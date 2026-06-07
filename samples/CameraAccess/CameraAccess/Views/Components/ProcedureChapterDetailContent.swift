@@ -35,6 +35,10 @@ struct ProcedureChapterDetailContent<ReadMoreContent: View, HeaderActionContent:
   // source row in the optional "Sources" footer. Identifiable URL +
   // .sheet(item:) gives us animated mount/unmount per URL change.
   @State private var selectedSourceURL: IdentifiableURL?
+  // Reference image (expert-attached, gated behind the feature flag).
+  // Tapping the preview opens the full-screen zoom viewer.
+  @State private var selectedReferenceImage: IdentifiableURL?
+  @AppStorage("referenceImageEnabled") private var referenceImageEnabled = false
 
   private var playbackSignature: String {
     let stepSignature = procedure.orderedSteps.map {
@@ -75,6 +79,7 @@ struct ProcedureChapterDetailContent<ReadMoreContent: View, HeaderActionContent:
               contentHeader
               stepSection(scrollProxy: scrollProxy)
               sourcesSection
+              referenceImageSection
           }
           .padding(Spacing.screenPadding)
           .padding(.top, Spacing.md)
@@ -97,6 +102,62 @@ struct ProcedureChapterDetailContent<ReadMoreContent: View, HeaderActionContent:
     .sheet(item: $selectedSourceURL) { wrapper in
       SafariBrowserView(url: wrapper.url)
         .ignoresSafeArea()
+    }
+    .fullScreenCover(item: $selectedReferenceImage) { wrapper in
+      ZoomableImageViewer(url: wrapper.url) { selectedReferenceImage = nil }
+    }
+  }
+
+  /// Expert-attached reference image (e.g. a circuit diagram). Gated behind
+  /// the feature flag; only renders when the procedure carries a non-empty
+  /// `referenceImageUrl` that resolves to a valid URL. Tapping expands it
+  /// into the full-screen zoom viewer.
+  @ViewBuilder
+  private var referenceImageSection: some View {
+    if referenceImageEnabled,
+       let path = procedure.referenceImageUrl, !path.isEmpty,
+       let url = URL(string: "\(serverBaseURL)\(path)") {
+      VStack(alignment: .leading, spacing: Spacing.md) {
+        Text("REFERENCE")
+          .font(.retraceOverline)
+          .tracking(0.5)
+          .foregroundColor(.textSecondary)
+
+        CachedAsyncImage(url: url) { phase in
+          switch phase {
+          case .success(let image):
+            image.resizable().scaledToFit()
+          case .failure:
+            Color.surfaceRaised.overlay(
+              Image(systemName: "photo")
+                .foregroundColor(.textSecondary)
+            )
+          case .empty:
+            Color.surfaceRaised.overlay(ProgressView())
+          @unknown default:
+            Color.surfaceRaised
+          }
+        }
+        .frame(maxWidth: .infinity)
+        .frame(maxHeight: 220)
+        .clipShape(RoundedRectangle(cornerRadius: Radius.md))
+        .overlay(
+          RoundedRectangle(cornerRadius: Radius.md)
+            .stroke(Color.borderSubtle, lineWidth: 1)
+        )
+        .overlay(alignment: .bottomTrailing) {
+          Image(systemName: "arrow.up.left.and.arrow.down.right")
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundColor(.white)
+            .padding(Spacing.xs)
+            .background(Color.black.opacity(0.45), in: RoundedRectangle(cornerRadius: Radius.sm))
+            .padding(Spacing.sm)
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+          selectedReferenceImage = IdentifiableURL(url: url)
+        }
+      }
     }
   }
 

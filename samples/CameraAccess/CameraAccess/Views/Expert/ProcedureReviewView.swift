@@ -1,5 +1,5 @@
-import PhotosUI
 import SwiftUI
+import UIKit
 
 struct ProcedureReviewView: View {
   let initialProcedure: ProcedureResponse
@@ -25,7 +25,9 @@ struct ProcedureReviewView: View {
   @State private var referenceImageURL: String?
   @State private var isUploadingImage = false
   @State private var uploadError: String?
-  @State private var pickerItem: PhotosPickerItem?
+  @State private var showImageSourceDialog = false
+  @State private var showImagePicker = false
+  @State private var pickerSource: UIImagePickerController.SourceType = .photoLibrary
 
   private let api = ProcedureAPIService()
 
@@ -157,8 +159,10 @@ struct ProcedureReviewView: View {
       HStack(spacing: Spacing.lg) {
         if let referenceImageURL,
            let url = URL(string: "\(serverBaseURL)\(referenceImageURL)") {
-          // Tapping the thumbnail re-opens the picker to replace it.
-          PhotosPicker(selection: $pickerItem, matching: .images) {
+          // Tapping the thumbnail re-opens the chooser to replace it.
+          Button {
+            showImageSourceDialog = true
+          } label: {
             AsyncImage(url: url) { phase in
               switch phase {
               case .success(let image):
@@ -177,7 +181,9 @@ struct ProcedureReviewView: View {
             )
           }
         } else {
-          PhotosPicker(selection: $pickerItem, matching: .images) {
+          Button {
+            showImageSourceDialog = true
+          } label: {
             HStack(spacing: Spacing.xs) {
               Image(systemName: "photo.badge.plus")
                 .font(.retraceCallout)
@@ -204,20 +210,36 @@ struct ProcedureReviewView: View {
           .fixedSize(horizontal: false, vertical: true)
       }
     }
-    .onChange(of: pickerItem) { _, newItem in
-      guard newItem != nil else { return }
-      Task { await uploadPickedImage() }
+    .confirmationDialog(
+      "Add reference image",
+      isPresented: $showImageSourceDialog,
+      titleVisibility: .visible
+    ) {
+      if UIImagePickerController.isSourceTypeAvailable(.camera) {
+        Button("Take Photo") {
+          pickerSource = .camera
+          showImagePicker = true
+        }
+      }
+      Button("Choose from Library") {
+        pickerSource = .photoLibrary
+        showImagePicker = true
+      }
+      Button("Cancel", role: .cancel) {}
+    }
+    .sheet(isPresented: $showImagePicker) {
+      MediaPickerView(mode: .image, source: pickerSource) { url, _ in
+        showImagePicker = false
+        Task { await handlePickedImageURL(url) }
+      }
     }
   }
 
-  private func uploadPickedImage() async {
+  private func handlePickedImageURL(_ url: URL) async {
     uploadError = nil
     do {
-      guard let raw = try await pickerItem?.loadTransferable(type: Data.self),
-            let jpeg = UIImage(data: raw)?.jpegData(compressionQuality: 0.75) else {
-        uploadError = "Couldn't read that image. Try another."
-        return
-      }
+      let data = try Data(contentsOf: url)
+      let jpeg = UIImage(data: data)?.jpegData(compressionQuality: 0.75) ?? data
       isUploadingImage = true
       let path = try await api.uploadReferenceImage(
         procedureId: initialProcedure.id,

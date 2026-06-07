@@ -176,6 +176,10 @@ struct ProcedureListItem: Codable, Identifiable {
   // processing-state card (e.g. "Analyzing video…" vs "Reading manual…").
   // Optional for backward compatibility.
   let sourceType: String?
+  // Optional expert-attached reference photo path. Mirrors
+  // `ProcedureResponse.referenceImageUrl`. Optional for backward
+  // compatibility with servers that predate the field.
+  let referenceImageUrl: String?
 
   enum CodingKeys: String, CodingKey {
     case id, title, description, status, category
@@ -186,6 +190,7 @@ struct ProcedureListItem: Codable, Identifiable {
     case iconSymbol = "icon_symbol"
     case iconEmoji = "icon_emoji"
     case sourceType = "source_type"
+    case referenceImageUrl = "reference_image_url"
   }
 }
 

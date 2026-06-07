@@ -23,12 +23,13 @@ struct MediaPickerView: UIViewControllerRepresentable {
   }
 
   let mode: MediaType
+  var source: UIImagePickerController.SourceType = .photoLibrary
   let onMediaSelected: (URL, MediaType) -> Void
 
   func makeUIViewController(context: Context) -> UIImagePickerController {
     let picker = UIImagePickerController()
     picker.delegate = context.coordinator
-    picker.sourceType = .photoLibrary
+    picker.sourceType = source
     switch mode {
     case .video:
       picker.mediaTypes = ["public.movie"]

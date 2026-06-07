@@ -88,7 +88,8 @@ struct WorkflowListView: View {
             iconSymbol: procedure.iconSymbol,
             iconEmoji: procedure.iconEmoji,
             sourceType: procedure.sourceType,
-            errorMessage: procedure.errorMessage
+            errorMessage: procedure.errorMessage,
+            referenceImageUrl: procedure.referenceImageUrl
           )
           if procedure.status == "processing" {
             card.padding(.horizontal, Spacing.screenPadding)
