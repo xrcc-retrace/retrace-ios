@@ -1,3 +1,4 @@
+import PhotosUI
 import SwiftUI
 
 struct ProcedureReviewView: View {
@@ -17,6 +18,15 @@ struct ProcedureReviewView: View {
   @State private var dragTranslation: CGFloat = 0
   @State private var rowHeight: CGFloat = 96
 
+  // Reference image (gated behind the feature flag). Experts can attach a
+  // single reference photo (e.g. a circuit diagram) the learner sees in
+  // the coaching reference panel.
+  @AppStorage("referenceImageEnabled") private var referenceImageEnabled: Bool = false
+  @State private var referenceImageURL: String?
+  @State private var isUploadingImage = false
+  @State private var uploadError: String?
+  @State private var pickerItem: PhotosPickerItem?
+
   private let api = ProcedureAPIService()
 
   init(
@@ -34,6 +44,7 @@ struct ProcedureReviewView: View {
     self._steps = State(
       initialValue: initialProcedure.steps.sorted { $0.stepNumber < $1.stepNumber }
     )
+    self._referenceImageURL = State(initialValue: initialProcedure.referenceImageUrl)
   }
 
   var body: some View {
@@ -119,6 +130,10 @@ struct ProcedureReviewView: View {
       }
 
       metadataStrip
+
+      if referenceImageEnabled {
+        referenceImageSection
+      }
     }
     .padding(Spacing.xl)
     .background(Color.surfaceBase)
@@ -127,6 +142,93 @@ struct ProcedureReviewView: View {
       RoundedRectangle(cornerRadius: Radius.md)
         .stroke(Color.borderSubtle, lineWidth: 1)
     )
+  }
+
+  // MARK: - Reference image
+
+  @ViewBuilder
+  private var referenceImageSection: some View {
+    VStack(alignment: .leading, spacing: Spacing.sm) {
+      Text("REFERENCE IMAGE")
+        .font(.retraceOverline)
+        .tracking(0.5)
+        .foregroundColor(.textSecondary)
+
+      HStack(spacing: Spacing.lg) {
+        if let referenceImageURL,
+           let url = URL(string: "\(serverBaseURL)\(referenceImageURL)") {
+          // Tapping the thumbnail re-opens the picker to replace it.
+          PhotosPicker(selection: $pickerItem, matching: .images) {
+            AsyncImage(url: url) { phase in
+              switch phase {
+              case .success(let image):
+                image
+                  .resizable()
+                  .scaledToFill()
+              default:
+                Color.surfaceRaised
+              }
+            }
+            .frame(width: 56, height: 56)
+            .clipShape(RoundedRectangle(cornerRadius: Radius.sm))
+            .overlay(
+              RoundedRectangle(cornerRadius: Radius.sm)
+                .stroke(Color.borderSubtle, lineWidth: 1)
+            )
+          }
+        } else {
+          PhotosPicker(selection: $pickerItem, matching: .images) {
+            HStack(spacing: Spacing.xs) {
+              Image(systemName: "photo.badge.plus")
+                .font(.retraceCallout)
+              Text("Add reference image")
+                .font(.retraceCallout)
+            }
+            .foregroundColor(.appPrimary)
+          }
+        }
+
+        if isUploadingImage {
+          ProgressView()
+            .progressViewStyle(CircularProgressViewStyle(tint: .appPrimary))
+            .scaleEffect(0.8)
+        }
+
+        Spacer(minLength: 0)
+      }
+
+      if let uploadError {
+        Text(uploadError)
+          .font(.retraceCaption1)
+          .foregroundColor(.semanticError)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+    }
+    .onChange(of: pickerItem) { _, newItem in
+      guard newItem != nil else { return }
+      Task { await uploadPickedImage() }
+    }
+  }
+
+  private func uploadPickedImage() async {
+    uploadError = nil
+    do {
+      guard let raw = try await pickerItem?.loadTransferable(type: Data.self),
+            let jpeg = UIImage(data: raw)?.jpegData(compressionQuality: 0.75) else {
+        uploadError = "Couldn't read that image. Try another."
+        return
+      }
+      isUploadingImage = true
+      let path = try await api.uploadReferenceImage(
+        procedureId: initialProcedure.id,
+        imageData: jpeg,
+        ext: "jpg"
+      )
+      referenceImageURL = path
+    } catch {
+      uploadError = error.localizedDescription
+    }
+    isUploadingImage = false
   }
 
   @ViewBuilder

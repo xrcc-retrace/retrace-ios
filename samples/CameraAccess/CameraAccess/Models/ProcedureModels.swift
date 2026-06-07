@@ -49,6 +49,11 @@ struct ProcedureResponse: Codable, Identifiable, Equatable {
   // for backward compatibility — treat nil as "video" since legacy rows
   // predate the column.
   let sourceType: String?
+  // Optional expert-attached reference photo (e.g. a circuit diagram).
+  // Server path like "/api/reference_images/{id}.{ext}"; nil when no
+  // image was uploaded. Optional for backward compatibility with
+  // servers that predate the field.
+  let referenceImageUrl: String?
 
   enum CodingKeys: String, CodingKey {
     case id, title, description, steps, status, category, sources
@@ -59,6 +64,7 @@ struct ProcedureResponse: Codable, Identifiable, Equatable {
     case iconSymbol = "icon_symbol"
     case iconEmoji = "icon_emoji"
     case sourceType = "source_type"
+    case referenceImageUrl = "reference_image_url"
   }
 
   init(from decoder: Decoder) throws {
@@ -77,6 +83,7 @@ struct ProcedureResponse: Codable, Identifiable, Equatable {
     category = try c.decodeIfPresent(String.self, forKey: .category)
     sources = try c.decodeIfPresent([OnlineSource].self, forKey: .sources)
     sourceType = try c.decodeIfPresent(String.self, forKey: .sourceType)
+    referenceImageUrl = try c.decodeIfPresent(String.self, forKey: .referenceImageUrl)
   }
 }
 

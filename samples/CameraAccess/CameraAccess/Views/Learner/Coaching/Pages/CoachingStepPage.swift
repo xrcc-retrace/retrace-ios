@@ -26,6 +26,10 @@ struct CoachingStepPage: RayBanHUDView {
   @ObservedObject var viewModel: CoachingSessionViewModel
   let stepCount: Int
   let clipURL: URL?
+  /// Optional expert reference image for the whole procedure. Threaded into
+  /// `RayBanHUDDetailPanel` so the reference panel can show a Video | Image
+  /// tab row (or image-only when the step has no clip).
+  let referenceImageURL: URL?
   /// Callback the focus engine's step-page handler invokes when the user
   /// dispatches `.dismiss` (lens double-tap, future MediaPipe back).
   /// Parent (`CoachingSessionView`) flips its `showDismissConfirmation`
@@ -54,12 +58,14 @@ struct CoachingStepPage: RayBanHUDView {
     viewModel: CoachingSessionViewModel,
     stepCount: Int,
     clipURL: URL?,
+    referenceImageURL: URL? = nil,
     isOverlayActive: Bool = false,
     onShowExitConfirmation: @escaping () -> Void
   ) {
     self.viewModel = viewModel
     self.stepCount = stepCount
     self.clipURL = clipURL
+    self.referenceImageURL = referenceImageURL
     self.isOverlayActive = isOverlayActive
     self.onShowExitConfirmation = onShowExitConfirmation
   }
@@ -119,7 +125,7 @@ struct CoachingStepPage: RayBanHUDView {
           onRetreatStep: {
             Task { await viewModel.navigateStepFromHUD(direction: .previous) }
           },
-          hasReference: { clipURL != nil },
+          hasReference: { clipURL != nil || referenceImageURL != nil },
           hasInsights: {
             guard let step = viewModel.currentStep else { return false }
             return !step.populatedInsightCategories.isEmpty
@@ -185,6 +191,10 @@ struct CoachingStepPage: RayBanHUDView {
   // MARK: - Top-row toggle affordances
 
   private var hasClip: Bool { clipURL != nil }
+  /// True when this step has any reference media — a clip, an expert
+  /// reference image, or both. Drives the Reference pill's status dot so
+  /// it lights up for image-only steps too.
+  private var hasReferenceContent: Bool { clipURL != nil || referenceImageURL != nil }
   private var hasInsights: Bool {
     guard let step = viewModel.currentStep else { return false }
     return !step.populatedInsightCategories.isEmpty
@@ -199,10 +209,10 @@ struct CoachingStepPage: RayBanHUDView {
       // to find out.
       toggleAffordance(
         label: expansion == .referenceExpanded ? "Hide ref" : "Reference",
-        icon: "play.rectangle",
+        icon: clipURL != nil ? "play.rectangle" : "photo",
         id: .toggleReference,
         isActive: expansion == .referenceExpanded,
-        statusDot: hasClip ? .referenceActive : .empty
+        statusDot: hasReferenceContent ? .referenceActive : .empty
       ) {
         toggleExpansion(.referenceExpanded)
       }
@@ -502,7 +512,7 @@ struct CoachingStepPage: RayBanHUDView {
   // MARK: - Reference + insights expanded panels
 
   private var clipPanel: some View {
-    RayBanHUDDetailPanel(clipURL: clipURL)
+    RayBanHUDDetailPanel(clipURL: clipURL, referenceImageURL: referenceImageURL)
   }
 
   private var insightsPanel: some View {
