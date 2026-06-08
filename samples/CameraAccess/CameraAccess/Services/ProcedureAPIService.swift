@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 
 @MainActor
 class ProcedureAPIService: ObservableObject {
@@ -370,6 +371,13 @@ class ProcedureAPIService: ObservableObject {
       throw APIError.serverError
     }
     return try decoder.decode(ReferenceImageUploadResponse.self, from: data).referenceImageUrl
+  }
+
+  /// Convenience overload: JPEG-encodes a `UIImage` (quality 0.75) and uploads
+  /// it. Centralizes the encode shared by the expert review + edit flows.
+  func uploadReferenceImage(procedureId: String, image: UIImage) async throws -> String {
+    let jpeg = image.jpegData(compressionQuality: 0.75) ?? Data()
+    return try await uploadReferenceImage(procedureId: procedureId, imageData: jpeg, ext: "jpg")
   }
 
   /// Remove the reference image attached to a procedure. Server returns

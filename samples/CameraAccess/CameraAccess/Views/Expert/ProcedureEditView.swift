@@ -18,8 +18,6 @@ struct ProcedureEditView: View {
   @AppStorage("referenceImageEnabled") private var referenceImageEnabled = false
   @State private var refIntent: RefImageIntent = .keep
   @State private var showImageSourceDialog = false
-  @State private var showImagePicker = false
-  @State private var pickerSource: UIImagePickerController.SourceType = .photoLibrary
 
   private let api = ProcedureAPIService()
 
@@ -172,28 +170,8 @@ struct ProcedureEditView: View {
         .disabled(!hasChanges || isSaving)
       }
     }
-    .confirmationDialog(
-      "Reference image",
-      isPresented: $showImageSourceDialog,
-      titleVisibility: .visible
-    ) {
-      if UIImagePickerController.isSourceTypeAvailable(.camera) {
-        Button("Take Photo") {
-          pickerSource = .camera
-          showImagePicker = true
-        }
-      }
-      Button("Choose from Library") {
-        pickerSource = .photoLibrary
-        showImagePicker = true
-      }
-      Button("Cancel", role: .cancel) {}
-    }
-    .sheet(isPresented: $showImagePicker) {
-      MediaPickerView(mode: .image, source: pickerSource) { url, _ in
-        showImagePicker = false
-        stagePickedImage(at: url)
-      }
+    .referenceImagePicker(isPresented: $showImageSourceDialog) { image in
+      refIntent = .replace(image)
     }
   }
 
@@ -307,12 +285,6 @@ struct ProcedureEditView: View {
 
   // MARK: - Reference image actions (staged only — no network until Save)
 
-  private func stagePickedImage(at url: URL) {
-    guard let data = try? Data(contentsOf: url),
-          let image = UIImage(data: data) else { return }
-    refIntent = .replace(image)
-  }
-
   private func requestRemove() {
     // If there was a saved image, mark it for removal; otherwise just discard
     // the staged pick (nothing to delete on the server).
@@ -342,8 +314,7 @@ struct ProcedureEditView: View {
         case .keep:
           break
         case .replace(let image):
-          let jpeg = image.jpegData(compressionQuality: 0.75) ?? Data()
-          _ = try await api.uploadReferenceImage(procedureId: procedure.id, imageData: jpeg, ext: "jpg")
+          _ = try await api.uploadReferenceImage(procedureId: procedure.id, image: image)
         case .remove:
           try await api.deleteReferenceImage(procedureId: procedure.id)
         }
