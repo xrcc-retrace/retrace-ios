@@ -372,6 +372,20 @@ class ProcedureAPIService: ObservableObject {
     return try decoder.decode(ReferenceImageUploadResponse.self, from: data).referenceImageUrl
   }
 
+  /// Remove the reference image attached to a procedure. Server returns
+  /// `{"reference_image_url": null}`; we ignore the body and just confirm 2xx.
+  func deleteReferenceImage(procedureId: String) async throws {
+    guard let url = URL(string: "\(serverBaseURL)/api/expert/procedures/\(procedureId)/reference-image") else {
+      throw APIError.invalidURL
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = "DELETE"
+    let (_, response) = try await URLSession.shared.data(for: request)
+    guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+      throw APIError.serverError
+    }
+  }
+
   // MARK: - Base URL accessor for clip URLs
 
   var baseURL: String { serverBaseURL }

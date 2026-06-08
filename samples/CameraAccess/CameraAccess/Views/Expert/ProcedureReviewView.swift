@@ -201,6 +201,20 @@ struct ProcedureReviewView: View {
         }
 
         Spacer(minLength: 0)
+
+        if referenceImageURL != nil {
+          Button("Remove", role: .destructive) {
+            Task {
+              do {
+                try await api.deleteReferenceImage(procedureId: initialProcedure.id)
+                referenceImageURL = nil
+              } catch {
+                uploadError = error.localizedDescription
+              }
+            }
+          }
+          .font(.retraceCaption1)
+        }
       }
 
       if let uploadError {

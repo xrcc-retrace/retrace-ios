@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct ProcedureEditView: View {
   let procedure: ProcedureResponse
@@ -10,6 +11,15 @@ struct ProcedureEditView: View {
   @State private var stepOrder: [ProcedureStepResponse]
   @State private var isSaving = false
   @State private var errorMessage: String?
+
+  // Reference image (gated behind the feature flag). Changes are *staged*
+  // locally via `refIntent` and only committed to the backend on Save, so
+  // tapping Cancel reverts them — consistent with the title/step edits.
+  @AppStorage("referenceImageEnabled") private var referenceImageEnabled = false
+  @State private var refIntent: RefImageIntent = .keep
+  @State private var showImageSourceDialog = false
+  @State private var showImagePicker = false
+  @State private var pickerSource: UIImagePickerController.SourceType = .photoLibrary
 
   private let api = ProcedureAPIService()
 
@@ -24,7 +34,33 @@ struct ProcedureEditView: View {
   private var hasChanges: Bool {
     title != procedure.title ||
     description != procedure.description ||
-    stepOrder.map(\.stepNumber) != procedure.steps.sorted(by: { $0.stepNumber < $1.stepNumber }).map(\.stepNumber)
+    stepOrder.map(\.stepNumber) != procedure.steps.sorted(by: { $0.stepNumber < $1.stepNumber }).map(\.stepNumber) ||
+    (referenceImageEnabled && hasReferenceChange)
+  }
+
+  // MARK: - Reference image state
+
+  private var stagedImage: UIImage? {
+    if case .replace(let image) = refIntent { return image }
+    return nil
+  }
+
+  /// True when the original (already-saved) image should be shown — i.e. the
+  /// user hasn't staged a replacement or a removal.
+  private var showsExistingRemoteImage: Bool {
+    if case .keep = refIntent { return procedure.referenceImageUrl != nil }
+    return false
+  }
+
+  private var hasImageShowing: Bool {
+    stagedImage != nil || showsExistingRemoteImage
+  }
+
+  private var hasReferenceChange: Bool {
+    switch refIntent {
+    case .keep: return false
+    case .replace, .remove: return true
+    }
   }
 
   var body: some View {
@@ -70,6 +106,11 @@ struct ProcedureEditView: View {
                 RoundedRectangle(cornerRadius: Radius.md)
                   .stroke(Color.borderSubtle, lineWidth: 1)
               )
+          }
+
+          // Reference image (staged; committed on Save)
+          if referenceImageEnabled {
+            referenceImageSection
           }
 
           // Step order
@@ -131,20 +172,183 @@ struct ProcedureEditView: View {
         .disabled(!hasChanges || isSaving)
       }
     }
+    .confirmationDialog(
+      "Reference image",
+      isPresented: $showImageSourceDialog,
+      titleVisibility: .visible
+    ) {
+      if UIImagePickerController.isSourceTypeAvailable(.camera) {
+        Button("Take Photo") {
+          pickerSource = .camera
+          showImagePicker = true
+        }
+      }
+      Button("Choose from Library") {
+        pickerSource = .photoLibrary
+        showImagePicker = true
+      }
+      Button("Cancel", role: .cancel) {}
+    }
+    .sheet(isPresented: $showImagePicker) {
+      MediaPickerView(mode: .image, source: pickerSource) { url, _ in
+        showImagePicker = false
+        stagePickedImage(at: url)
+      }
+    }
+  }
+
+  // MARK: - Reference image section
+
+  @ViewBuilder
+  private var referenceImageSection: some View {
+    VStack(alignment: .leading, spacing: Spacing.md) {
+      Text("REFERENCE IMAGE")
+        .font(.retraceOverline)
+        .tracking(0.5)
+        .foregroundColor(.textSecondary)
+
+      referenceImagePreview
+
+      if hasImageShowing {
+        HStack(spacing: Spacing.lg) {
+          Button {
+            showImageSourceDialog = true
+          } label: {
+            Label("Replace", systemImage: "photo")
+              .font(.retraceCallout)
+              .foregroundColor(.appPrimary)
+          }
+
+          Button(role: .destructive) {
+            requestRemove()
+          } label: {
+            Label("Remove", systemImage: "trash")
+              .font(.retraceCallout)
+          }
+
+          Spacer(minLength: 0)
+        }
+      } else {
+        Button {
+          showImageSourceDialog = true
+        } label: {
+          HStack(spacing: Spacing.xs) {
+            Image(systemName: "photo.badge.plus")
+            Text("Add reference image")
+          }
+          .font(.retraceCallout)
+          .foregroundColor(.appPrimary)
+        }
+      }
+    }
+  }
+
+  @ViewBuilder
+  private var referenceImagePreview: some View {
+    if let stagedImage {
+      Image(uiImage: stagedImage)
+        .resizable()
+        .scaledToFill()
+        .frame(maxWidth: .infinity)
+        .frame(height: 160)
+        .clipShape(RoundedRectangle(cornerRadius: Radius.md))
+        .overlay(
+          RoundedRectangle(cornerRadius: Radius.md)
+            .stroke(Color.borderSubtle, lineWidth: 1)
+        )
+    } else if showsExistingRemoteImage,
+              let urlString = procedure.referenceImageUrl,
+              let url = URL(string: "\(api.baseURL)\(urlString)") {
+      AsyncImage(url: url) { phase in
+        switch phase {
+        case .success(let image):
+          image.resizable().scaledToFill()
+        case .failure:
+          referencePlaceholder(text: "Couldn't load image")
+        default:
+          ZStack {
+            Color.surfaceRaised
+            ProgressView().tint(.appPrimary)
+          }
+        }
+      }
+      .frame(maxWidth: .infinity)
+      .frame(height: 160)
+      .clipShape(RoundedRectangle(cornerRadius: Radius.md))
+      .overlay(
+        RoundedRectangle(cornerRadius: Radius.md)
+          .stroke(Color.borderSubtle, lineWidth: 1)
+      )
+    } else {
+      referencePlaceholder(text: "No reference image")
+    }
+  }
+
+  private func referencePlaceholder(text: String) -> some View {
+    ZStack {
+      RoundedRectangle(cornerRadius: Radius.md)
+        .fill(Color.surfaceRaised)
+      VStack(spacing: Spacing.sm) {
+        Image(systemName: "photo")
+          .font(.system(size: 28))
+          .foregroundColor(.textTertiary)
+        Text(text)
+          .font(.retraceSubheadline)
+          .foregroundColor(.textTertiary)
+      }
+    }
+    .frame(maxWidth: .infinity)
+    .frame(height: 160)
+    .overlay(
+      RoundedRectangle(cornerRadius: Radius.md)
+        .stroke(Color.borderSubtle, lineWidth: 1)
+    )
+  }
+
+  // MARK: - Reference image actions (staged only — no network until Save)
+
+  private func stagePickedImage(at url: URL) {
+    guard let data = try? Data(contentsOf: url),
+          let image = UIImage(data: data) else { return }
+    refIntent = .replace(image)
+  }
+
+  private func requestRemove() {
+    // If there was a saved image, mark it for removal; otherwise just discard
+    // the staged pick (nothing to delete on the server).
+    refIntent = procedure.referenceImageUrl != nil ? .remove : .keep
   }
 
   private func save() async {
     isSaving = true
     errorMessage = nil
 
-    let update = ProcedureUpdateRequest(
-      title: title != procedure.title ? title : nil,
-      description: description != procedure.description ? description : nil,
-      stepOrder: stepOrder.map(\.stepNumber) != procedure.steps.sorted(by: { $0.stepNumber < $1.stepNumber }).map(\.stepNumber) ? stepOrder.map(\.stepNumber) : nil
-    )
+    let titleChanged = title != procedure.title
+    let descChanged = description != procedure.description
+    let orderChanged = stepOrder.map(\.stepNumber) != procedure.steps.sorted(by: { $0.stepNumber < $1.stepNumber }).map(\.stepNumber)
 
     do {
-      _ = try await api.updateProcedure(id: procedure.id, update: update)
+      if titleChanged || descChanged || orderChanged {
+        let update = ProcedureUpdateRequest(
+          title: titleChanged ? title : nil,
+          description: descChanged ? description : nil,
+          stepOrder: orderChanged ? stepOrder.map(\.stepNumber) : nil
+        )
+        _ = try await api.updateProcedure(id: procedure.id, update: update)
+      }
+
+      if referenceImageEnabled {
+        switch refIntent {
+        case .keep:
+          break
+        case .replace(let image):
+          let jpeg = image.jpegData(compressionQuality: 0.75) ?? Data()
+          _ = try await api.uploadReferenceImage(procedureId: procedure.id, imageData: jpeg, ext: "jpg")
+        case .remove:
+          try await api.deleteReferenceImage(procedureId: procedure.id)
+        }
+      }
+
       onSaved()
       dismiss()
     } catch {
@@ -152,4 +356,11 @@ struct ProcedureEditView: View {
     }
     isSaving = false
   }
+}
+
+/// Staged intent for the reference image while editing. Committed on Save.
+private enum RefImageIntent {
+  case keep
+  case replace(UIImage)
+  case remove
 }
