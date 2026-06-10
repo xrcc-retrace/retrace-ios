@@ -165,8 +165,42 @@ class AudioSessionManager: ObservableObject {
 
   // MARK: - Audio Session
 
+  #if DEBUG
+  /// Debug-only. When true, `.coachingPhoneOnly` stops forcing the iPhone
+  /// speaker: it drops `.defaultToSpeaker`, uses `.default` instead of
+  /// `.voiceChat`, skips the `overrideOutputAudioPort(.speaker)` override, and
+  /// disables hardware voice processing (AEC). This lets Gemini Live's audio
+  /// flow over the QuickTime-over-USB / HDMI virtual output route to a connected
+  /// Mac for demos. Capture stays full-duplex on the built-in mic, so you can
+  /// still talk to Gemini. Trade-off: with AEC off, an open mic near loud Mac
+  /// speakers can re-trigger barge-in. Toggle from Settings → Debug; takes
+  /// effect on the next coaching session start. Backed by UserDefaults so readable
+  /// from both the main-actor and off-main (`configureSessionOffMain`) paths.
+  nonisolated static var routeAudioToMacForDemo: Bool {
+    get { UserDefaults.standard.bool(forKey: "debug.routeAudioToMacForDemo") }
+    set { UserDefaults.standard.set(newValue, forKey: "debug.routeAudioToMacForDemo") }
+  }
+  #endif
+
+  /// Whether hardware voice processing (AEC/VPIO) should be enabled for `mode`.
+  /// Coaching modes use it normally; the DEBUG demo toggle turns it off for
+  /// `.coachingPhoneOnly` so the AI audio can leave the phone for the Mac.
+  /// Recording modes never use it.
+  nonisolated static func shouldEnableVoiceProcessing(for mode: AudioSessionMode) -> Bool {
+    guard mode == .coaching || mode == .coachingPhoneOnly else { return false }
+    #if DEBUG
+    if mode == .coachingPhoneOnly, routeAudioToMacForDemo { return false }
+    #endif
+    return true
+  }
+
   func configureAudioSession() {
     let session = AVAudioSession.sharedInstance()
+    #if DEBUG
+    let demoRoute = AudioSessionManager.routeAudioToMacForDemo
+    #else
+    let demoRoute = false
+    #endif
     do {
       switch mode {
       case .coaching:
@@ -181,8 +215,10 @@ class AudioSessionManager: ObservableObject {
         // HFP glasses are paired. The learner explicitly chose the iPhone transport.
         try session.setCategory(
           .playAndRecord,
-          mode: .voiceChat,
-          options: [.defaultToSpeaker]  // no HFP / A2DP
+          // Demo route: `.default` (no call-audio bias) so output can take the
+          // Mac's virtual route; otherwise `.voiceChat` for on-phone AEC.
+          mode: demoRoute ? .default : .voiceChat,
+          options: demoRoute ? [] : [.defaultToSpeaker]  // no HFP / A2DP
         )
       case .recording:
         // Simplex capture. No `.voiceChat` (no AEC processing), no `.defaultToSpeaker`
@@ -208,10 +244,11 @@ class AudioSessionManager: ObservableObject {
         )
       }
       try session.setActive(true)
-      if mode == .coachingPhoneOnly {
+      if mode == .coachingPhoneOnly, !demoRoute {
         // Belt-and-suspenders: even with `.defaultToSpeaker`, an actively routed
         // HFP output could sneak through if the user paired glasses mid-session.
         // This override forces the loudspeaker for the life of this activation.
+        // Skipped in the DEBUG demo route so output can reach the Mac.
         try session.overrideOutputAudioPort(.speaker)
       }
       if mode == .coachingPhoneOnly || mode == .recordingPhoneOnly {
@@ -306,11 +343,9 @@ class AudioSessionManager: ObservableObject {
     //    coaching session can't leave a 5-channel VPIO format behind that
     //    would later fail input-chain validation.
     do {
-      if capturedMode == .coaching || capturedMode == .coachingPhoneOnly {
-        try node.setVoiceProcessingEnabled(true)
-      } else {
-        try node.setVoiceProcessingEnabled(false)
-      }
+      try node.setVoiceProcessingEnabled(
+        AudioSessionManager.shouldEnableVoiceProcessing(for: capturedMode)
+      )
     } catch {
       print("[AudioSession] prewarm: setVoiceProcessingEnabled failed: \(error)")
     }
@@ -348,11 +383,9 @@ class AudioSessionManager: ObservableObject {
       await Task.detached(priority: .userInitiated) { [inputNode = self.inputNode] in
         Self.configureSessionOffMain(mode: capturedMode)
         do {
-          if capturedMode == .coaching || capturedMode == .coachingPhoneOnly {
-            try inputNode.setVoiceProcessingEnabled(true)
-          } else {
-            try inputNode.setVoiceProcessingEnabled(false)
-          }
+          try inputNode.setVoiceProcessingEnabled(
+            AudioSessionManager.shouldEnableVoiceProcessing(for: capturedMode)
+          )
         } catch {
           print("[AudioSession] ⚠ setVoiceProcessingEnabled failed: \(error)")
         }
@@ -453,11 +486,9 @@ class AudioSessionManager: ObservableObject {
     await Task.detached(priority: .userInitiated) { [inputNode = self.inputNode] in
       Self.configureSessionOffMain(mode: capturedMode)
       do {
-        if capturedMode == .coaching || capturedMode == .coachingPhoneOnly {
-          try inputNode.setVoiceProcessingEnabled(true)
-        } else {
-          try inputNode.setVoiceProcessingEnabled(false)
-        }
+        try inputNode.setVoiceProcessingEnabled(
+          AudioSessionManager.shouldEnableVoiceProcessing(for: capturedMode)
+        )
       } catch {
         print("[AudioSession] retry: setVoiceProcessingEnabled failed: \(error)")
       }
@@ -492,6 +523,11 @@ class AudioSessionManager: ObservableObject {
   /// documented thread-safe.
   nonisolated private static func configureSessionOffMain(mode: AudioSessionMode) {
     let session = AVAudioSession.sharedInstance()
+    #if DEBUG
+    let demoRoute = routeAudioToMacForDemo
+    #else
+    let demoRoute = false
+    #endif
     do {
       switch mode {
       case .coaching:
@@ -503,8 +539,8 @@ class AudioSessionManager: ObservableObject {
       case .coachingPhoneOnly:
         try session.setCategory(
           .playAndRecord,
-          mode: .voiceChat,
-          options: [.defaultToSpeaker]
+          mode: demoRoute ? .default : .voiceChat,
+          options: demoRoute ? [] : [.defaultToSpeaker]
         )
       case .recording:
         // A2DP is invalid with `.record` (output-only profile); see the
@@ -523,7 +559,7 @@ class AudioSessionManager: ObservableObject {
         )
       }
       try session.setActive(true)
-      if mode == .coachingPhoneOnly {
+      if mode == .coachingPhoneOnly, !demoRoute {
         try session.overrideOutputAudioPort(.speaker)
       }
       if mode == .coachingPhoneOnly || mode == .recordingPhoneOnly {
@@ -553,25 +589,21 @@ class AudioSessionManager: ObservableObject {
     // repeats. `.voiceChat` mode alone is tuned for earpiece and doesn't cancel
     // loudspeaker well. `setVoiceProcessingEnabled(true)` must be called before
     // `engine.start()` and reconfigures the input node's output format.
-    if mode == .coaching || mode == .coachingPhoneOnly {
-      do {
-        try inputNode.setVoiceProcessingEnabled(true)
-      } catch {
-        print("[AudioSession] ⚠ Failed to enable voice processing: \(error)")
-      }
-    } else {
-      // Defensive: a prior coaching session in this app launch may have
-      // left the input audio unit in VPIO mode (5-ch multichannel
-      // format). Recording-mode `engine.start()` then fails input
-      // chain validation with -10868 kAudioUnitErr_FormatNotSupported.
-      // Calling false on a non-VPIO node is a no-op; on a leaked-VPIO
-      // node it forces it back to standard RemoteIO so the engine
-      // starts cleanly. Mirror in `startCaptureAsync`.
-      do {
-        try inputNode.setVoiceProcessingEnabled(false)
-      } catch {
-        print("[AudioSession] ⚠ Failed to disable voice processing: \(error)")
-      }
+    // Enable hardware voice processing (AEC) for coaching modes; disable it
+    // otherwise. Disabling matters defensively: a prior coaching session in
+    // this app launch may have left the input AU in VPIO mode (5-ch
+    // multichannel format), and recording-mode `engine.start()` then fails
+    // input-chain validation with -10868 kAudioUnitErr_FormatNotSupported.
+    // Calling false on a non-VPIO node is a no-op; on a leaked-VPIO node it
+    // forces it back to standard RemoteIO so the engine starts cleanly. The
+    // DEBUG Mac-route demo also reports `false` here for `.coachingPhoneOnly`
+    // (see `shouldEnableVoiceProcessing`). Mirror in `startCaptureAsync`.
+    do {
+      try inputNode.setVoiceProcessingEnabled(
+        AudioSessionManager.shouldEnableVoiceProcessing(for: mode)
+      )
+    } catch {
+      print("[AudioSession] ⚠ Failed to set voice processing: \(error)")
     }
 
     installMicTap()
