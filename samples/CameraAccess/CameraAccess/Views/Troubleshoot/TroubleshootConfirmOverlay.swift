@@ -13,6 +13,15 @@ struct TroubleshootConfirmOverlay: View {
   let onConfirm: () -> Void
   let onReject: () -> Void
 
+  // Push-to-talk (demo flag). When on, a centered Talk capsule sits below
+  // "Try again" as a third option so the user can answer the identification
+  // question by voice as well as by pinch/tap. Off → these stay false/nil and
+  // the Talk control is omitted.
+  var isPushToTalk: Bool = false
+  var isTalkEngaged: Bool = false
+  var onTalkDown: (() -> Void)? = nil
+  var onTalkUp: (() -> Void)? = nil
+
   var body: some View {
     VStack(spacing: 18) {
       deviceGroup
@@ -44,6 +53,18 @@ struct TroubleshootConfirmOverlay: View {
     VStack(spacing: 8) {
       confirmPill
       rejectPill
+      // Third option in demo mode: answer by voice. Touch-only press-and-hold
+      // (its own gesture), centered and compact so it reads distinct from the
+      // two full-width pinch pills. No mute here.
+      if isPushToTalk {
+        RayBanHUDTalkCapsule(
+          isTalkEngaged: isTalkEngaged,
+          onTalkDown: onTalkDown,
+          onTalkUp: onTalkUp
+        )
+        .frame(maxWidth: .infinity)
+        .padding(.top, 2)
+      }
     }
   }
 

@@ -364,6 +364,11 @@ class DiagnosticSessionViewModel: GeminiLiveSessionBase {
     diagnosticTransport == .iPhone ? .coachingPhoneOnly : .coaching
   }
 
+  /// Diagnose mode supports the same walkie-talkie Talk button as coaching.
+  /// `isPushToTalkActive` (base) additionally gates it on `.iPhone` transport +
+  /// the demo flag, so it only surfaces in the Mac-route demo.
+  override var supportsPushToTalk: Bool { true }
+
   // MARK: - Library-miss hold
 
   /// Start the synthetic 3-second `.libraryMissed` moment. Called when

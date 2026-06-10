@@ -470,44 +470,13 @@ struct RayBanHUDBottomAudioActionRow: View {
     HStack(spacing: 6) {
       muteCapsule
       if isPushToTalk {
-        talkCapsule
+        RayBanHUDTalkCapsule(
+          isTalkEngaged: isTalkEngaged,
+          onTalkDown: onTalkDown,
+          onTalkUp: onTalkUp
+        )
       }
     }
-  }
-
-  /// Walkie-talkie button — touch-only (press-and-hold or quick-tap latch), not
-  /// `.hoverSelectable`: press-and-hold isn't a focus-engine pattern and the
-  /// demo is driven by touch on the phone in hand.
-  private var talkCapsule: some View {
-    HStack(spacing: 6) {
-      Image(systemName: isTalkEngaged ? "waveform" : "mic.circle.fill")
-        .font(.system(size: 13, weight: .semibold))
-      Text(isTalkEngaged ? "Talking…" : "Talk")
-        .font(.inter(.medium, size: 13))
-        .lineLimit(1)
-        .fixedSize(horizontal: true, vertical: false)
-    }
-    .foregroundStyle(Color.white.opacity(isTalkEngaged ? 0.98 : 0.9))
-    .padding(.horizontal, 12)
-    .padding(.vertical, 7)
-    .layoutPriority(1)
-    .background(
-      Capsule()
-        .fill(Color(red: 0.13, green: 0.55, blue: 0.30).opacity(isTalkEngaged ? 0.75 : 0))
-    )
-    .rayBanHUDPanel(shape: .capsule)
-    // `onLongPressGesture(pressing:)` is purpose-built for press/release tracking
-    // and — unlike a DragGesture — resists the HUD's paging/scroll gestures and
-    // won't cancel on finger drift, so a real hold stays a hold. `minimumDuration`
-    // is set huge so `perform` never fires; we only use the `pressing` callback.
-    .onLongPressGesture(
-      minimumDuration: 3600,
-      maximumDistance: .greatestFiniteMagnitude,
-      pressing: { isPressing in
-        if isPressing { onTalkDown?() } else { onTalkUp?() }
-      },
-      perform: {}
-    )
   }
 
   private var muteCapsule: some View {
@@ -558,5 +527,48 @@ struct RayBanHUDBottomAudioActionRow: View {
     )
     .rayBanHUDPanel(shape: .capsule)
     .hoverSelectable(exitControl, shape: .capsule, onConfirm: onExit)
+  }
+}
+
+/// Walkie-talkie button — touch-only (press-and-hold or quick-tap latch), not
+/// `.hoverSelectable`: press-and-hold isn't a focus-engine pattern and the demo
+/// is driven by touch on the phone in hand. Reused by the coaching/diagnose
+/// bottom row (`RayBanHUDBottomAudioActionRow`) and the Troubleshoot confirm
+/// overlay's third "Talk" option.
+struct RayBanHUDTalkCapsule: View {
+  let isTalkEngaged: Bool
+  let onTalkDown: (() -> Void)?
+  let onTalkUp: (() -> Void)?
+
+  var body: some View {
+    HStack(spacing: 6) {
+      Image(systemName: isTalkEngaged ? "waveform" : "mic.circle.fill")
+        .font(.system(size: 13, weight: .semibold))
+      Text(isTalkEngaged ? "Talking…" : "Talk")
+        .font(.inter(.medium, size: 13))
+        .lineLimit(1)
+        .fixedSize(horizontal: true, vertical: false)
+    }
+    .foregroundStyle(Color.white.opacity(isTalkEngaged ? 0.98 : 0.9))
+    .padding(.horizontal, 12)
+    .padding(.vertical, 7)
+    .layoutPriority(1)
+    .background(
+      Capsule()
+        .fill(Color(red: 0.13, green: 0.55, blue: 0.30).opacity(isTalkEngaged ? 0.75 : 0))
+    )
+    .rayBanHUDPanel(shape: .capsule)
+    // `onLongPressGesture(pressing:)` is purpose-built for press/release tracking
+    // and — unlike a DragGesture — resists the HUD's paging/scroll gestures and
+    // won't cancel on finger drift, so a real hold stays a hold. `minimumDuration`
+    // is set huge so `perform` never fires; we only use the `pressing` callback.
+    .onLongPressGesture(
+      minimumDuration: 3600,
+      maximumDistance: .greatestFiniteMagnitude,
+      pressing: { isPressing in
+        if isPressing { onTalkDown?() } else { onTalkUp?() }
+      },
+      perform: {}
+    )
   }
 }
