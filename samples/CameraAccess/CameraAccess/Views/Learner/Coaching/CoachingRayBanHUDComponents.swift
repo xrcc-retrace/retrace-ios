@@ -5,6 +5,14 @@ enum RayBanHUDStepCardMode {
   case content(stepIndex: Int, stepCount: Int, step: ProcedureStepResponse?, isExpanded: Bool)
 }
 
+/// Media sub-tab inside `RayBanHUDDetailPanel`. Selects between the step
+/// clip (video) and the expert reference image. Hashable because it
+/// becomes the associated value of the Hashable `HUDControl.referenceTab`.
+enum MediaTab: Hashable, CaseIterable {
+  case video
+  case image
+}
+
 enum InsightCategory: String, CaseIterable, Hashable {
   case tips
   case warnings
@@ -286,24 +294,45 @@ struct RayBanHUDStepCard: View {
 /// will need a media-type-aware sub-view (see plan).
 struct RayBanHUDDetailPanel: View {
   let clipURL: URL?
+  /// Optional expert reference image for the whole procedure. When present
+  /// alongside a clip (and the feature flag is on), a Video | Image tab row
+  /// lets the learner switch between the step clip and this image.
+  let referenceImageURL: URL?
 
+  @AppStorage("referenceImageEnabled") private var referenceImageEnabled: Bool = false
   @State private var player: AVPlayer?
   @State private var isPlaying: Bool = false
+  @State private var mediaTab: MediaTab = .video
+
+  init(clipURL: URL?, referenceImageURL: URL? = nil) {
+    self.clipURL = clipURL
+    self.referenceImageURL = referenceImageURL
+  }
+
+  /// Show the Video | Image tab row only when both media exist and the
+  /// flag is on. When only the image exists (no clip), the panel shows the
+  /// image directly with no tabs.
+  private var showTabs: Bool {
+    referenceImageEnabled && clipURL != nil && referenceImageURL != nil
+  }
+
+  /// Whether the panel should currently render the reference image rather
+  /// than the clip: either the Image tab is selected (tabs shown), or this
+  /// is an image-only step (no clip but a reference image exists).
+  private var showingImage: Bool {
+    guard referenceImageEnabled, referenceImageURL != nil else { return false }
+    if showTabs { return mediaTab == .image }
+    return clipURL == nil
+  }
 
   var body: some View {
-    Group {
-      if let clipURL {
-        clipView(url: clipURL)
-      } else {
-        noClipPlaceholder
+    VStack(spacing: 8) {
+      if showTabs {
+        mediaTabs
       }
+
+      mediaArea
     }
-    .frame(maxWidth: .infinity)
-    .frame(height: RayBanHUDLayoutTokens.detailHeight)
-    .clipShape(
-      RoundedRectangle(cornerRadius: RayBanHUDLayoutTokens.cardRadius, style: .continuous)
-    )
-    .rayBanHUDPanel(shape: .rounded(RayBanHUDLayoutTokens.cardRadius))
     .hoverSelectable(
       .referenceClip,
       shape: .rounded(RayBanHUDLayoutTokens.cardRadius),
@@ -317,7 +346,71 @@ struct RayBanHUDDetailPanel: View {
       player?.pause()
       player = nil
       isPlaying = false
+      mediaTab = .video
     }
+  }
+
+  @ViewBuilder
+  private var mediaArea: some View {
+    Group {
+      if showingImage, let referenceImageURL {
+        imageView(url: referenceImageURL)
+      } else if let clipURL {
+        clipView(url: clipURL)
+      } else {
+        noClipPlaceholder
+      }
+    }
+    .frame(maxWidth: .infinity)
+    .frame(height: RayBanHUDLayoutTokens.detailHeight)
+    .clipShape(
+      RoundedRectangle(cornerRadius: RayBanHUDLayoutTokens.cardRadius, style: .continuous)
+    )
+    .rayBanHUDPanel(shape: .rounded(RayBanHUDLayoutTokens.cardRadius))
+  }
+
+  /// Video | Image capsule tab row. Visual style copied from
+  /// `RayBanHUDStepCard.insightsTabs` (active = white fill + black text,
+  /// inactive = faint white fill + white text). Each tab is its own
+  /// `.hoverSelectable` so the focus engine can select it; nested inside
+  /// the panel's outer `.referenceClip` selectable, which keeps driving
+  /// playback for the media area.
+  private var mediaTabs: some View {
+    HStack(spacing: 6) {
+      ForEach(MediaTab.allCases, id: \.self) { tab in
+        let isActive = mediaTab == tab
+        Text(tab == .video ? "Video" : "Image")
+          .font(.inter(.medium, size: 13))
+          .foregroundStyle(isActive ? Color.black.opacity(0.9) : Color.white.opacity(0.92))
+          .padding(.horizontal, 12)
+          .padding(.vertical, 6)
+          .background(
+            Capsule().fill(isActive ? Color.white.opacity(0.95) : Color.white.opacity(0.08))
+          )
+          .hoverSelectable(.referenceTab(tab), shape: .capsule) {
+            mediaTab = tab
+          }
+      }
+      Spacer(minLength: 0)
+    }
+  }
+
+  @ViewBuilder
+  private func imageView(url: URL) -> some View {
+    AsyncImage(url: url) { phase in
+      switch phase {
+      case .success(let image):
+        image
+          .resizable()
+          .scaledToFit()
+      case .empty:
+        ProgressView()
+          .progressViewStyle(CircularProgressViewStyle(tint: .white))
+      default:
+        noClipPlaceholder
+      }
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
   }
 
   @ViewBuilder
@@ -368,6 +461,7 @@ struct RayBanHUDDetailPanel: View {
   /// state) or when a non-video URL is passed (forward-looking guard
   /// — currently not exercised since the server only emits MP4s).
   private func togglePlayback() {
+    guard mediaTab == .video else { return }
     guard let url = clipURL else { return }
     if player == nil {
       let p = AVPlayer(url: url)

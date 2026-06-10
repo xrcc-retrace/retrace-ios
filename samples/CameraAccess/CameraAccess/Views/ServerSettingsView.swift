@@ -41,6 +41,10 @@ struct DebugSettingsSection: View {
   /// without a restart. Touch + lens swipes still work; only the
   /// pinch / micro-gesture path is muted.
   @AppStorage("disableHandTracking") private var disableHandTracking: Bool = false
+  /// Gates the experimental expert reference-image feature. When on, the
+  /// procedure review screen exposes a reference-photo picker and the
+  /// Coaching reference panel can show that image alongside the step clip.
+  @AppStorage("referenceImageEnabled") private var referenceImageEnabled: Bool = false
 
   var body: some View {
     VStack(alignment: .leading, spacing: Spacing.md) {
@@ -88,6 +92,22 @@ struct DebugSettingsSection: View {
             .font(.retraceCallout)
             .foregroundColor(.textPrimary)
           Text("Silences the MediaPipe pinch-drag and micro-gesture pipeline across Expert, Coaching, and Troubleshoot. Touch swipes and taps still work. Useful when running without good lighting or when you'd rather drive the HUD purely from touch.")
+            .font(.retraceCaption1)
+            .foregroundColor(.textTertiary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+      }
+      .tint(.appPrimary)
+      .padding(14)
+      .background(Color.surfaceRaised)
+      .cornerRadius(Radius.md)
+
+      Toggle(isOn: $referenceImageEnabled) {
+        VStack(alignment: .leading, spacing: 2) {
+          Text("Reference image upload")
+            .font(.retraceCallout)
+            .foregroundColor(.textPrimary)
+          Text("Lets experts attach a reference photo (e.g. a circuit diagram) during procedure review. Learners can view it alongside the step clip in the coaching reference panel.")
             .font(.retraceCaption1)
             .foregroundColor(.textTertiary)
             .fixedSize(horizontal: false, vertical: true)

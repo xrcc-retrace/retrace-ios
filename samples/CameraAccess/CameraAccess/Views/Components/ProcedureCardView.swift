@@ -15,6 +15,11 @@ struct ProcedureCardView: View {
   let sourceType: String?
   /// Procedure-level error message, surfaced on the failed-state card.
   let errorMessage: String?
+  /// Optional expert-attached reference image path. Drives the "Ref" pill
+  /// when the feature flag is on. Optional so older server builds compile.
+  let referenceImageUrl: String?
+
+  @AppStorage("referenceImageEnabled") private var referenceImageEnabled = false
 
   /// Drives the badge pulse animation when status == "processing".
   /// Toggled once in `.onAppear`; the `.repeatForever` modifier on
@@ -32,7 +37,8 @@ struct ProcedureCardView: View {
     iconSymbol: String? = nil,
     iconEmoji: String? = nil,
     sourceType: String? = nil,
-    errorMessage: String? = nil
+    errorMessage: String? = nil,
+    referenceImageUrl: String? = nil
   ) {
     self.title = title
     self.description = description
@@ -44,6 +50,7 @@ struct ProcedureCardView: View {
     self.iconEmoji = iconEmoji
     self.sourceType = sourceType
     self.errorMessage = errorMessage
+    self.referenceImageUrl = referenceImageUrl
   }
 
   var body: some View {
@@ -126,6 +133,9 @@ struct ProcedureCardView: View {
           }
         } else {
           MetadataPill(icon: "list.number", text: "\(stepCount) steps")
+        }
+        if referenceImageEnabled, let ref = referenceImageUrl, !ref.isEmpty {
+          MetadataPill(icon: "photo", text: "Ref")
         }
       }
     }

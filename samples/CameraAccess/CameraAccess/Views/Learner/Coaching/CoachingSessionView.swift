@@ -509,6 +509,13 @@ struct CoachingSessionView: View {
     return URL(string: "\(serverBaseURL)\(clipUrl)")
   }
 
+  /// Procedure-level expert reference image (not per-step). Resolved from
+  /// the procedure's `reference_image_url`; nil when none was attached.
+  private var procedureReferenceImageURL: URL? {
+    guard let path = procedure.referenceImageUrl else { return nil }
+    return URL(string: "\(serverBaseURL)\(path)")
+  }
+
   // MARK: - Ray-Ban emulator pages
 
   /// Ordered list of pages the lens emulator paginates through. Today
@@ -528,6 +535,7 @@ struct CoachingSessionView: View {
         viewModel: viewModel,
         stepCount: procedure.steps.count,
         clipURL: currentStepClipURL,
+        referenceImageURL: procedureReferenceImageURL,
         // Pass through the exit-overlay flag so the step card's
         // auto-scrolling description suspends while the recede recipe
         // is up — the user's scroll position is preserved across the

@@ -1,5 +1,9 @@
 *.xcframework/
 
+## macOS metadata
+.DS_Store
+xcuserdata/
+
 # Bundler / Fastlane
 vendor/bundle/
 .bundle/

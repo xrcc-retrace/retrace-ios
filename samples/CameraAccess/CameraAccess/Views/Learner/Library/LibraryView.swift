@@ -183,7 +183,8 @@ struct LibraryView: View {
                 createdAt: procedure.createdAt,
                 status: procedure.status,
                 iconSymbol: procedure.iconSymbol,
-                iconEmoji: procedure.iconEmoji
+                iconEmoji: procedure.iconEmoji,
+                referenceImageUrl: procedure.referenceImageUrl
               )
             }
           }

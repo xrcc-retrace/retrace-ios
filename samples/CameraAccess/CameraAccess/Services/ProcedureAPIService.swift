@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 
 @MainActor
 class ProcedureAPIService: ObservableObject {
@@ -332,6 +333,65 @@ class ProcedureAPIService: ObservableObject {
       throw APIError.serverError
     }
     return try decoder.decode(ManualStatusResponse.self, from: data)
+  }
+
+  // MARK: - Expert reference image upload
+
+  private struct ReferenceImageUploadResponse: Decodable {
+    let referenceImageUrl: String
+
+    enum CodingKeys: String, CodingKey {
+      case referenceImageUrl = "reference_image_url"
+    }
+  }
+
+  /// Upload an expert-attached reference photo for a procedure (e.g. a
+  /// circuit diagram). Multipart field name `file`. Returns the server
+  /// path (`/api/reference_images/{id}.{ext}`) for the stored image.
+  func uploadReferenceImage(procedureId: String, imageData: Data, ext: String) async throws -> String {
+    guard let url = URL(string: "\(serverBaseURL)/api/expert/procedures/\(procedureId)/reference-image") else {
+      throw APIError.invalidURL
+    }
+    let boundary = "Boundary-\(UUID().uuidString)"
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+
+    let mimeType = "image/\(ext == "jpg" ? "jpeg" : ext)"
+    var body = Data()
+    body.append("--\(boundary)\r\n".data(using: .utf8)!)
+    body.append("Content-Disposition: form-data; name=\"file\"; filename=\"reference.\(ext)\"\r\n".data(using: .utf8)!)
+    body.append("Content-Type: \(mimeType)\r\n\r\n".data(using: .utf8)!)
+    body.append(imageData)
+    body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
+    request.httpBody = body
+
+    let (data, response) = try await URLSession.shared.data(for: request)
+    guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+      throw APIError.serverError
+    }
+    return try decoder.decode(ReferenceImageUploadResponse.self, from: data).referenceImageUrl
+  }
+
+  /// Convenience overload: JPEG-encodes a `UIImage` (quality 0.75) and uploads
+  /// it. Centralizes the encode shared by the expert review + edit flows.
+  func uploadReferenceImage(procedureId: String, image: UIImage) async throws -> String {
+    let jpeg = image.jpegData(compressionQuality: 0.75) ?? Data()
+    return try await uploadReferenceImage(procedureId: procedureId, imageData: jpeg, ext: "jpg")
+  }
+
+  /// Remove the reference image attached to a procedure. Server returns
+  /// `{"reference_image_url": null}`; we ignore the body and just confirm 2xx.
+  func deleteReferenceImage(procedureId: String) async throws {
+    guard let url = URL(string: "\(serverBaseURL)/api/expert/procedures/\(procedureId)/reference-image") else {
+      throw APIError.invalidURL
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = "DELETE"
+    let (_, response) = try await URLSession.shared.data(for: request)
+    guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+      throw APIError.serverError
+    }
   }
 
   // MARK: - Base URL accessor for clip URLs

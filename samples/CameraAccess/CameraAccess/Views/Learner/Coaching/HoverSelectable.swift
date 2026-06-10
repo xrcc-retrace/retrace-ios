@@ -14,6 +14,10 @@ enum HUDControl: Hashable {
   case exitWorkflow
   case completionSavedWorkflows
   case insightsTab(InsightCategory)
+  /// Video | Image sub-tab inside the Coaching reference panel. Selectable
+  /// when both a step clip and an expert reference image exist (feature
+  /// flagged). Mirrors `.insightsTab` — not in the directional focus graph.
+  case referenceTab(MediaTab)
   case expertStopRecording
   case expertTipCard
   /// "X" cancel button on the Expert stop-recording confirmation

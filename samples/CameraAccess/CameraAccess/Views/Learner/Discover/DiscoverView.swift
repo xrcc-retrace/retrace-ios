@@ -274,7 +274,8 @@ struct DiscoverView: View {
           iconSymbol: procedure.iconSymbol,
           iconEmoji: procedure.iconEmoji,
           sourceType: procedure.sourceType,
-          errorMessage: procedure.errorMessage
+          errorMessage: procedure.errorMessage,
+          referenceImageUrl: procedure.referenceImageUrl
         )
         // Tap navigates to detail unless the row is still processing —
         // the placeholder state is non-interactive (no chevron, no tap

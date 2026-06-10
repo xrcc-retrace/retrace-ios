@@ -62,6 +62,7 @@
 		5C974C2AB0E8B6920F302AA2 /* MicroGestureRecognizerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F03B4126B7992B8C4EEED886 /* MicroGestureRecognizerTests.swift */; };
 		5D814FE48DB22EA1AC1F10D6 /* StepCompletionOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = 987E45559FBEF6734EBC7931 /* StepCompletionOverlay.swift */; };
 		5DD6406BB4A46418A2193B60 /* DiagnosticPhaseBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = C63E4DB6B45A9AAD0ECFEE8F /* DiagnosticPhaseBar.swift */; };
+		6046488EB1A7B0CF3EB2C214 /* ZoomableImageViewer.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD554B5BA2E45691C8771E44 /* ZoomableImageViewer.swift */; };
 		60DF4617925A0CACD6F03C7E /* CoachingSessionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 74A24F39AC3FBF21EED9B635 /* CoachingSessionView.swift */; };
 		623E3C45394ED08F5E0A2C4B /* CoachingExitConfirmHandler.swift in Sources */ = {isa = PBXBuildFile; fileRef = E61B9285EA1004D1AEEBDE44 /* CoachingExitConfirmHandler.swift */; };
 		65EF4A519FF63B1F403F75A1 /* ExpertCoachingTips.swift in Sources */ = {isa = PBXBuildFile; fileRef = C8C748278F0F5C3661104317 /* ExpertCoachingTips.swift */; };
@@ -120,6 +121,7 @@
 		944B4BBCAE19C6DFF7A25444 /* WorkflowListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46AF40C98BC7FE0C7AC6C759 /* WorkflowListView.swift */; };
 		994A4B418FF5A91E813B7DC4 /* TroubleshootStageHeaderCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0A444E4CB59DAEA56FF00E5D /* TroubleshootStageHeaderCard.swift */; };
 		9AF04D3F87B6DC700258DDF6 /* AudioSessionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 489D4C508C3B294BAD1E51D9 /* AudioSessionManager.swift */; };
+		9CDA420C85AF28FBDA910C5B /* ReferenceImagePicker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 499E43EF91E081B5BF03C682 /* ReferenceImagePicker.swift */; };
 		9EB646868A00AFD405367AB3 /* LocalProgressStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 07404D8FBB8C80A8A82E300C /* LocalProgressStore.swift */; };
 		9ED5507B6DAF993CD2049D46 /* BottomDrawer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9335DB8EDEFA17CB49E9ABDD /* BottomDrawer.swift */; };
 		A0E547C58FF5989932C14DDC /* WorkflowListViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39E042E4AC27537C599E1532 /* WorkflowListViewModel.swift */; };
@@ -245,6 +247,7 @@
 		44C44034ACD8780D26CA09B2 /* TroubleshootSearchingPage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TroubleshootSearchingPage.swift; path = CameraAccess/Views/Troubleshoot/Pages/TroubleshootSearchingPage.swift; sourceTree = SOURCE_ROOT; };
 		46AF40C98BC7FE0C7AC6C759 /* WorkflowListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = WorkflowListView.swift; path = CameraAccess/Views/Expert/WorkflowListView.swift; sourceTree = SOURCE_ROOT; };
 		489D4C508C3B294BAD1E51D9 /* AudioSessionManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AudioSessionManager.swift; path = CameraAccess/Utils/AudioSessionManager.swift; sourceTree = SOURCE_ROOT; };
+		499E43EF91E081B5BF03C682 /* ReferenceImagePicker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ReferenceImagePicker.swift; path = CameraAccess/Views/Components/ReferenceImagePicker.swift; sourceTree = SOURCE_ROOT; };
 		499F4D8E9A46087CEB86D631 /* ProcedureReviewView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ProcedureReviewView.swift; path = CameraAccess/Views/Expert/ProcedureReviewView.swift; sourceTree = SOURCE_ROOT; };
 		4EE54C2F993327C350C47178 /* PDFPreviewView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PDFPreviewView.swift; path = CameraAccess/Views/Expert/PDFPreviewView.swift; sourceTree = SOURCE_ROOT; };
 		4FFD4E1884B15ADD90501837 /* GeminiLiveService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = GeminiLiveService.swift; path = CameraAccess/Services/GeminiLiveService.swift; sourceTree = SOURCE_ROOT; };
@@ -363,6 +366,7 @@
 		D6BD4EEEA270A1F20B895BA5 /* CompletionFeedback.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = CompletionFeedback.swift; path = CameraAccess/Services/CompletionFeedback.swift; sourceTree = SOURCE_ROOT; };
 		D7014E92A26E9858AE17F0C3 /* OnboardingContainerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = OnboardingContainerView.swift; path = CameraAccess/Views/Onboarding/OnboardingContainerView.swift; sourceTree = SOURCE_ROOT; };
 		DCFE420BBC04BE5574B2C3DD /* DiscoverViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = DiscoverViewModel.swift; path = CameraAccess/ViewModels/DiscoverViewModel.swift; sourceTree = SOURCE_ROOT; };
+		DD554B5BA2E45691C8771E44 /* ZoomableImageViewer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ZoomableImageViewer.swift; path = CameraAccess/Views/Components/ZoomableImageViewer.swift; sourceTree = SOURCE_ROOT; };
 		DDCEB1A9F8E7D6C5F8A7B6C4 /* PinchDragRecognizerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PinchDragRecognizerTests.swift; path = CameraAccessTests/PinchDragRecognizerTests.swift; sourceTree = SOURCE_ROOT; };
 		DE4028B402B545D8AE4181B2 /* AppOrientationController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AppOrientationController.swift; path = CameraAccess/Utils/AppOrientationController.swift; sourceTree = SOURCE_ROOT; };
 		DEB0447F881367FC38E1DC03 /* CachedAsyncImage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = CachedAsyncImage.swift; path = CameraAccess/Views/Components/CachedAsyncImage.swift; sourceTree = SOURCE_ROOT; };
@@ -567,6 +571,8 @@
 				987E45559FBEF6734EBC7931 /* StepCompletionOverlay.swift */,
 				D6BD4EEEA270A1F20B895BA5 /* CompletionFeedback.swift */,
 				C08341B2B93A541E594BF44D /* GlassesCoachingFrameSource.swift */,
+				DD554B5BA2E45691C8771E44 /* ZoomableImageViewer.swift */,
+				499E43EF91E081B5BF03C682 /* ReferenceImagePicker.swift */,
 			);
 			sourceTree = "<group>";
 		};
@@ -1054,6 +1060,8 @@
 				5D814FE48DB22EA1AC1F10D6 /* StepCompletionOverlay.swift in Sources */,
 				06B04EF6950DF925B13B574F /* CompletionFeedback.swift in Sources */,
 				47714C6EB4B516B37D200490 /* GlassesCoachingFrameSource.swift in Sources */,
+				6046488EB1A7B0CF3EB2C214 /* ZoomableImageViewer.swift in Sources */,
+				9CDA420C85AF28FBDA910C5B /* ReferenceImagePicker.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -1093,7 +1101,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_ASSET_PATHS = "";
-				DEVELOPMENT_TEAM = V56DG94ZL5;
+				DEVELOPMENT_TEAM = 9SVBTR9GV3;
 				ENABLE_PREVIEWS = YES;
 				FRAMEWORK_SEARCH_PATHS = "";
 				INFOPLIST_FILE = CameraAccess/Info.plist;
@@ -1103,7 +1111,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.xrcc.retrace.ios.v1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.xrccart.retrace.ios.v1;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SWIFT_VERSION = 5.0;
@@ -1122,7 +1130,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_ASSET_PATHS = "";
-				DEVELOPMENT_TEAM = V56DG94ZL5;
+				DEVELOPMENT_TEAM = 9SVBTR9GV3;
 				ENABLE_PREVIEWS = YES;
 				INFOPLIST_FILE = CameraAccess/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
@@ -1131,7 +1139,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.xrcc.retrace.ios.v1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.xrccart.retrace.ios.v1;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SWIFT_VERSION = 5.0;
