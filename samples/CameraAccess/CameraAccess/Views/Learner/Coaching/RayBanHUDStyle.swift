@@ -365,6 +365,13 @@ struct RayBanHUDBottomAudioActionRow: View {
   let onToggleMute: () -> Void
   let onExit: () -> Void
 
+  // Push-to-talk (walkie-talkie) — only the coaching call site passes these;
+  // Troubleshoot pages use the defaults so the Talk capsule stays hidden.
+  let isPushToTalk: Bool
+  let isTalkEngaged: Bool
+  let onTalkDown: (() -> Void)?
+  let onTalkUp: (() -> Void)?
+
   /// Mirrors the same AppStorage key `HandTrackingStatusIndicator`
   /// reads. When the user disables hand tracking in Server Settings →
   /// Debug, the indicator returns EmptyView and we replace its slot
@@ -380,7 +387,11 @@ struct RayBanHUDBottomAudioActionRow: View {
     muteControl: HUDControl,
     exitControl: HUDControl,
     onToggleMute: @escaping () -> Void,
-    onExit: @escaping () -> Void
+    onExit: @escaping () -> Void,
+    isPushToTalk: Bool = false,
+    isTalkEngaged: Bool = false,
+    onTalkDown: (() -> Void)? = nil,
+    onTalkUp: (() -> Void)? = nil
   ) {
     self.isMuted = isMuted
     self.aiPeak = aiPeak
@@ -390,6 +401,10 @@ struct RayBanHUDBottomAudioActionRow: View {
     self.exitControl = exitControl
     self.onToggleMute = onToggleMute
     self.onExit = onExit
+    self.isPushToTalk = isPushToTalk
+    self.isTalkEngaged = isTalkEngaged
+    self.onTalkDown = onTalkDown
+    self.onTalkUp = onTalkUp
   }
 
   var body: some View {
@@ -419,7 +434,7 @@ struct RayBanHUDBottomAudioActionRow: View {
     //   between mute and exit via symmetric `Spacer()`s.
     HStack(alignment: .bottom, spacing: 6) {
       if disableHandTracking {
-        muteCapsule
+        muteAndTalkCluster
 
         Spacer(minLength: 0)
 
@@ -431,7 +446,7 @@ struct RayBanHUDBottomAudioActionRow: View {
         exitCapsule
           .layoutPriority(1)
       } else {
-        muteCapsule
+        muteAndTalkCluster
           .frame(maxWidth: .infinity, alignment: .leading)
 
         wideAudioMeter
@@ -448,6 +463,51 @@ struct RayBanHUDBottomAudioActionRow: View {
       }
     }
     .frame(height: 34)
+  }
+
+  /// Mute, plus the Talk capsule beside it in push-to-talk demo mode.
+  private var muteAndTalkCluster: some View {
+    HStack(spacing: 6) {
+      muteCapsule
+      if isPushToTalk {
+        talkCapsule
+      }
+    }
+  }
+
+  /// Walkie-talkie button — touch-only (press-and-hold or quick-tap latch), not
+  /// `.hoverSelectable`: press-and-hold isn't a focus-engine pattern and the
+  /// demo is driven by touch on the phone in hand.
+  private var talkCapsule: some View {
+    HStack(spacing: 6) {
+      Image(systemName: isTalkEngaged ? "waveform" : "mic.circle.fill")
+        .font(.system(size: 13, weight: .semibold))
+      Text(isTalkEngaged ? "Talking…" : "Talk")
+        .font(.inter(.medium, size: 13))
+        .lineLimit(1)
+        .fixedSize(horizontal: true, vertical: false)
+    }
+    .foregroundStyle(Color.white.opacity(isTalkEngaged ? 0.98 : 0.9))
+    .padding(.horizontal, 12)
+    .padding(.vertical, 7)
+    .layoutPriority(1)
+    .background(
+      Capsule()
+        .fill(Color(red: 0.13, green: 0.55, blue: 0.30).opacity(isTalkEngaged ? 0.75 : 0))
+    )
+    .rayBanHUDPanel(shape: .capsule)
+    // `onLongPressGesture(pressing:)` is purpose-built for press/release tracking
+    // and — unlike a DragGesture — resists the HUD's paging/scroll gestures and
+    // won't cancel on finger drift, so a real hold stays a hold. `minimumDuration`
+    // is set huge so `perform` never fires; we only use the `pressing` callback.
+    .onLongPressGesture(
+      minimumDuration: 3600,
+      maximumDistance: .greatestFiniteMagnitude,
+      pressing: { isPressing in
+        if isPressing { onTalkDown?() } else { onTalkUp?() }
+      },
+      perform: {}
+    )
   }
 
   private var muteCapsule: some View {

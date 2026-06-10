@@ -323,6 +323,10 @@ class CoachingSessionViewModel: GeminiLiveSessionBase {
     _transport == .iPhone ? .coachingPhoneOnly : .coaching
   }
 
+  /// Coaching exposes the walkie-talkie Talk button (gated to the iPhone
+  /// Mac-route demo by `isPushToTalkActive` in the base).
+  override var supportsPushToTalk: Bool { true }
+
   override func onConnectedExtra() {
     // Heartbeat arms on every .connected transition (including resumption
     // reconnects). scheduleNextHeartbeat cancels any prior tick before

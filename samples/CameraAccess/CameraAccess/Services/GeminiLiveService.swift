@@ -211,6 +211,20 @@ class GeminiLiveService: ObservableObject {
     }
   }
 
+  /// Tell Gemini the user's audio stream has ended (push-to-talk release). With
+  /// automatic VAD enabled (our token's default) this forces the model to
+  /// finalize the current turn and respond. Resume later by simply sending
+  /// audio again — Gemini reopens the stream on the next audio message.
+  func sendAudioStreamEnd() async throws {
+    let json: [String: Any] = ["realtimeInput": ["audioStreamEnd": true]]
+    let data = try JSONSerialization.data(withJSONObject: json)
+    guard let text = String(data: data, encoding: .utf8) else {
+      throw LiveServiceError.encodingFailed
+    }
+    try await sendText(text)
+    print("[GeminiLive] audioStreamEnd sent — finalizing user turn")
+  }
+
   /// Send a single JPEG-encoded video frame to Gemini Live.
   /// Call at a modest rate (≈0.5 fps) — Gemini Live is rate-limited on video input.
   /// Wire format: canonical `realtimeInput.video` blob (not the deprecated
