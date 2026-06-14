@@ -216,7 +216,7 @@ final class DeviceSessionManager: ObservableObject {
       let after = try await wearables.requestPermission(.camera)
       cameraPermission = after
       log("ensureCameraPermissionGranted: post-prompt status = \(after)")
-      log("[Retrace.Diag][ensureCameraPermissionGranted] post-prompt wearables.devices.count=\(wearables.devices.count) hasAnyActive=\(hasAnyActiveDevice) hasDisplay=\(hasDisplayCapableDevice)")
+      log("ensureCameraPermissionGranted: post-prompt devices=\(wearables.devices.count) hasAnyActive=\(hasAnyActiveDevice) hasDisplay=\(hasDisplayCapableDevice)")
       return after
     } catch {
       log("ensureCameraPermissionGranted: requestPermission threw: \(error)")
@@ -358,7 +358,7 @@ final class DeviceSessionManager: ObservableObject {
           return "{id=\(id) unresolved}"
         }
       }.joined(separator: ", ")
-      log("[Retrace.Diag][acquire] pre-createSession: req=\(requirements) wearables.devices.count=\(paired.count) [\(pairedDescriptions)]")
+      log("acquire(\(consumerLabel)) pre-createSession: req=\(requirements) devices=\(paired.count) [\(pairedDescriptions)]")
       log("acquire(\(consumerLabel), req=\(requirements)) → createSession + start")
       let session = try wearables.createSession(deviceSelector: selector)
       deviceSession = session
@@ -471,23 +471,22 @@ final class DeviceSessionManager: ObservableObject {
       }
     }
     let started = Date()
-    log("[Retrace.Diag][awaitMatchingDevice] enter req=\(requirements) hasAnyActive=\(hasAnyActiveDevice) hasDisplay=\(hasDisplayCapableDevice) devicesCount=\(wearables.devices.count) cameraPermission=\(cameraPermission.map { String(describing: $0) } ?? "nil")")
     if available() {
-      log("[Retrace.Diag][awaitMatchingDevice] already-available exit req=\(requirements)")
+      log("awaitMatchingDevice(req=\(requirements)) → already available")
       return
     }
-    log("awaitMatchingDevice(req=\(requirements)) → waiting up to \(timeout)s")
+    log("awaitMatchingDevice(req=\(requirements)) → waiting up to \(timeout)s (devices=\(wearables.devices.count) hasAnyActive=\(hasAnyActiveDevice) hasDisplay=\(hasDisplayCapableDevice))")
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
       try? await Task.sleep(nanoseconds: 150_000_000)
       if available() {
         let elapsed = Int(Date().timeIntervalSince(started) * 1000)
-        log("[Retrace.Diag][awaitMatchingDevice] matched after \(elapsed)ms req=\(requirements)")
+        log("awaitMatchingDevice(req=\(requirements)) → matched after \(elapsed)ms")
         return
       }
     }
     let elapsed = Int(Date().timeIntervalSince(started) * 1000)
-    log("[Retrace.Diag][awaitMatchingDevice] TIMEOUT after \(elapsed)ms req=\(requirements) devicesCount=\(wearables.devices.count) hasAnyActive=\(hasAnyActiveDevice) hasDisplay=\(hasDisplayCapableDevice) — createSession will throw noEligibleDevice")
+    log("awaitMatchingDevice(req=\(requirements)) → TIMEOUT after \(elapsed)ms (devices=\(wearables.devices.count) hasAnyActive=\(hasAnyActiveDevice) hasDisplay=\(hasDisplayCapableDevice)); createSession will throw noEligibleDevice")
   }
 
   // MARK: - Private — start race
@@ -610,13 +609,6 @@ final class DeviceSessionManager: ObservableObject {
       for await deviceId in strong.anyDeviceSelector.activeDeviceStream() {
         guard let strong = self else { return }
         strong.hasAnyActiveDevice = deviceId != nil
-        if let deviceId = deviceId, let device = strong.wearables.deviceForIdentifier(deviceId) {
-          strong.log("[Retrace.Diag][monitorActive] emit: device=\(device.nameOrId()) type=\(device.deviceType().rawValue) supportsDisplay=\(device.supportsDisplay()) compatibility=\(device.compatibility())")
-        } else if let deviceId = deviceId {
-          strong.log("[Retrace.Diag][monitorActive] emit: deviceId=\(deviceId) (unresolved — wearables.deviceForIdentifier returned nil)")
-        } else {
-          strong.log("[Retrace.Diag][monitorActive] emit: device=nil (no eligible device visible to DAT)")
-        }
       }
     }
     displayDeviceMonitorTask = Task { [weak self] in
@@ -624,13 +616,6 @@ final class DeviceSessionManager: ObservableObject {
       for await deviceId in strong.displayDeviceSelector.activeDeviceStream() {
         guard let strong = self else { return }
         strong.hasDisplayCapableDevice = deviceId != nil
-        if let deviceId = deviceId, let device = strong.wearables.deviceForIdentifier(deviceId) {
-          strong.log("[Retrace.Diag][monitorDisplay] emit: device=\(device.nameOrId()) type=\(device.deviceType().rawValue) supportsDisplay=\(device.supportsDisplay()) compatibility=\(device.compatibility())")
-        } else if let deviceId = deviceId {
-          strong.log("[Retrace.Diag][monitorDisplay] emit: deviceId=\(deviceId) (unresolved — wearables.deviceForIdentifier returned nil)")
-        } else {
-          strong.log("[Retrace.Diag][monitorDisplay] emit: device=nil (no display-capable device visible)")
-        }
       }
     }
   }

@@ -5,7 +5,7 @@ import Foundation
 
 /// Throttles `CMSampleBuffer` frames from `IPhoneCameraCapture` and forwards
 /// them to Gemini Live as JPEG bytes at the same rate the glasses path uses
-/// (≈0.5 fps by default — `videoMinInterval` 2.0s).
+/// (1 fps by default — `videoMinInterval` 1.0s).
 ///
 /// All frame processing happens on the AVCapture delegate queue that delivered
 /// the sample buffer; no hop to MainActor. Lock-protected state for the

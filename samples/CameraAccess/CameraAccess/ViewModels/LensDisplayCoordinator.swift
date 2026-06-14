@@ -76,6 +76,26 @@ final class LensDisplayCoordinator: ObservableObject {
   /// in that mode.
   private var managerSessionErrorsCancellable: AnyCancellable?
 
+  /// Set true once an `attachToDisplay()` attempt fails with a reason
+  /// that won't resolve without external state change (active glasses
+  /// don't support display, or no display-capable device is reachable
+  /// at all). Subsequent `attachToDisplay()` calls short-circuit so a
+  /// renderer pumping ~8 lazy `coordinator.send` calls per second on a
+  /// non-display device doesn't loop attach attempts at the same rate.
+  ///
+  /// Reset in `resetDisplaySession()` — which fires whenever
+  /// `wearables.registrationStateStream()` emits `.available` /
+  /// `.unavailable`, i.e. exactly the moments when "try again" might
+  /// produce a different outcome (a Display device just paired, or the
+  /// active non-display device disconnected).
+  ///
+  /// NOT set for `datAppOnTheGlassesUpdateRequired` (own recovery UI),
+  /// generic catch-all errors (those flip `didFailToStartSession`), or
+  /// the inline path's typed `DeviceSessionError` cases — the same
+  /// "permanent for the current registration" rationale doesn't apply
+  /// uniformly to those.
+  private var attachUnavailableForCurrentRegistration: Bool = false
+
   /// Reads the live debug toggle. Re-read on each `attachToDisplay()`
   /// so a flip in Settings takes effect on the next attach (no app
   /// relaunch required).
@@ -121,6 +141,11 @@ final class LensDisplayCoordinator: ObservableObject {
 
   private func resetDisplaySession() async {
     await detachFromDisplay()
+    // Registration state just flipped — the world might look different
+    // now (Display just paired, or the active non-display device just
+    // disconnected). Clear the "attach unavailable" short-circuit so
+    // the next `coordinator.send(_:)` triggers a fresh attach attempt.
+    attachUnavailableForCurrentRegistration = false
     deviceSelector = AutoDeviceSelector(
       wearables: wearables,
       filter: { $0.supportsDisplay() }
@@ -173,6 +198,13 @@ final class LensDisplayCoordinator: ObservableObject {
 
   func attachToDisplay() async {
     guard display == nil else { return }
+    // Short-circuit if a prior attempt against the current registration
+    // state already determined no display device is reachable / claimable.
+    // Without this, a renderer pumping ~8 lazy `coordinator.send` calls
+    // per second on a non-display device would loop attach attempts at
+    // the same rate, hammering DSM and flooding logs. Reset happens in
+    // `resetDisplaySession()` when registration availability changes.
+    guard !attachUnavailableForCurrentRegistration else { return }
 
     didFailToStartSession = false
 
@@ -226,9 +258,15 @@ final class LensDisplayCoordinator: ObservableObject {
       // glasses — the phone-side SwiftUI emulator is the UI. Not an
       // error to surface in the UI; just log the diagnosis and leave
       // `display = nil` so `LensSession.send(_:)` no-ops cleanly.
+      //
+      // Set `attachUnavailableForCurrentRegistration = true` so the
+      // ~120ms-cadence lazy `coordinator.send` calls don't loop attach
+      // attempts at the same rate. The flag clears in
+      // `resetDisplaySession()` when registration state changes.
       print("[LensDisplayCoordinator] lens output unavailable — active glasses do not support display capability (non-display DAT model); phone UI takes over")
       requiresDATAppUpdate = false
       didFailToStartSession = false
+      attachUnavailableForCurrentRegistration = true
     } catch DeviceSessionManager.AcquireError.noEligibleDevice {
       // No display-capable device is currently reachable. Same outcome
       // as the requirements-conflict case: the phone UI takes over, lens
@@ -238,6 +276,7 @@ final class LensDisplayCoordinator: ObservableObject {
       print("[LensDisplayCoordinator] lens output unavailable — no display-capable glasses reachable (no Ray-Ban Meta Display paired or active)")
       requiresDATAppUpdate = false
       didFailToStartSession = false
+      attachUnavailableForCurrentRegistration = true
     } catch {
       print("[LensDisplayCoordinator] manager.acquire threw → \(error)")
       requiresDATAppUpdate = false

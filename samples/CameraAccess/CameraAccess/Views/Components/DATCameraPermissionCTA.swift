@@ -267,17 +267,17 @@ struct DATCameraPermissionCTA: View {
       // PermissionError (action: investigate Dev Mode / DAT helper).
       do {
         let value = try await sessionManager.allGlassesPermissionsGranted()
-        print("[Retrace.Diag][CTA] allGlassesPermissionsGranted returned: \(value)")
+        print("[CTA] allGlassesPermissionsGranted returned: \(value)")
         return value
       } catch {
-        print("[Retrace.Diag][CTA] allGlassesPermissionsGranted threw — type=\(String(describing: type(of: error))) value=\(error)")
+        print("[CTA] allGlassesPermissionsGranted threw — type=\(String(describing: type(of: error))) value=\(error)")
         return nil
       }
     }
     if granted == nil {
       // Either a real 5s timeout OR the inner closure logged a throw
-      // immediately and we got here via that path. The Retrace.Diag
-      // log above is the source of truth.
+      // immediately and we got here via that path. The [CTA] log above
+      // is the source of truth.
       print("[DATCameraPermissionCTA] allGlassesPermissionsGranted timed out after \(Self.statusCheckTimeout)s — surfacing CTA")
     }
     if granted == true {

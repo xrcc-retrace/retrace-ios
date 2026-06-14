@@ -34,12 +34,9 @@ final class LensSession: ObservableObject {
   /// The active renderer. Single-slot; replaced on `activate(_:vm:)`.
   private var currentRenderer: LensRenderer?
 
-  /// Reason the last `send(_:)` was suppressed (or `.delivered` if it
-  /// actually went through). Used to log only on transitions so a
-  /// renderer pumping 8 BT-sends/sec doesn't flood the console with the
-  /// same suppression message. Cleared on `deactivate()`.
-  private enum SendState { case undecided, delivered, toggleOff, displayNil }
-  private var lastSendState: SendState = .undecided
+  /// Whether the last `send(_:)` saw the toggle ON. Used to log once
+  /// per state transition (toggle flip) instead of per-send.
+  private var lastLoggedToggleState: Bool? = nil
 
   init(coordinator: LensDisplayCoordinator) {
     self.coordinator = coordinator
@@ -48,32 +45,29 @@ final class LensSession: ObservableObject {
   // MARK: - Public API
 
   /// Send a DisplayableView (FlexBox or VideoPlayer) to the glasses.
-  /// Silently no-ops when the lens output toggle is off or no display
-  /// is paired. Renderers and ad-hoc smoke tests call through here so
-  /// the toggle gate stays in one place.
   ///
-  /// Suppression reasons are logged once per state transition (not per
-  /// send) — so "lens output disabled" or "display unavailable on this
-  /// device" surfaces clearly in the console without spamming.
+  /// Calls through to `LensDisplayCoordinator.send(_:)` which owns the
+  /// **lazy-attach** lifecycle: when `display == nil`, that first send
+  /// is what triggers `attachToDisplay()` and queues the view to fire
+  /// once the Display capability reaches `.started`. We must NOT short-
+  /// circuit here on `display == nil`, or the lens never attaches.
+  ///
+  /// The only gate that belongs in this wrapper is the user-controlled
+  /// `lensOutputEnabled` toggle from Server Settings → Debug.
+  /// Acquire-time failures (non-display device active, no display-capable
+  /// device reachable, DAT helper missing) surface via the coordinator's
+  /// own log lines — once per attach attempt, not per send.
   func send(_ view: some DisplayableView) async {
-    guard UserDefaults.standard.bool(forKey: "lensOutputEnabled") else {
-      if lastSendState != .toggleOff {
+    let toggleOn = UserDefaults.standard.bool(forKey: "lensOutputEnabled")
+    if lastLoggedToggleState != toggleOn {
+      if toggleOn {
+        print("[LensSession] send forwarding → coordinator (lensOutputEnabled=true)")
+      } else {
         print("[LensSession] send suppressed — lensOutputEnabled=false in Server Settings → Debug")
-        lastSendState = .toggleOff
       }
-      return
+      lastLoggedToggleState = toggleOn
     }
-    guard coordinator.display != nil else {
-      if lastSendState != .displayNil {
-        print("[LensSession] send suppressed — no display capability (non-display glasses or display not yet attached)")
-        lastSendState = .displayNil
-      }
-      return
-    }
-    if lastSendState != .delivered {
-      print("[LensSession] send delivering → glasses display")
-      lastSendState = .delivered
-    }
+    guard toggleOn else { return }
     await coordinator.send(view)
   }
 
@@ -126,7 +120,7 @@ final class LensSession: ObservableObject {
   func deactivate() {
     currentRenderer?.cancel()
     currentRenderer = nil
-    lastSendState = .undecided
+    lastLoggedToggleState = nil
     currentFlow = .idle
   }
 

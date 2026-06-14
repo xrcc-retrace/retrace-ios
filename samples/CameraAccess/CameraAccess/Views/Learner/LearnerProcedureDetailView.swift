@@ -403,19 +403,19 @@ struct LearnerProcedureDetailView: View {
         }
       }.joined(separator: ", ")
       let permDescription = deviceSessionManager.cameraPermission.map { String(describing: $0) } ?? "unavailable"
-      print("[Retrace.Diag][launchGate] transport=\(transport) hasActiveDevice=\(wearablesVM.hasActiveDevice) devicesCount=\(wearables.devices.count) [\(pairedSnapshot)] registrationState=\(wearablesVM.registrationState) cameraPermission=\(permDescription)")
+      print("[launchGate] transport=\(transport) hasActiveDevice=\(wearablesVM.hasActiveDevice) devicesCount=\(wearables.devices.count) [\(pairedSnapshot)] registrationState=\(wearablesVM.registrationState) cameraPermission=\(permDescription)")
       switch transport {
       case .glasses:
         // Pre-HOTFIX behavior restored 2026-05-21 — route on real glasses
         // connectivity now that lens + DeviceSessionManager are wired.
         if wearablesVM.registrationState != .registered {
-          print("[Retrace.Diag][launchGate] → routing to RegistrationPromptSheet (not .registered)")
+          print("[launchGate] → routing to RegistrationPromptSheet (not .registered)")
           showRegistrationSheet = true
         } else if !wearablesVM.hasActiveDevice {
-          print("[Retrace.Diag][launchGate] → routing to GlassesInactiveSheet (registered but no active device)")
+          print("[launchGate] → routing to GlassesInactiveSheet (registered but no active device)")
           showGlassesInactiveSheet = true
         } else {
-          print("[Retrace.Diag][launchGate] → presentedCoaching = .glasses")
+          print("[launchGate] → presentedCoaching = .glasses")
           presentedCoaching = .glasses
         }
       case .iPhone:

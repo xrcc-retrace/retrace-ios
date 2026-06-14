@@ -241,8 +241,8 @@ class GeminiLiveSessionBase: ObservableObject {
   // MARK: - Constants
 
   let activityMaxEntries = 200
-  let videoMinInterval: TimeInterval = 2.0
-  let videoJpegQuality: CGFloat = 0.5
+  let videoMinInterval: TimeInterval = 1.0
+  let videoJpegQuality: CGFloat = 0.85
 
   // MARK: - Combine
 
@@ -862,21 +862,33 @@ class GeminiLiveSessionBase: ObservableObject {
         // active consumer (e.g. lens) so adding capabilities here doesn't
         // require a private DeviceSession.
         do {
-          // Filterless `.any` so non-display DAT glasses (Oakley Meta
-          // Vanguard, regular Ray-Ban Meta Wayfarer/Skyler) can also drive
-          // Coaching + Troubleshoot — they speak PSM 129 and support
-          // Stream + BT-HFP audio just like Display. The lens-output path
-          // (`LensDisplayCoordinator`) still acquires with `.requiresDisplay`
-          // on its own consumer label, so a non-display device simply
-          // leaves `display` nil and `LensSession.send(_:)` no-ops — the
-          // phone-side SwiftUI emulator remains the UI on those models.
+          // Intent-aware acquire: when the user has lens output enabled
+          // AND a Display-capable device is reachable, bias the camera
+          // path to `.requiresDisplay` so the shared `DeviceSession` is
+          // guaranteed to land on the Display glasses. Without this, in
+          // multi-paired setups (Display + Vanguard both registered) the
+          // filterless selector's "first connected" tiebreak could pick
+          // the non-display device — and the lens consumer would then
+          // throw `requirementsConflictWithActiveSession`, leaving the
+          // lens dark even though Display is present.
           //
-          // Trade-off: if a Stories peripheral (older non-DAT-protocol
-          // model) is paired, the filterless selector will probe it and
-          // log "Unknown error: 436 — No known channel matching peer …".
-          // Console noise only, no functional regression.
-          let acquired = try await manager.acquire(consumerLabel: "gemini-live")
-          print("[Retrace.Diag][GeminiLive] acquire returned: deviceSession.state=\(acquired.state) deviceId=\(acquired.deviceId)")
+          // When `lensOutputEnabled` is off or no Display is reachable,
+          // fall back to `.any` — that preserves Step 13 behavior on
+          // non-display DAT glasses (Vanguard, regular RBM Wayfarer/
+          // Skyler): they speak PSM 129 and support Stream + BT-HFP
+          // audio, so Coaching + Troubleshoot still run with the phone-
+          // side SwiftUI emulator as the UI.
+          //
+          // Trade-off (only when falling back to `.any`): if a Stories
+          // peripheral is paired, the filterless selector will probe it
+          // and log "Unknown error: 436 — No known channel matching peer
+          // …". Console noise only, no functional regression.
+          let wantsLens = UserDefaults.standard.bool(forKey: "lensOutputEnabled")
+          let prefersDisplay = wantsLens && manager.hasDisplayCapableDevice
+          let req: DeviceSessionManager.DeviceRequirements = prefersDisplay ? .requiresDisplay : .any
+          print("[GeminiLive] acquire requirements=\(req) (wantsLens=\(wantsLens), hasDisplay=\(manager.hasDisplayCapableDevice))")
+          let acquired = try await manager.acquire(consumerLabel: "gemini-live", requirements: req)
+          print("[GeminiLive] acquire returned: deviceSession.state=\(acquired.state) deviceId=\(acquired.deviceId)")
           if let device = self.wearables.deviceForIdentifier(acquired.deviceId) {
             print("[GeminiLive] selected device: name=\(device.nameOrId()) type=\(device.deviceType().rawValue) supportsDisplay=\(device.supportsDisplay()) compatibility=\(device.compatibility())")
             let route = AVAudioSession.sharedInstance().currentRoute
@@ -894,10 +906,31 @@ class GeminiLiveSessionBase: ObservableObject {
             print("[GeminiLive]   lens will render: \(lensWillRender) \(lensWillRender ? "(glasses display)" : "(phone emulator only)")")
             print("[GeminiLive] ═════════════════════════════════════════════")
           }
+          // Glasses-path fidelity bump (2026-06-14): request .medium
+          // resolution at the SDK's lowest valid frame rate (2 fps).
+          // Per `mwdat-ios:camera-streaming`, valid frameRate values are
+          // {2, 7, 15, 24, 30} — 1 fps is not exposed by DAT 0.7. The iOS
+          // `videoMinInterval = 1.0s` throttle below drops every other DAT
+          // frame so Gemini sees 1 fps net. The skill is explicit:
+          // "Request lower settings for higher visual quality per frame"
+          // — dropping fps while keeping resolution modest gives the BT
+          // pipe bandwidth headroom to send each frame less-compressed.
+          //
+          // Why .medium and not .high: .high (720×1280) on Vanguard
+          // delayed the first frame past the 8s `awaitCameraReady`
+          // ceiling. .medium (504×896) at 2 fps still raises per-frame
+          // fidelity over the prior .low/24fps config without that
+          // first-frame ramp-up cost. The iOS-side `awaitCameraReady`
+          // ceiling is bumped to 30s as well for defense in depth.
+          //
+          // Phone preview will display 2 fps (matches the DAT emit rate).
+          // Only applies to the DSM-enabled manager branch; the inline-
+          // fallback path below keeps its conservative .low/24fps config
+          // as a known-stable rollback.
           let config = StreamConfiguration(
             videoCodec: .raw,
-            resolution: .low,
-            frameRate: 24
+            resolution: .medium,
+            frameRate: 2
           )
           guard let s = try acquired.addStream(config: config) else {
             print("[GeminiLive] Could not attach stream capability to the device session")
@@ -917,17 +950,17 @@ class GeminiLiveSessionBase: ObservableObject {
           await MainActor.run { self.pendingDATHelperUpdate = true }
           return
         } catch {
-          print("[Retrace.Diag][GeminiLive] manager.acquire('gemini-live') threw — type=\(String(describing: type(of: error))) value=\(error)")
+          print("[GeminiLive] manager.acquire('gemini-live') threw — type=\(String(describing: type(of: error))) value=\(error)")
           if let acquireError = error as? DeviceSessionManager.AcquireError {
             switch acquireError {
             case .sessionStartFailed(let underlying):
-              print("[Retrace.Diag][GeminiLive]   AcquireError.sessionStartFailed underlying type=\(String(describing: type(of: underlying))) value=\(underlying)")
+              print("[GeminiLive]   AcquireError.sessionStartFailed underlying type=\(String(describing: type(of: underlying))) value=\(underlying)")
             case .requirementsConflictWithActiveSession(let req):
-              print("[Retrace.Diag][GeminiLive]   AcquireError.requirementsConflictWithActiveSession req=\(req)")
+              print("[GeminiLive]   AcquireError.requirementsConflictWithActiveSession req=\(req)")
             case .permissionCheckFailed(let msg):
-              print("[Retrace.Diag][GeminiLive]   AcquireError.permissionCheckFailed message=\(msg)")
+              print("[GeminiLive]   AcquireError.permissionCheckFailed message=\(msg)")
             case .noEligibleDevice, .startTimedOut, .cancelled, .cameraPermissionDenied:
-              print("[Retrace.Diag][GeminiLive]   AcquireError leaf case=\(acquireError)")
+              print("[GeminiLive]   AcquireError leaf case=\(acquireError)")
             }
           }
           print("[GeminiLive] manager.acquire('gemini-live') failed: \(error)")
@@ -1004,9 +1037,9 @@ class GeminiLiveSessionBase: ObservableObject {
           await MainActor.run { self.pendingDATHelperUpdate = true }
           return
         } catch {
-          print("[Retrace.Diag][GeminiLive] Inline createSession threw — type=\(String(describing: type(of: error))) value=\(error)")
+          print("[GeminiLive] Inline createSession threw — type=\(String(describing: type(of: error))) value=\(error)")
           if let sessionError = error as? DeviceSessionError {
-            print("[Retrace.Diag][GeminiLive]   DeviceSessionError case=\(sessionError)")
+            print("[GeminiLive]   DeviceSessionError case=\(sessionError)")
           }
           print("[GeminiLive] Failed to create glasses stream session: \(error)")
           await MainActor.run { self.cameraSetupFailed = true }
@@ -1134,9 +1167,18 @@ class GeminiLiveSessionBase: ObservableObject {
     // Wait for the setup task to complete (or its early-return failure
     // path to flip `cameraSetupFailed`), then either short-circuit or
     // wait for first frame proof.
+    //
+    // Timeout bumped from 8s → 30s (2026-06-14) after the DAT Stream
+    // config moved to `.high` + 2 fps for the manager-path glasses route.
+    // At larger frame size + lower polling rate the SDK's first-frame
+    // delivery is observably ~10s on Vanguard despite Stream.state →
+    // streaming arriving quickly. The timeout is purely an upper bound —
+    // healthy sessions resolve as soon as the frame arrives — so a
+    // generous ceiling costs nothing and stops a real race from killing
+    // session start.
     await cameraLifecycleTask?.value
     if cameraSetupFailed { return false }
-    return await awaitCameraReady(timeout: 8.0)
+    return await awaitCameraReady(timeout: 30.0)
   }
 
   /// Handler for `DeviceSessionError`s fanned out by the manager on the
@@ -1364,10 +1406,12 @@ class GeminiLiveSessionBase: ObservableObject {
       self.iPhonePreviewLayer = camera.previewLayer
     }
 
-    // Same readiness-wait pattern as the glasses path.
+    // Same readiness-wait pattern as the glasses path. Same 30s upper
+    // bound for symmetry — iPhone first-frame arrives in <1s in healthy
+    // sessions, so the generous ceiling never bites here in practice.
     await cameraLifecycleTask?.value
     if cameraSetupFailed { return false }
-    return await awaitCameraReady(timeout: 8.0)
+    return await awaitCameraReady(timeout: 30.0)
   }
 
   /// Enqueue camera teardown onto the lifecycle chain. Safe to call while a

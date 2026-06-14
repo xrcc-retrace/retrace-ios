@@ -834,8 +834,18 @@ class StreamSessionViewModel: ObservableObject {
         // in-flight release, so `.sessionAlreadyExists` and the 5s
         // datAppOnTheGlassesUpdateRequired masking bug both go away.
         do {
-          print("[Glasses] startSession() → manager.acquire('expert')")
-          let acquired = try await manager.acquire(consumerLabel: "expert")
+          // Intent-aware acquire (mirrors `GeminiLiveSessionBase`): when
+          // the user has lens output enabled AND a Display-capable
+          // device is reachable, bias to `.requiresDisplay` so the
+          // multi-paired Display + Vanguard scenario lands the shared
+          // DeviceSession on Display — guaranteeing the lens consumer
+          // can attach. Otherwise `.any` preserves Step 13 behavior on
+          // non-display DAT glasses.
+          let wantsLens = UserDefaults.standard.bool(forKey: "lensOutputEnabled")
+          let prefersDisplay = wantsLens && manager.hasDisplayCapableDevice
+          let req: DeviceSessionManager.DeviceRequirements = prefersDisplay ? .requiresDisplay : .any
+          print("[Glasses] startSession() → manager.acquire('expert', req=\(req)) (wantsLens=\(wantsLens), hasDisplay=\(manager.hasDisplayCapableDevice))")
+          let acquired = try await manager.acquire(consumerLabel: "expert", requirements: req)
           print("[Glasses] manager.acquire ✓ (state=\(acquired.state))")
           print("[Glasses] addStream(config: codec=raw, resolution=.medium, fps=30) → …")
           guard let s = try acquired.addStream(config: streamConfig) else {
