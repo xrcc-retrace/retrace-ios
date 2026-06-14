@@ -5,12 +5,32 @@ struct OnboardingGlassesView: View {
   @ObservedObject var wearablesVM: WearablesViewModel
   let onNext: () -> Void
 
+  /// Two-stage onboarding for the glasses path:
+  /// 1. Registration — pair the glasses via Meta AI.
+  /// 2. Camera permission — grant `Permission.camera` so the device
+  ///    shows up in `wearables.devices` (without this, every
+  ///    glasses-camera session later throws `noEligibleDevice` no matter
+  ///    how patient we are about waiting for the device).
+  ///
+  /// Stage 2 is provided by the shared `DATCameraPermissionCTA` component
+  /// so the same flow surfaces in HomeScreen + Server Settings without
+  /// duplicating the state machine.
+  ///
+  /// `Continue` is gated on `granted`; `Skip for now` exits to the next
+  /// onboarding page (user can grant later from Profile / Server Settings,
+  /// which also embeds the same CTA).
+  @State private var isCameraGranted: Bool = false
+
   private var isRegistering: Bool {
     wearablesVM.registrationState == .registering
   }
 
   private var isRegistered: Bool {
     wearablesVM.registrationState == .registered
+  }
+
+  private var canContinue: Bool {
+    !isRegistered || isCameraGranted
   }
 
   var body: some View {
@@ -50,6 +70,9 @@ struct OnboardingGlassesView: View {
       }
 
       VStack(spacing: Spacing.md) {
+        // Stage 1 — register glasses. Stays present once registered (as
+        // the "Connected" check) so the user sees the two-step structure:
+        // connect, then grant access.
         CustomButton(
           title: isRegistered ? "Connected" : (isRegistering ? "Connecting…" : "Connect my glasses"),
           icon: isRegistered ? "checkmark" : "eyeglasses",
@@ -59,14 +82,29 @@ struct OnboardingGlassesView: View {
           wearablesVM.connectGlasses()
         }
 
+        // Stage 2 — DAT camera permission. The shared component self-
+        // hides until registration completes, then surfaces a CTA. On
+        // grant it fires `onGranted` which we use to flip `isCameraGranted`
+        // (gating "Continue") and to auto-advance after a brief beat so
+        // the user sees the granted state register before the page transitions.
+        DATCameraPermissionCTA(
+          registrationState: wearablesVM.registrationState,
+          style: .button
+        ) {
+          isCameraGranted = true
+          DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            onNext()
+          }
+        }
+
         CustomButton(
-          title: isRegistered ? "Continue" : "Skip for now",
+          title: canContinue ? "Continue" : "Skip for now",
           style: .ghost,
           isDisabled: false,
           action: onNext
         )
 
-        Text("You can connect glasses later from Profile.")
+        Text(footerText)
           .font(.retraceCaption1)
           .foregroundColor(.textTertiary)
           .multilineTextAlignment(.center)
@@ -74,13 +112,14 @@ struct OnboardingGlassesView: View {
       .padding(.horizontal, Spacing.screenPadding)
       .padding(.bottom, Spacing.xl)
     }
-    .onChange(of: wearablesVM.registrationState) { _, newState in
-      if newState == .registered {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-          onNext()
-        }
-      }
-    }
+  }
+
+  // MARK: - Header copy
+
+  private var footerText: String {
+    if isCameraGranted { return "Glasses ready." }
+    if isRegistered { return "Allow camera access so Retrace can see what you see." }
+    return "You can connect glasses later from Profile."
   }
 
   private var heroArt: some View {
@@ -116,12 +155,14 @@ struct OnboardingGlassesView: View {
   }
 
   private var statusColor: Color {
-    if isRegistered { return .semanticSuccess }
+    if isRegistered && isCameraGranted { return .semanticSuccess }
+    if isRegistered { return .appPrimary }
     if isRegistering { return .appPrimary }
     return .textTertiary
   }
 
   private var statusText: String {
+    if isRegistered && isCameraGranted { return "Glasses ready" }
     if isRegistered { return "Glasses connected" }
     if isRegistering { return "Waiting for Meta AI app…" }
     return "Not connected"

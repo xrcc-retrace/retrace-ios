@@ -58,7 +58,7 @@ Releases are fully automated. **A `v*` git tag pushed to `origin` triggers a Git
 When the user says "push to TestFlight" / "ship a TestFlight build" / "release a build", run:
 
 ```bash
-cd dat-ios-test
+cd retrace-ios
 git fetch --tags origin
 git tag --sort=-v:refname | head -5    # find the latest v* tag
 git tag vX.Y.Z                         # bump patch unless told otherwise

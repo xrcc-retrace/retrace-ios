@@ -186,6 +186,16 @@ class CoachingSessionViewModel: GeminiLiveSessionBase {
   /// "Procedure Complete" panel doesn't keep ticking.
   private var frozenSessionDuration: TimeInterval?
 
+  // MARK: - Lens read accessors (Step 6 — Native lens renderer)
+  //
+  // `procedure` itself is `private`; these computed accessors expose
+  // exactly what `CoachingLensRenderer` needs without giving the renderer
+  // mutable access to internal state. No behavior change.
+
+  var lensProcedureId: String { procedure.id }
+  var lensProcedureTitle: String { procedure.title }
+  var lensTotalSteps: Int { procedure.steps.count }
+
   var formattedSessionDuration: String {
     let elapsed: TimeInterval
     if let frozen = frozenSessionDuration {
@@ -206,11 +216,12 @@ class CoachingSessionViewModel: GeminiLiveSessionBase {
     procedure: ProcedureResponse,
     wearables: WearablesInterface,
     serverBaseURL: String,
-    transport: CaptureTransport = .glasses
+    transport: CaptureTransport = .glasses,
+    sessionManager: DeviceSessionManager? = nil
   ) {
     self.procedure = procedure
     self._transport = transport
-    super.init(wearables: wearables, serverBaseURL: serverBaseURL)
+    super.init(wearables: wearables, serverBaseURL: serverBaseURL, sessionManager: sessionManager)
   }
 
   // MARK: - Lifecycle (public entry / exit)

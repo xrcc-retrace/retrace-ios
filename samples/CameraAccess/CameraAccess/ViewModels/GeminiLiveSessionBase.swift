@@ -76,6 +76,31 @@ class GeminiLiveSessionBase: ObservableObject {
   @Published var geminiConnectionState: GeminiLiveService.ConnectionState = .disconnected
   @Published var activity: [ActivityEntry] = []
 
+  /// Set true when the pre-session DAT glasses-permissions gate fails
+  /// (camera and/or microphone not granted) on a `.glasses` transport
+  /// session. The session view binds this to a `.sheet(isPresented:)`
+  /// and presents a `PermissionRequiredSheet` containing the same
+  /// `DATCameraPermissionCTA` used elsewhere in the app — which now
+  /// grants BOTH camera and mic in one flow. On grant inside the
+  /// sheet, the view calls `retryAfterPermissionGrant()` to re-run
+  /// session start in place.
+  ///
+  /// This is the recovery layer of the defense-in-depth strategy — the
+  /// pre-flight CTAs on `LearnerProcedureDetailView` and the troubleshoot
+  /// transport picker catch the 99% case before the user ever taps. This
+  /// flag catches the residual case (revoked permission between picker
+  /// tap and session start, or app-backgrounded into Meta AI).
+  @Published var pendingGlassesPermissions: Bool = false
+
+  /// Set true when audio readiness times out (no first PCM buffer within
+  /// the timeout window). Distinct from `pendingGlassesPermissions`
+  /// because the recovery action is different: this isn't a permission
+  /// problem (those have been verified by the time we get here), it's
+  /// a BT HFP SCO setup delay or a transient audio-route issue. The
+  /// session view binds this to a sheet presenting an `AudioRecoverySheet`
+  /// with a "Try again" CTA that calls `retryAfterAudioFailure()`.
+  @Published var pendingAudioRetry: Bool = false
+
   // MARK: - Inputs
 
   let wearables: WearablesInterface
@@ -107,10 +132,15 @@ class GeminiLiveSessionBase: ObservableObject {
 
   // MARK: - Video forwarding (glasses + iPhone, same throttle)
 
-  var streamSession: StreamSession?
+  var streamSession: MWDATCamera.Stream?
   var deviceSession: DeviceSession?
   var stateListenerToken: AnyListenerToken?
   var videoFrameListenerToken: AnyListenerToken?
+  /// Phase 4: subscription to the shared `DeviceSessionManager`'s
+  /// `sessionErrors` fan-out, when the manager path is active. Replaces
+  /// the per-consumer `errorStream` observation we never had. Cleared in
+  /// `stopCameraStream`.
+  var sessionErrorsCancellable: AnyCancellable?
   var iPhoneCamera: IPhoneCameraCapture?
   var iPhoneVideoSource: IPhoneCoachingCameraSource?
   /// Off-MainActor frame fan-out for the glasses transport. Owns the JPEG
@@ -118,6 +148,39 @@ class GeminiLiveSessionBase: ObservableObject {
   /// publisher listener body stays a one-line `submit(_:)` call.
   var glassesCoachingSource: GlassesCoachingFrameSource?
   var cameraLifecycleTask: Task<Void, Never>?
+
+  /// One-shot signal that the active camera pipeline (glasses or iPhone)
+  /// has delivered its first video frame. Set on the MainActor by the
+  /// frame listener / sample-buffer closure. Read by `awaitCameraReady(_:)`
+  /// which the new sequential `startGeminiLiveSession` order awaits before
+  /// opening the Gemini WebSocket. Cleared at the start of each camera
+  /// setup so a previous session's `true` doesn't satisfy a new wait.
+  ///
+  /// Why first-frame instead of stream-state: on the glasses transport,
+  /// `Stream.state == .streaming` flips a beat before any actual video
+  /// data arrives over the BT pipe. We want the proof that data flows,
+  /// not the proof that the SDK think it should.
+  private var firstFrameSeen = false
+  private var firstFrameContinuation: CheckedContinuation<Bool, Never>?
+
+  /// Set by the camera setup Task when an unrecoverable setup-time error
+  /// hits (failed `manager.acquire`, `addStream` returning nil, iPhone
+  /// permission denied, etc.). Read by the outer `setupCameraStream` /
+  /// `setupIPhoneCameraStream` async wrapper to short-circuit the
+  /// first-frame wait — no point waiting 8s for a frame that will never
+  /// arrive when the camera never came up.
+  private var cameraSetupFailed = false
+
+  /// Audio analogue of `firstFrameSeen` / `firstFrameContinuation`. Set
+  /// when the first PCM buffer arrives from the active `AudioSessionManager`,
+  /// awaited by `startGeminiLiveSession` step 2 before proceeding to the
+  /// camera. The wait is short (2 s) because `AVAudioEngine.start()`
+  /// succeeding usually means buffers begin flowing within ~50 ms — but on
+  /// the BT HFP path with the glasses' mic, the SCO link can take longer
+  /// to actually carry audio, so the explicit wait removes the silent
+  /// "Gemini connected but no mic data" failure mode for that case.
+  private var firstMicBufferSeen = false
+  private var firstMicBufferContinuation: CheckedContinuation<Bool, Never>?
 
   // Hand tracking: owns the MediaPipe service. The pinch-drag recognizer
   // and its plumbing (frame log, orientation log throttle, debug-provider
@@ -170,9 +233,24 @@ class GeminiLiveSessionBase: ObservableObject {
 
   // MARK: - Init
 
-  init(wearables: WearablesInterface, serverBaseURL: String) {
+  /// Phase 4: optional shared `DeviceSessionManager`. When the
+  /// `deviceSessionManagerEnabled` toggle is ON, camera session lifecycle
+  /// goes through the manager so it can be shared with the lens display
+  /// (issue #180). When OFF (default during migration) we fall back to
+  /// the original `wearables.createSession` inline path.
+  let sessionManager: DeviceSessionManager?
+
+  /// Reads the live debug toggle. Re-read on each `setupCameraStream`
+  /// call so a flip in Settings takes effect on the next session
+  /// (no app relaunch required).
+  var deviceSessionManagerEnabled: Bool {
+    UserDefaults.standard.bool(forKey: "deviceSessionManagerEnabled") && sessionManager != nil
+  }
+
+  init(wearables: WearablesInterface, serverBaseURL: String, sessionManager: DeviceSessionManager? = nil) {
     self.wearables = wearables
     self.serverBaseURL = serverBaseURL
+    self.sessionManager = sessionManager
   }
 
   /// Backstop for the abnormal-dismiss path: if the owning view is dropped
@@ -304,13 +382,154 @@ class GeminiLiveSessionBase: ObservableObject {
     iPhoneCamera?.setPreviewInterfaceOrientation(orientation)
   }
 
+  /// Re-run `startGeminiLiveSession()` after the user granted DAT
+  /// glasses permissions (camera + mic) via the recovery sheet on the
+  /// session view. Safe to call from the sheet's `onGranted` callback
+  /// because the prior gate failure returned before any state was
+  /// initialized (no audio, no camera, no Gemini service exist yet) —
+  /// so this is a clean restart, not a resume.
+  func retryAfterPermissionGrant() async {
+    pendingGlassesPermissions = false
+    await startGeminiLiveSession()
+  }
+
+  /// Re-run `startGeminiLiveSession()` after the user taps "Try again"
+  /// on the audio recovery sheet. Same reasoning as
+  /// `retryAfterPermissionGrant` — the audio readiness check fails
+  /// late enough that an `AudioSessionManager` was created and
+  /// `startCapture()` was called, but a fresh `startGeminiLiveSession`
+  /// will tear that down by creating a new one (the existing reference
+  /// is overwritten). No leak.
+  func retryAfterAudioFailure() async {
+    pendingAudioRetry = false
+    await startGeminiLiveSession()
+  }
+
+  // MARK: - Readiness gates
+
+  /// Await proof that the camera pipeline is delivering data — used by
+  /// `setupCameraStream` / `setupIPhoneCameraStream` after the setup Task
+  /// completes successfully. Returns `true` if a frame arrived within the
+  /// timeout, `false` otherwise. Idempotent w.r.t. early arrival: if a
+  /// frame landed before this method was called, `firstFrameSeen` will
+  /// already be true and we return immediately.
+  ///
+  /// The continuation pattern (instead of polling a `@Published` bool)
+  /// avoids both busy-wait CPU and the SwiftUI runloop tax of a bound
+  /// `@Published` flip we don't otherwise need to observe.
+  @MainActor
+  private func awaitCameraReady(timeout: TimeInterval) async -> Bool {
+    if firstFrameSeen {
+      firstFrameSeen = false
+      return true
+    }
+    return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+      self.firstFrameContinuation = cont
+      // Strong self capture. While the continuation is suspended the
+      // awaiter (a method call on self) already retains self, so this
+      // doesn't extend lifetime in normal use. It defends against any
+      // future refactor that could call this from outside an instance-
+      // method context: with `[weak self]`, a nil self at watchdog-fire
+      // time would skip the resume and leave the continuation hanging
+      // forever (CheckedContinuation contract: must resume exactly once).
+      Task { @MainActor [self] in
+        try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+        if let pending = self.firstFrameContinuation {
+          self.firstFrameContinuation = nil
+          pending.resume(returning: false)
+        }
+      }
+    }
+  }
+
+  /// Audio analogue of `awaitCameraReady`. Returns `true` if the first
+  /// PCM buffer arrived from the active `AudioSessionManager` within the
+  /// timeout, `false` otherwise.
+  @MainActor
+  private func awaitAudioReady(timeout: TimeInterval) async -> Bool {
+    if firstMicBufferSeen {
+      firstMicBufferSeen = false
+      return true
+    }
+    return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+      self.firstMicBufferContinuation = cont
+      // Strong self capture — same reasoning as `awaitCameraReady`.
+      Task { @MainActor [self] in
+        try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+        if let pending = self.firstMicBufferContinuation {
+          self.firstMicBufferContinuation = nil
+          pending.resume(returning: false)
+        }
+      }
+    }
+  }
+
+  /// Tear down JUST the camera path (and its DSM lease) without touching
+  /// audio, Gemini, or any per-session bookkeeping. Used by
+  /// `startGeminiLiveSession` to clean up when `mintSession` fails after
+  /// the camera came up successfully — otherwise we'd leave an orphaned
+  /// DAT session + stream alive until the next teardown.
+  ///
+  /// Implementation note: `stopCameraStream()` is fire-and-forget by
+  /// design (chains onto `cameraLifecycleTask`). Here we explicitly
+  /// await that chain so the caller knows the camera is fully released
+  /// before it returns and the audio/Gemini cleanup proceeds.
+  private func teardownCameraOnly() async {
+    stopCameraStream()
+    await cameraLifecycleTask?.value
+  }
+
   // MARK: - Session lifecycle
 
   /// Brings up audio + camera + WebSocket and wires callbacks. Called by
   /// the subclass's public `startSession(...)` after it has reset its own
   /// mode-specific state.
+  ///
+  /// Strict sequential order — the Gemini WebSocket cannot open until
+  /// camera + audio are both confirmed running. Prior behavior fired
+  /// camera setup as a concurrent fire-and-forget Task and connected
+  /// Gemini regardless; a silent camera failure (e.g. missing DAT camera
+  /// permission) then left us in a Gemini Live session with audio-only,
+  /// which is the worst failure mode because the model behaves as if it
+  /// has vision when it doesn't.
   func startGeminiLiveSession() async {
-    // 1. Audio — pick the mode based on transport override.
+    // 0. DAT camera permission gate (glasses transport only). Per the
+    //    DAT 0.7 contract, devices don't appear in `wearables.devices`
+    //    until `Permission.camera` is granted via Meta AI — so without
+    //    this the camera setup would later fail with `noEligibleDevice`
+    //    regardless of how patiently we wait. Non-prompting check: the
+    //    prompt belongs in onboarding (eager) or a Profile CTA (opt-in).
+    //    Mid-session-start bouncing to Meta AI would be jarring.
+    if transport == .glasses, let manager = sessionManager {
+      do {
+        // Check BOTH camera and microphone — the DAT 0.7 docs only
+        // explicitly require camera for device visibility, but Display
+        // glasses BT HFP audio appears to silently no-op without the
+        // DAT mic grant. Treating both as prerequisites removes the
+        // silent "mic configured but no buffers" failure mode.
+        let granted = try await manager.allGlassesPermissionsGranted()
+        guard granted else {
+          voiceStatus = "Glasses permissions required"
+          pendingGlassesPermissions = true
+          print("[GeminiLive] DAT glasses permissions not fully granted — aborting session start, surfacing recovery sheet")
+          return
+        }
+      } catch {
+        voiceStatus = "Permission check failed"
+        pendingGlassesPermissions = true
+        print("[GeminiLive] DAT permission check threw: \(error) — surfacing recovery sheet")
+        return
+      }
+    }
+
+    // 1. Audio — pick the mode based on transport override, request iOS
+    //    mic, start capture, AND wait for the first PCM buffer so we
+    //    know the mic pipeline is actually delivering data — not just
+    //    that AVAudioEngine started without throwing. The BT HFP path
+    //    with glasses can take time to carry audio over the SCO link,
+    //    and Gemini connecting in that window leaves us with an open
+    //    socket that hears nothing — the audio analogue of the silent
+    //    camera-failure mode we're also fixing.
     let audio = AudioSessionManager(mode: audioSessionMode)
     self.audioManager = audio
 
@@ -318,15 +537,86 @@ class GeminiLiveSessionBase: ObservableObject {
     guard micGranted else {
       voiceStatus = "Mic denied"
       print("[GeminiLive] Microphone permission denied")
+      audioManager = nil
       return
     }
 
-    // 2. Camera — glasses or iPhone depending on transport.
+    // Temporary first-buffer detector. Replaced in step 5 with the real
+    // gemini-forwarding closure; until then this is the only listener
+    // and the only thing it does is resume the readiness continuation.
+    firstMicBufferSeen = false
+    audio.onAudioBuffer = { [weak self] _, _ in
+      Task { @MainActor [weak self] in
+        guard let self = self else { return }
+        if let pending = self.firstMicBufferContinuation {
+          self.firstMicBufferContinuation = nil
+          pending.resume(returning: true)
+        } else {
+          self.firstMicBufferSeen = true
+        }
+      }
+    }
+    voiceStatus = "Starting audio..."
+    // HFP warmup per Meta's official iOS sample at
+    // https://wearables.developer.meta.com/docs/develop/dat/microphones-and-speakers#ios-sample-code:
+    // "When planning to use HFP and streaming simultaneously, ensure
+    // that HFP is fully configured before initiating any streaming
+    // session that requires audio functionality." The canonical worked
+    // example uses ~2 seconds between session activation and stream
+    // start. Without it, `engine.start()` on the glasses BT HFP path
+    // returns success but `isRunning` flips false (the input audio
+    // unit attaches to a half-negotiated route and bails) — exactly
+    // the silent-mic failure we saw in the diagnostic dump.
+    //
+    // We split the previous single `startCapture()` call into:
+    //   1. `configureSessionOnly()` — runs setCategory + setActive only
+    //   2. 2 s sleep — gives the BT SCO link time to fully come up
+    //   3. `startCapture()` — runs the engine setup (skips its own
+    //      configure step via the `didConfigureSession` guard)
+    audio.configureSessionOnly()
+    if transport == .glasses {
+      try? await Task.sleep(nanoseconds: 2_000_000_000)
+    }
+    audio.startCapture()
+    // 8 s readiness timeout is the safety net — if the HFP warmup
+    // wasn't enough on this device/cycle, the recovery sheet still
+    // surfaces and the user can retry.
+    let audioReady = await awaitAudioReady(timeout: 8.0)
+    // Clear the temp closure either way — step 5 installs the real one,
+    // and on failure we don't want a stale first-buffer hook left behind.
+    audio.onAudioBuffer = nil
+    guard audioReady else {
+      voiceStatus = "Audio not connecting"
+      pendingAudioRetry = true
+      print("[GeminiLive] Mic capture did not deliver a buffer within 8 s — aborting session start, surfacing audio recovery sheet")
+      // Single-shot diagnostic dump. Tap delivers ~64 ms-spaced silent
+      // buffers when the route is genuinely capturing, so 8 s of zero
+      // buffers means the system is broken below the user-input layer.
+      // Dump every state that could explain it (VPIO engagement, route
+      // contents, system mute flags, etc.) so we can identify the
+      // root cause without instrumenting more code.
+      print(audio.dumpAudioDiagnostics())
+      audio.stopCapture()
+      audioManager = nil
+      return
+    }
+
+    // 2. Camera — awaited end-to-end. Returns true once the first frame
+    //    has actually arrived (or false on timeout / acquire failure).
+    voiceStatus = "Starting camera..."
+    let cameraReady: Bool
     switch transport {
     case .glasses:
-      setupCameraStream()
+      cameraReady = await setupCameraStream()
     case .iPhone:
-      setupIPhoneCameraStream()
+      cameraReady = await setupIPhoneCameraStream()
+    }
+    guard cameraReady else {
+      voiceStatus = "Camera failed"
+      print("[GeminiLive] Camera did not come up — aborting session start before Gemini connect")
+      audio.stopCapture()
+      audioManager = nil
+      return
     }
 
     // 3. Mint session via subclass.
@@ -337,6 +627,9 @@ class GeminiLiveSessionBase: ObservableObject {
     } catch {
       voiceStatus = "Session error"
       print("[GeminiLive] Failed to mint session: \(error)")
+      audio.stopCapture()
+      audioManager = nil
+      await teardownCameraOnly()
       return
     }
     self.sessionId = payload.sessionId
@@ -440,11 +733,9 @@ class GeminiLiveSessionBase: ObservableObject {
 
     // 6. Connect. Setup-complete flips state to .connected inside the service;
     // our observer (below) picks that up and gates the audio send path open.
+    // Audio capture is already running (step 1) — no second start.
     voiceStatus = "Connecting..."
     await gemini.connect()
-
-    // 7. Start audio capture (also starts playback).
-    audio.startCapture()
 
     // Mirror audio manager's isAISpeaking onto the VM via Combine.
     observeAudioIsAISpeaking(audio)
@@ -485,47 +776,140 @@ class GeminiLiveSessionBase: ObservableObject {
 
   // MARK: - Camera Stream (glasses via DAT SDK)
 
-  func setupCameraStream() {
+  /// Bring up the glasses camera path end-to-end. Returns `true` once a
+  /// video frame has actually arrived from the DAT `Stream` capability,
+  /// or `false` on setup failure / first-frame timeout. The function is
+  /// awaited by `startGeminiLiveSession` step 3 — the Gemini WebSocket
+  /// cannot open until this resolves true.
+  ///
+  /// Internally the heavy lifting still runs inside a Task chained onto
+  /// `cameraLifecycleTask` so a rapid stop / restart still serializes
+  /// safely (the lifecycle task is reused by `stopCameraStream` to await
+  /// any in-flight setup). The outer wrapper layers the first-frame wait
+  /// on top of the lifecycle task.
+  @discardableResult
+  func setupCameraStream() async -> Bool {
+    // Reset the per-attach readiness signals so a previous session's
+    // `true` can't satisfy this wait. Must happen on MainActor before
+    // any frame listener could fire, since the listener resumes on the
+    // same actor.
+    firstFrameSeen = false
+    cameraSetupFailed = false
+    if let pending = firstFrameContinuation {
+      firstFrameContinuation = nil
+      pending.resume(returning: false)
+    }
+
     let prior = cameraLifecycleTask
     cameraLifecycleTask = Task { [weak self] in
       await prior?.value
       guard let self = self else { return }
 
-      // Defensive: tear down a prior session before creating a new one.
-      if let existing = self.streamSession {
-        await existing.stop()
-        self.streamSession = nil
-        self.videoFrameListenerToken = nil
-        self.stateListenerToken = nil
-      }
-      if let existing = self.deviceSession {
-        existing.stop()
-        self.deviceSession = nil
-      }
+      // Reset per-attach local state shared by both paths. Inline-path
+      // also stops the prior SDK objects below; manager-path doesn't
+      // because the manager owns DeviceSession lifecycle.
       self.handLandmarkerService?.stop()
       self.handLandmarkerService = nil
       self.glassesCoachingSource = nil
       self.glassesPreviewFrame = nil
 
-      let deviceSelector = AutoDeviceSelector(wearables: self.wearables)
-      let config = StreamSessionConfig(
-        videoCodec: .raw,
-        resolution: .low,
-        frameRate: 24
-      )
       let session: DeviceSession
-      let stream: StreamSession
-      do {
-        session = try self.wearables.createSession(deviceSelector: deviceSelector)
-        guard let s = try session.addStream(config: config) else {
-          print("[GeminiLive] Could not attach stream capability to the device session")
+      let stream: MWDATCamera.Stream
+
+      if self.deviceSessionManagerEnabled, let manager = self.sessionManager {
+        // Manager path (Phase 4). The session is shared with any other
+        // active consumer (e.g. lens) so adding capabilities here doesn't
+        // require a private DeviceSession.
+        do {
+          let acquired = try await manager.acquire(consumerLabel: "gemini-live")
+          let config = StreamConfiguration(
+            videoCodec: .raw,
+            resolution: .low,
+            frameRate: 24
+          )
+          guard let s = try acquired.addStream(config: config) else {
+            print("[GeminiLive] Could not attach stream capability to the device session")
+            await manager.release(consumerLabel: "gemini-live")
+            await MainActor.run { self.cameraSetupFailed = true }
+            return
+          }
+          session = acquired
+          stream = s
+        } catch {
+          print("[GeminiLive] manager.acquire('gemini-live') failed: \(error)")
+          await MainActor.run { self.cameraSetupFailed = true }
           return
         }
-        stream = s
-      } catch {
-        print("[GeminiLive] Failed to create glasses stream session: \(error)")
-        return
+
+        // Subscribe to the manager's session-error fan-out so a mid-session
+        // DeviceSessionError (BT drop, thermal, peakPowerShutdown, DAT-app
+        // update required) surfaces in our UI immediately instead of being
+        // discovered only when the next tool call fails.
+        self.sessionErrorsCancellable?.cancel()
+        self.sessionErrorsCancellable = manager.sessionErrors
+          .receive(on: DispatchQueue.main)
+          .sink { [weak self] error in
+            self?.handleCameraSessionError(error)
+          }
+      } else {
+        // Inline path (pre-Phase-4 behavior, preserved as the toggle-OFF
+        // fallback). Defensive: tear down a prior session before creating.
+        if let existing = self.streamSession {
+          await existing.stop()
+          self.streamSession = nil
+          self.videoFrameListenerToken = nil
+          self.stateListenerToken = nil
+        }
+        if let existing = self.deviceSession {
+          existing.stop()
+          self.deviceSession = nil
+        }
+
+        let deviceSelector = AutoDeviceSelector(wearables: self.wearables)
+        let config = StreamConfiguration(
+          videoCodec: .raw,
+          resolution: .low,
+          frameRate: 24
+        )
+        do {
+          let created = try self.wearables.createSession(deviceSelector: deviceSelector)
+          // CRITICAL ordering: session.start() + await .started MUST run
+          // before addStream(config:). createSession returns a session
+          // in `.idle`; addStream on an idle session returns nil per
+          // SDK contract. Mirrors the canonical lifecycle in
+          // `StreamSessionViewModel.startSession()` (the expert path).
+          // The DSM-enabled branch above doesn't need this because
+          // `manager.acquire(...)` awaits `.started` internally.
+          do {
+            try created.start()
+          } catch {
+            print("[GeminiLive] Inline path: session.start() threw \(error)")
+            await MainActor.run { self.cameraSetupFailed = true }
+            return
+          }
+          do {
+            try await Self.awaitDeviceSessionStarted(created, timeout: 5.0)
+          } catch {
+            print("[GeminiLive] Inline path: session never reached .started — \(error.localizedDescription)")
+            created.stop()
+            await MainActor.run { self.cameraSetupFailed = true }
+            return
+          }
+          guard let s = try created.addStream(config: config) else {
+            print("[GeminiLive] Inline path: addStream returned nil even after .started — eligible device dropped?")
+            created.stop()
+            await MainActor.run { self.cameraSetupFailed = true }
+            return
+          }
+          session = created
+          stream = s
+        } catch {
+          print("[GeminiLive] Failed to create glasses stream session: \(error)")
+          await MainActor.run { self.cameraSetupFailed = true }
+          return
+        }
       }
+
       self.deviceSession = session
       self.streamSession = stream
 
@@ -533,7 +917,14 @@ class GeminiLiveSessionBase: ObservableObject {
       // setupIPhoneCameraStream(). Kept in sync so the lens HUD's pinch /
       // double-pinch back gestures behave identically regardless of which
       // camera is feeding frames into Gemini.
-      if HandTrackingConfig.isAvailable && !HandGestureService.isDisabled {
+      //
+      // Additional gate: when `lensOutputEnabled` is on, the user's input
+      // for the lens UI flows through the Neural Band (which the DAT SDK
+      // auto-routes to FlexBox.onTap callbacks). MediaPipe-driven phone-
+      // side hand tracking is then redundant and just burns CPU + frames
+      // that could be competing with audio over the same BT pipe. Skip it.
+      let lensOutputActive = UserDefaults.standard.bool(forKey: "lensOutputEnabled")
+      if HandTrackingConfig.isAvailable && !HandGestureService.isDisabled && !lensOutputActive {
         HandGestureService.shared.reset()
         HandGestureService.shared.onBackGesture = { [weak self] in
           self?.onBackGesture?()
@@ -552,6 +943,8 @@ class GeminiLiveSessionBase: ObservableObject {
           print("[GeminiLive] Hand tracking disabled on glasses path: \(error.localizedDescription)")
           self.handLandmarkerService = nil
         }
+      } else if lensOutputActive {
+        print("[GeminiLive] Hand tracking suppressed — lens output active, input routes through Neural Band (glasses path)")
       } else if HandGestureService.isDisabled {
         print("[GeminiLive] Hand tracking suppressed by user setting (glasses path)")
       }
@@ -584,23 +977,143 @@ class GeminiLiveSessionBase: ObservableObject {
       )
       self.glassesCoachingSource = source
 
-      self.videoFrameListenerToken = stream.videoFramePublisher.listen { [weak source] videoFrame in
+      // Wire stream-state observation so we can see in the console exactly
+      // when the Stream capability transitions (.waitingForDevice → .starting
+      // → .streaming) and any error events. Previously these were silent —
+      // we only saw DeviceSession state but had no visibility into the
+      // camera capability itself.
+      self.stateListenerToken = stream.statePublisher.listen { state in
+        print("[GeminiLive] Stream.state → \(state)")
+      }
+
+      // Count incoming video frames so we can confirm the camera is actually
+      // delivering data (vs. an attached-but-silent stream). On the very
+      // first frame, hop to MainActor and resolve `firstFrameContinuation`
+      // (or set `firstFrameSeen` if no continuation was installed yet —
+      // covers the race where the frame arrives before the outer wrapper
+      // begins its wait).
+      var frameCountDiag = 0
+      self.videoFrameListenerToken = stream.videoFramePublisher.listen { [weak self, weak source] videoFrame in
+        frameCountDiag &+= 1
+        if frameCountDiag == 1 {
+          print("[GeminiLive] First glasses frame received ✓ ")
+          Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            if let pending = self.firstFrameContinuation {
+              self.firstFrameContinuation = nil
+              pending.resume(returning: true)
+            } else {
+              self.firstFrameSeen = true
+            }
+          }
+        } else if frameCountDiag % 60 == 0 {
+          print("[GeminiLive] Glasses frames delivered: \(frameCountDiag)")
+        }
         source?.submit(videoFrame)
       }
 
-      do {
-        try session.start()
-      } catch {
-        print("[GeminiLive] Failed to start device session: \(error)")
-        return
-      }
+      // Manager and inline paths both deliver a `.started` session by this
+      // point (DSM: `manager.acquire` awaits started; inline: explicit
+      // `start()` + `awaitDeviceSessionStarted` above before `addStream`).
+      // Now kick the stream.
+      print("[GeminiLive] stream.start() → … (currentState=\(stream.state))")
       await stream.start()
+      print("[GeminiLive] stream.start() returned (state=\(stream.state))")
+    }
+
+    // Wait for the setup task to complete (or its early-return failure
+    // path to flip `cameraSetupFailed`), then either short-circuit or
+    // wait for first frame proof.
+    await cameraLifecycleTask?.value
+    if cameraSetupFailed { return false }
+    return await awaitCameraReady(timeout: 8.0)
+  }
+
+  /// Handler for `DeviceSessionError`s fanned out by the manager on the
+  /// Phase 4 path. Currently logs + lets the existing error UI catch up;
+  /// extend as we surface specific errors in coaching/troubleshoot.
+  @MainActor
+  private func handleCameraSessionError(_ error: DeviceSessionError) {
+    print("[GeminiLive] camera session error → \(error)")
+    // The Lens path already wires the same fan-out and decides whether to
+    // flip `requiresDATAppUpdate`. Here we just log so a mid-coaching
+    // BT/thermal/peakPowerShutdown can be diagnosed from the console.
+    // Subclasses (Coaching/Diagnostic VMs) can override or observe via
+    // `sessionManager?.sessionErrors` if they need to surface a user-
+    // visible alert.
+  }
+
+  /// Wait for `session.state` to transition to `.started` (with a timeout).
+  /// Used only by the inline (DSM-disabled) fallback path — the DSM
+  /// `manager.acquire(...)` does the equivalent wait internally.
+  ///
+  /// Background: `DeviceSession.start()` is `throws` but returns
+  /// synchronously after flipping the state to `.starting`. The transition
+  /// to `.started` is async (BT/WiFi handshake). Calling `addStream(config:)`
+  /// before `.started` returns nil — the SDK's documented contract. This
+  /// helper subscribes to `statePublisher`, bridges to AsyncStream, and
+  /// awaits the transition with a watchdog timer.
+  ///
+  /// Modeled on `StreamSessionViewModel.awaitDeviceSessionStarted(_:timeout:)`.
+  fileprivate static func awaitDeviceSessionStarted(
+    _ session: DeviceSession,
+    timeout: TimeInterval
+  ) async throws {
+    if session.state == .started { return }
+
+    let (stateStream, continuation) = AsyncStream<DeviceSessionState>.makeStream()
+    let listenerToken = session.statePublisher.listen { state in
+      continuation.yield(state)
+    }
+    defer { _ = listenerToken }
+
+    // Recheck after subscribing to catch a transition that landed between
+    // the entry check and the listener install.
+    if session.state == .started {
+      continuation.finish()
+      return
+    }
+
+    let started: Bool = await withTaskGroup(of: Bool.self, returning: Bool.self) { group in
+      group.addTask {
+        for await state in stateStream {
+          if state == .started { return true }
+          if state == .stopped { return false }
+        }
+        return false
+      }
+      group.addTask {
+        try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+        return false
+      }
+      let first = await group.next() ?? false
+      group.cancelAll()
+      continuation.finish()
+      return first
+    }
+
+    if !started {
+      throw DeviceSessionError.unexpectedError(description: "Session never reached .started within \(timeout)s")
     }
   }
 
   /// iPhone-native video source. Throttled at the shared 0.5 fps / 0.5 quality
-  /// so the token budget math carries over from the glasses path.
-  func setupIPhoneCameraStream() {
+  /// so the token budget math carries over from the glasses path. Returns
+  /// `true` once the first sample buffer arrives from `AVCaptureSession`,
+  /// `false` on permission denial / start failure / first-buffer timeout.
+  /// Awaited by `startGeminiLiveSession` step 3 — same contract as the
+  /// glasses path.
+  @discardableResult
+  func setupIPhoneCameraStream() async -> Bool {
+    // Reset the readiness signals — see `setupCameraStream` for why this
+    // must happen on MainActor before any sample buffer could fire.
+    firstFrameSeen = false
+    cameraSetupFailed = false
+    if let pending = firstFrameContinuation {
+      firstFrameContinuation = nil
+      pending.resume(returning: false)
+    }
+
     let prior = cameraLifecycleTask
     cameraLifecycleTask = Task { [weak self] in
       await prior?.value
@@ -620,6 +1133,7 @@ class GeminiLiveSessionBase: ObservableObject {
       guard granted else {
         self.voiceStatus = "Camera denied"
         print("[GeminiLive] iPhone camera permission denied")
+        await MainActor.run { self.cameraSetupFailed = true }
         return
       }
 
@@ -636,7 +1150,26 @@ class GeminiLiveSessionBase: ObservableObject {
       }
       self.iPhoneVideoSource = source
 
-      camera.onSampleBuffer = { [weak source] sampleBuffer in
+      // First-sample-buffer signal mirrors the glasses
+      // `videoFramePublisher.listen` path: on count == 1, hop to MainActor
+      // and resolve `firstFrameContinuation` (or set `firstFrameSeen` if
+      // no waiter has installed yet — covers the race where the buffer
+      // lands before the outer wrapper begins its wait).
+      var iPhoneBufferCountDiag = 0
+      camera.onSampleBuffer = { [weak self, weak source] sampleBuffer in
+        iPhoneBufferCountDiag &+= 1
+        if iPhoneBufferCountDiag == 1 {
+          print("[GeminiLive] First iPhone sample buffer received ✓")
+          Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            if let pending = self.firstFrameContinuation {
+              self.firstFrameContinuation = nil
+              pending.resume(returning: true)
+            } else {
+              self.firstFrameSeen = true
+            }
+          }
+        }
         source?.submit(sampleBuffer)
       }
 
@@ -644,7 +1177,11 @@ class GeminiLiveSessionBase: ObservableObject {
       // ingest each frame into the Meta XR micro-gesture recognizer, and
       // log any emitted event. No HUD binding yet (deferred to the next
       // milestone once reliability is validated on-device).
-      if HandTrackingConfig.isAvailable && !HandGestureService.isDisabled {
+      //
+      // Same lens-output gate as the glasses path above: when sending
+      // trees to the lens, Neural Band drives input.
+      let lensOutputActive = UserDefaults.standard.bool(forKey: "lensOutputEnabled")
+      if HandTrackingConfig.isAvailable && !HandGestureService.isDisabled && !lensOutputActive {
         // Reset the shared gesture service so stale FSM state from any
         // prior session doesn't carry across. Wire `.back` events to the
         // VM's exposed `onBackGesture` so the existing call-site contract
@@ -675,6 +1212,8 @@ class GeminiLiveSessionBase: ObservableObject {
         } catch {
           print("[GeminiLive] Hand tracking disabled: \(error.localizedDescription)")
         }
+      } else if lensOutputActive {
+        print("[GeminiLive] Hand tracking suppressed — lens output active, input routes through Neural Band")
       } else if HandGestureService.isDisabled {
         print("[GeminiLive] Hand tracking suppressed by user setting")
       }
@@ -683,6 +1222,7 @@ class GeminiLiveSessionBase: ObservableObject {
         try await camera.start()
       } catch {
         print("[GeminiLive] iPhone camera failed to start: \(error)")
+        await MainActor.run { self.cameraSetupFailed = true }
         return
       }
       self.iPhoneCamera = camera
@@ -697,6 +1237,11 @@ class GeminiLiveSessionBase: ObservableObject {
       // the same pixel stream the JPEG throttle drains — no extra capture.
       self.iPhonePreviewLayer = camera.previewLayer
     }
+
+    // Same readiness-wait pattern as the glasses path.
+    await cameraLifecycleTask?.value
+    if cameraSetupFailed { return false }
+    return await awaitCameraReady(timeout: 8.0)
   }
 
   /// Enqueue camera teardown onto the lifecycle chain. Safe to call while a
@@ -708,15 +1253,34 @@ class GeminiLiveSessionBase: ObservableObject {
       await prior?.value
       guard let self = self else { return }
 
+      // Capture whether the active session was acquired via the manager
+      // BEFORE we drop any references. Reads the same toggle that
+      // setupCameraStream branched on so start/stop stay symmetric.
+      let usedManager = self.deviceSessionManagerEnabled
+
+      // Tokens FIRST so any trailing publisher events stop hitting the
+      // frame fan-out closures (which may be mid-teardown themselves).
       self.videoFrameListenerToken = nil
       self.stateListenerToken = nil
+      self.sessionErrorsCancellable?.cancel()
+      self.sessionErrorsCancellable = nil
 
       if let session = self.streamSession {
         await session.stop()
       }
-      self.deviceSession?.stop()
       self.streamSession = nil
-      self.deviceSession = nil
+
+      // DeviceSession lifecycle: under the manager, release the lease and
+      // let the manager decide whether to stop the underlying session
+      // (it stays alive if another consumer like lens still holds it).
+      // Under the inline path, stop it ourselves like before.
+      if usedManager, let manager = self.sessionManager {
+        self.deviceSession = nil
+        await manager.release(consumerLabel: "gemini-live")
+      } else {
+        self.deviceSession?.stop()
+        self.deviceSession = nil
+      }
 
       self.iPhoneCamera?.onSampleBuffer = nil
       self.iPhoneCamera?.onHandSampleBuffer = nil

@@ -11,6 +11,7 @@ struct RecordTabView: View {
   // see results land regardless of which tab the user is currently on.
   @ObservedObject var uploadService: UploadService
   @ObservedObject var manualUploadVM: ManualUploadViewModel
+  @EnvironmentObject private var deviceSessionManager: DeviceSessionManager
 
   // The recording flow is now transport-agnostic: both .glasses and .iPhone
   // route through `IPhoneRecordingView(transport:)`, which swaps only the
@@ -53,7 +54,8 @@ struct RecordTabView: View {
         wearables: wearables,
         uploadService: uploadService,
         onAcknowledgeProcedure: handleProcedureAcknowledged,
-        onRecordingComplete: handleRecordingComplete
+        onRecordingComplete: handleRecordingComplete,
+        sessionManager: deviceSessionManager
       )
     }
     .sheet(isPresented: $showRegistrationSheet) {
@@ -80,6 +82,7 @@ struct RecordTabView: View {
         subtitle: nil,
         glassesActionLabel: "Record with Glasses",
         iPhoneActionLabel: "Record with iPhone",
+        registrationState: wearablesVM.registrationState,
         onSelect: { transport in
           pendingTransport = transport
         }
@@ -227,9 +230,17 @@ struct RecordTabView: View {
     pendingTransport = nil
     switch transport {
     case .glasses:
-      // HOTFIX: glasses + Gemini Live + HFP mic isn't ready — always land on
-      // the inactive sheet so the user can fall through to iPhone transport.
-      showGlassesInactiveSheet = true
+      // Pre-HOTFIX behavior restored 2026-05-21: route based on actual
+      // glasses connectivity. The old "always show inactive sheet"
+      // HOTFIX was put in before the lens path + DeviceSessionManager
+      // landed; both work now so glasses transport is real again.
+      if wearablesVM.registrationState != .registered {
+        showRegistrationSheet = true
+      } else if !wearablesVM.hasActiveDevice {
+        showGlassesInactiveSheet = true
+      } else {
+        recordingTransport = .glasses
+      }
     case .iPhone:
       recordingTransport = .iPhone
     }

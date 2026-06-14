@@ -39,12 +39,24 @@
 	<dict>
 		<key>AppLinkURLScheme</key>
 		<string>cameraaccess://</string>
+		<!-- MetaAppID = "0" + ClientToken empty is the Dev Mode workaround.
+		     Bypasses per-app provisioning at the Wearables Developer Center
+		     so the DAT bundle on the glasses provisions against a generic
+		     dev profile instead of our specific MetaAppID. Required because
+		     our app isn't enrolled in WDC with Active User tester status.
+		     Swap these back to $(META_APP_ID) / $(CLIENT_TOKEN) once we
+		     have real WDC credentials. See memory/reference_mrbd_dat_on_glasses_install.md. -->
 		<key>ClientToken</key>
-		<string>$(CLIENT_TOKEN)</string>
+		<string></string>
 		<key>MetaAppID</key>
-		<string>$(META_APP_ID)</string>
+		<string>0</string>
 		<key>TeamID</key>
 		<string>$(DEVELOPMENT_TEAM)</string>
+		<!-- DAMEnabled = Display Access Mode. Without this, MWDATDisplay's
+		     capability.start() silently no-ops (Display.state stays .stopped
+		     and no transitions fire). Required for any lens rendering. -->
+		<key>DAMEnabled</key>
+		<true/>
 	</dict>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>Needed to connect to Meta AI Glasses</string>
@@ -81,8 +93,10 @@
 	<true/>
 	<key>UIBackgroundModes</key>
 	<array>
+		<string>bluetooth-central</string>
 		<string>bluetooth-peripheral</string>
 		<string>external-accessory</string>
+		<string>processing</string>
 	</array>
 	<key>UILaunchScreen</key>
 	<dict/>

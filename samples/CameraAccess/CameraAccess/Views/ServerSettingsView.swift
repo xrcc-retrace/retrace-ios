@@ -1,4 +1,5 @@
 import MWDATCore
+import MWDATDisplay
 import SwiftUI
 
 // MARK: - Combined screen (used by ModeSelectionView's gear icon)
@@ -45,6 +46,22 @@ struct DebugSettingsSection: View {
   /// procedure review screen exposes a reference-photo picker and the
   /// Coaching reference panel can show that image alongside the step clip.
   @AppStorage("referenceImageEnabled") private var referenceImageEnabled: Bool = false
+  /// When true, every `LensSession.send(_:)` reaches the on-glasses
+  /// display. When false (default), all sends silently no-op so the
+  /// existing SwiftUI emulator is the only visible HUD. Flip on when
+  /// iterating on native lens output during development.
+  @AppStorage("lensOutputEnabled") private var lensOutputEnabled: Bool = false
+  /// Migration flag. When true, consumers (LensDisplayCoordinator,
+  /// GeminiLiveSessionBase, StreamSessionViewModel, WearablesViewModel)
+  /// route their DAT DeviceSession lifecycle through the shared
+  /// `DeviceSessionManager` instead of each creating their own session.
+  /// Phase 1 lands the manager but no consumer uses it yet — flipping
+  /// this toggle is a no-op until per-consumer migrations land in
+  /// subsequent phases. Default OFF until Phase 8 cleanup.
+  @AppStorage("deviceSessionManagerEnabled") private var deviceSessionManagerEnabled: Bool = false
+
+  @EnvironmentObject private var lensSession: LensSession
+  @State private var smokeTestResult: String?
 
   var body: some View {
     VStack(alignment: .leading, spacing: Spacing.md) {
@@ -118,8 +135,85 @@ struct DebugSettingsSection: View {
       .background(Color.surfaceRaised)
       .cornerRadius(Radius.md)
 
+      Toggle(isOn: $lensOutputEnabled) {
+        VStack(alignment: .leading, spacing: 2) {
+          Text("Send to glasses lens")
+            .font(.retraceCallout)
+            .foregroundColor(.textPrimary)
+          Text("Mirrors every page to the actual Meta Ray-Ban Display lens via the DAT SDK display capability. The phone-side SwiftUI emulator keeps running either way; this is purely additive. Off by default while the native lens layer is under development.")
+            .font(.retraceCaption1)
+            .foregroundColor(.textTertiary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+      }
+      .tint(.appPrimary)
+      .padding(14)
+      .background(Color.surfaceRaised)
+      .cornerRadius(Radius.md)
+
+      Toggle(isOn: $deviceSessionManagerEnabled) {
+        VStack(alignment: .leading, spacing: 2) {
+          Text("DeviceSessionManager (migration)")
+            .font(.retraceCallout)
+            .foregroundColor(.textPrimary)
+          Text("Routes DAT DeviceSession lifecycle through the shared DeviceSessionManager so camera + display can coexist on the same session. Off until consumer migrations land in subsequent phases. Leave OFF unless explicitly testing migration phases.")
+            .font(.retraceCaption1)
+            .foregroundColor(.textTertiary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+      }
+      .tint(.appPrimary)
+      .padding(14)
+      .background(Color.surfaceRaised)
+      .cornerRadius(Radius.md)
+
+      CustomButton(
+        title: lensSession.coordinator.isSending ? "Sending…" : "Send test tree to glasses",
+        style: .secondary,
+        isDisabled: lensSession.coordinator.isSending || !lensOutputEnabled
+      ) {
+        Task {
+          await sendSmokeTestTree()
+        }
+      }
+      .padding(.top, Spacing.xs)
+
+      if let smokeTestResult {
+        Text(smokeTestResult)
+          .font(.retraceCaption1)
+          .foregroundColor(.textSecondary)
+      }
     }
     .padding(.top, Spacing.xl)
+  }
+
+  /// Step 3 smoke test — fires a "Hello lens" tree through LensSession.send.
+  /// As of Step 5, uses `LensComponents.cardPanel` so any spacing/padding
+  /// tuning in the factory landing here propagates everywhere.
+  /// Verifies the SDK plumbing without any renderer involvement.
+  private func sendSmokeTestTree() async {
+    smokeTestResult = nil
+    let tree = LensComponents.cardPanel(
+      direction: .column,
+      spacing: 12,
+      alignment: .center,
+      crossAlignment: .center,
+      padding: 24
+    ) {
+      Icon(name: .checkmark, style: .filled)
+      Text("Hello lens", style: .heading, color: .primary)
+      Text("Send test from Settings", style: .meta, color: .secondary)
+    }
+
+    await lensSession.send(tree)
+
+    if let error = lensSession.coordinator.errorMessage {
+      smokeTestResult = "✗ \(error)"
+    } else if lensSession.coordinator.isConnected {
+      smokeTestResult = "✓ Sent to glasses"
+    } else {
+      smokeTestResult = "Queued — waiting for display to start"
+    }
   }
 }
 
@@ -127,6 +221,7 @@ struct DebugSettingsSection: View {
 
 struct GlassesSettingsSection: View {
   @ObservedObject var wearablesVM: WearablesViewModel
+  @EnvironmentObject private var lensCoordinator: LensDisplayCoordinator
 
   var body: some View {
     VStack(alignment: .leading, spacing: Spacing.md) {
@@ -149,6 +244,87 @@ struct GlassesSettingsSection: View {
       .background(Color.surfaceRaised)
       .cornerRadius(Radius.md)
 
+      if lensCoordinator.requiresDATAppUpdate {
+        VStack(alignment: .leading, spacing: Spacing.xs) {
+          HStack(spacing: Spacing.sm) {
+            Image(systemName: "exclamationmark.triangle.fill")
+              .foregroundColor(.orange)
+            Text("DAT app on glasses needs to be installed or updated")
+              .font(.retraceCallout)
+              .foregroundColor(.textPrimary)
+          }
+          Text("The on-glasses helper app is required for sending content to the lens. Tap Update to open the Meta AI install flow.")
+            .font(.retraceCaption1)
+            .foregroundColor(.textTertiary)
+            .fixedSize(horizontal: false, vertical: true)
+
+          CustomButton(
+            title: "Update app on glasses",
+            style: .primary,
+            isDisabled: false
+          ) {
+            wearablesVM.openDATGlassesAppUpdate()
+          }
+          .padding(.top, Spacing.xs)
+        }
+        .padding(14)
+        .background(Color.surfaceRaised)
+        .cornerRadius(Radius.md)
+      }
+
+      if wearablesVM.requiresFirmwareUpdate {
+        VStack(alignment: .leading, spacing: Spacing.xs) {
+          HStack(spacing: Spacing.sm) {
+            Image(systemName: "exclamationmark.triangle.fill")
+              .foregroundColor(.orange)
+            Text("Glasses firmware needs an update")
+              .font(.retraceCallout)
+              .foregroundColor(.textPrimary)
+          }
+          Text("Your glasses firmware is older than this app expects. Update it from the Meta AI app before recording or coaching will work reliably.")
+            .font(.retraceCaption1)
+            .foregroundColor(.textTertiary)
+            .fixedSize(horizontal: false, vertical: true)
+
+          CustomButton(
+            title: "Update firmware",
+            style: .primary,
+            isDisabled: false
+          ) {
+            wearablesVM.openFirmwareUpdate()
+          }
+          .padding(.top, Spacing.xs)
+        }
+        .padding(14)
+        .background(Color.surfaceRaised)
+        .cornerRadius(Radius.md)
+      }
+
+      if !wearablesVM.devices.isEmpty {
+        VStack(alignment: .leading, spacing: Spacing.xs) {
+          ForEach(wearablesVM.devices, id: \.self) { deviceId in
+            HStack(spacing: Spacing.md) {
+              Image(systemName: "eyeglasses")
+                .foregroundColor(.textSecondary)
+              VStack(alignment: .leading, spacing: 2) {
+                Text(wearablesVM.displayName(for: deviceId))
+                  .font(.retraceCallout)
+                  .foregroundColor(.textPrimary)
+                Text(String(describing: deviceId))
+                  .font(.system(size: 11, design: .monospaced))
+                  .foregroundColor(.textTertiary)
+                  .lineLimit(1)
+                  .truncationMode(.middle)
+              }
+              Spacer()
+            }
+            .padding(14)
+            .background(Color.surfaceRaised)
+            .cornerRadius(Radius.md)
+          }
+        }
+      }
+
       CustomButton(
         title: wearablesVM.registrationState == .registering
           ? "Connecting…" : "Register new glasses",
@@ -161,6 +337,25 @@ struct GlassesSettingsSection: View {
           wearablesVM.connectGlasses()
         }
       }
+
+      if wearablesVM.registrationState == .registered {
+        CustomButton(
+          title: "Forget glasses",
+          style: .secondary,
+          isDisabled: false
+        ) {
+          wearablesVM.disconnectGlasses()
+        }
+      }
+
+      // DAT camera permission row — second prerequisite alongside
+      // registration. Self-hides until `.registered`. Same component
+      // mounted in Onboarding + HomeScreen so the post-pairing flow is
+      // consistent regardless of which surface triggered the pairing.
+      DATCameraPermissionCTA(
+        registrationState: wearablesVM.registrationState,
+        style: .card
+      )
     }
     .padding(.top, Spacing.xl)
   }

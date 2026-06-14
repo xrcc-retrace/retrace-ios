@@ -6,6 +6,7 @@ struct LearnerProcedureDetailView: View {
   let wearables: WearablesInterface
   @ObservedObject var wearablesVM: WearablesViewModel
   @ObservedObject var progressStore: LocalProgressStore
+  @EnvironmentObject private var deviceSessionManager: DeviceSessionManager
 
   @StateObject private var viewModel = ProcedureDetailViewModel()
   @State private var presentedCoaching: CaptureTransport?
@@ -45,7 +46,8 @@ struct LearnerProcedureDetailView: View {
           progressStore: progressStore,
           serverBaseURL: viewModel.serverBaseURL,
           transport: transport,
-          startingStep: coachingStartingStep
+          startingStep: coachingStartingStep,
+          sessionManager: deviceSessionManager
         )
       }
     }
@@ -207,11 +209,21 @@ struct LearnerProcedureDetailView: View {
   private var freshCTAs: some View {
     VStack(spacing: Spacing.md) {
       if isStartCoachingExpanded {
+        // Pre-flight DAT camera permission CTA. Self-hides until
+        // registered; surfaces when registered-but-not-granted; shows
+        // "granted ✓" once user grants in Meta AI. Disables only the
+        // glasses button below; iPhone transport doesn't require it.
+        DATCameraPermissionCTA(
+          registrationState: wearablesVM.registrationState,
+          style: .card
+        )
+        .transition(.move(edge: .bottom).combined(with: .opacity))
+
         CustomButton(
           title: "Coach with Glasses",
           icon: "eyeglasses",
           style: .primary,
-          isDisabled: false
+          isDisabled: glassesBlockedByMissingPermission
         ) {
           launchCoaching(transport: .glasses, startingStep: nil)
         }
@@ -246,6 +258,7 @@ struct LearnerProcedureDetailView: View {
   @ViewBuilder
   private func resumeCTAs(_ resumable: SessionRecord) -> some View {
     let continueStep = resumable.stepsCompleted + 1
+    let resumeBlockedByPermission = resumeTransport == .glasses && glassesBlockedByMissingPermission
 
     VStack(spacing: Spacing.md) {
       HStack(spacing: 0) {
@@ -264,11 +277,22 @@ struct LearnerProcedureDetailView: View {
       .background(Color.surfaceBase)
       .clipShape(Capsule())
 
+      // Pre-flight DAT camera permission CTA — only relevant when the
+      // glasses pill is selected. The component self-hides when not
+      // registered; when registered-but-not-granted it surfaces here so
+      // the user can grant before tapping Continue / Start Over.
+      if resumeTransport == .glasses {
+        DATCameraPermissionCTA(
+          registrationState: wearablesVM.registrationState,
+          style: .card
+        )
+      }
+
       CustomButton(
         title: "Continue from Step \(continueStep)",
         icon: "arrow.right.circle.fill",
         style: .primary,
-        isDisabled: false
+        isDisabled: resumeBlockedByPermission
       ) {
         launchCoaching(transport: resumeTransport, startingStep: continueStep)
       }
@@ -277,7 +301,7 @@ struct LearnerProcedureDetailView: View {
         title: "Start Over",
         icon: "arrow.counterclockwise",
         style: .secondary,
-        isDisabled: false
+        isDisabled: resumeBlockedByPermission
       ) {
         progressStore.updateSession(
           id: resumable.id,
@@ -287,6 +311,16 @@ struct LearnerProcedureDetailView: View {
         launchCoaching(transport: resumeTransport, startingStep: nil)
       }
     }
+  }
+
+  /// True when the user is paired but DAT camera permission isn't
+  /// `.granted` — in this state the glasses transport will fail at the
+  /// pre-session gate, so we disable any button that would launch a
+  /// glasses-transport session. iPhone-transport buttons stay enabled.
+  /// Reactive — re-renders when DSM's `cameraPermission` flips.
+  private var glassesBlockedByMissingPermission: Bool {
+    wearablesVM.registrationState == .registered &&
+      deviceSessionManager.cameraPermission != .granted
   }
 
   @ViewBuilder
@@ -331,8 +365,15 @@ struct LearnerProcedureDetailView: View {
     coachingStartingStep = startingStep
     switch transport {
     case .glasses:
-      // HOTFIX: see RecordTabView.handlePickedTransport.
-      showGlassesInactiveSheet = true
+      // Pre-HOTFIX behavior restored 2026-05-21 — route on real glasses
+      // connectivity now that lens + DeviceSessionManager are wired.
+      if wearablesVM.registrationState != .registered {
+        showRegistrationSheet = true
+      } else if !wearablesVM.hasActiveDevice {
+        showGlassesInactiveSheet = true
+      } else {
+        presentedCoaching = .glasses
+      }
     case .iPhone:
       presentedCoaching = .iPhone
     }

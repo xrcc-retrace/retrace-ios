@@ -119,10 +119,11 @@ class DiagnosticSessionViewModel: GeminiLiveSessionBase {
   init(
     wearables: WearablesInterface,
     serverBaseURL: String,
-    transport: CaptureTransport
+    transport: CaptureTransport,
+    sessionManager: DeviceSessionManager? = nil
   ) {
     self.diagnosticTransport = transport
-    super.init(wearables: wearables, serverBaseURL: serverBaseURL)
+    super.init(wearables: wearables, serverBaseURL: serverBaseURL, sessionManager: sessionManager)
 
     // Derive `searchStage` and `searchNarration` from the base's
     // published map of in-flight tool names. Updates in real time as

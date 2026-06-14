@@ -13,6 +13,7 @@ struct CoachingSessionView: View {
 
   @Environment(\.dismiss) private var dismiss
   @EnvironmentObject private var appOrientationController: AppOrientationController
+  @EnvironmentObject private var lensSession: LensSession
   @StateObject private var viewModel: CoachingSessionViewModel
 
   @State private var showDismissConfirmation = false
@@ -42,7 +43,8 @@ struct CoachingSessionView: View {
     progressStore: LocalProgressStore,
     serverBaseURL: String,
     transport: CaptureTransport = .glasses,
-    startingStep: Int? = nil
+    startingStep: Int? = nil,
+    sessionManager: DeviceSessionManager? = nil
   ) {
     self.procedure = procedure
     self.wearables = wearables
@@ -55,7 +57,8 @@ struct CoachingSessionView: View {
       procedure: procedure,
       wearables: wearables,
       serverBaseURL: serverBaseURL,
-      transport: transport
+      transport: transport,
+      sessionManager: sessionManager
     ))
   }
 
@@ -148,6 +151,10 @@ struct CoachingSessionView: View {
           showDismissConfirmation = true
         }
       }
+      // Native lens path (Step 6) — mirrors this session's state onto the
+      // glasses display. Silent no-op when the "Send to glasses lens"
+      // toggle is off or no Display capability is available.
+      lensSession.activate(.coaching, vm: viewModel)
       viewModel.startSession(progressStore: progressStore, startingStep: startingStep)
       if transport == .iPhone {
         // Broaden the allowed orientation mask so the user can naturally
@@ -168,6 +175,11 @@ struct CoachingSessionView: View {
       }
     }
     .onDisappear {
+      // Tear down the native lens renderer first so it stops projecting
+      // VM state to the glasses. Display capability stays attached
+      // (it's app-scoped); the next `.activate(.coaching|.troubleshoot|...)`
+      // will mount a fresh renderer without re-handshaking the SDK.
+      lensSession.deactivate()
       viewModel.endSession(progressStore: progressStore)
       if transport == .iPhone {
         UIDevice.current.endGeneratingDeviceOrientationNotifications()
@@ -188,6 +200,38 @@ struct CoachingSessionView: View {
     // Completion collapses the page list to a single page; clamp to 0.
     .onChange(of: viewModel.isCompleted) { _, _ in
       coachingPageIndex = 0
+    }
+    // Recovery layer of the DAT camera permission gate. The pre-flight
+    // on LearnerProcedureDetailView catches the 99% case; this sheet
+    // catches the residual race where permission was revoked between
+    // tapping "Coach with Glasses" and the session VM running its gate
+    // (e.g. user backgrounded into Meta AI between the two). On grant,
+    // the embedded CTA calls `retryAfterPermissionGrant()` which re-runs
+    // `startGeminiLiveSession()` cleanly (no state was initialized
+    // before the gate fired).
+    .sheet(isPresented: $viewModel.pendingGlassesPermissions) {
+      PermissionRequiredSheet(
+        onGranted: {
+          Task { await viewModel.retryAfterPermissionGrant() }
+        },
+        onCancel: {
+          viewModel.pendingGlassesPermissions = false
+        }
+      )
+    }
+    // Audio readiness recovery — fires when BT HFP SCO didn't deliver
+    // its first PCM buffer within the timeout. Permission has already
+    // been verified by the time we get here; the recovery action is a
+    // straight retry of session start (no Meta AI bounce needed).
+    .sheet(isPresented: $viewModel.pendingAudioRetry) {
+      AudioRecoverySheet(
+        onRetry: {
+          Task { await viewModel.retryAfterAudioFailure() }
+        },
+        onCancel: {
+          viewModel.pendingAudioRetry = false
+        }
+      )
     }
   }
 

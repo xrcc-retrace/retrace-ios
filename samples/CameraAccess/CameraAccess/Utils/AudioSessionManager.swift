@@ -107,6 +107,17 @@ class AudioSessionManager: ObservableObject {
   /// -10868 race. Reset by `stopCapture()`.
   private var didPrewarm = false
 
+  /// True once `configureAudioSession()` has run successfully (whether
+  /// from `startCapture()` directly, `prewarm()`, or the new public
+  /// `configureSessionOnly()` entry point). Callers that need to insert
+  /// a delay between session activation and `engine.start()` (e.g. the
+  /// HFP warmup required by Meta's official iOS sample) call
+  /// `configureSessionOnly()` first; the subsequent `startCapture()`
+  /// then sees this flag set and skips re-running the configure step
+  /// (which would post a fresh route-change cascade and undo the
+  /// warmup). Reset by `stopCapture()`.
+  private var didConfigureSession = false
+
   /// Called on the audio capture queue with each PCM buffer.
   var onAudioBuffer: ((AVAudioPCMBuffer, AVAudioTime) -> Void)?
 
@@ -170,11 +181,26 @@ class AudioSessionManager: ObservableObject {
     do {
       switch mode {
       case .coaching:
-        // Full-duplex with hardware AEC, speaker fallback when no HFP is paired.
+        // Aligned with Meta's official iOS audio sample for Display
+        // glasses (https://wearables.developer.meta.com/docs/develop/
+        // dat/microphones-and-speakers#ios-sample-code). Was previously
+        // `.voiceChat` mode with A2DP + defaultToSpeaker options — the
+        // combination silently broke `engine.start()` on BT HFP from
+        // Display glasses (engine returned success but `isRunning`
+        // immediately flipped false, no buffers ever delivered to the
+        // tap). Both Meta's sample AND the deprecated SmartSight
+        // working pattern omit explicit voice-processing enable and
+        // use a narrower option set.
+        //
+        // Trade-off: we lose hardware AEC. In practice glasses speakers
+        // are open-ear with physical separation from the temple mic,
+        // and Gemini's server-side VAD filters short bleed. If
+        // self-barge-in becomes a real problem in field use, follow up
+        // with a software ducking filter on the player node output.
         try session.setCategory(
           .playAndRecord,
-          mode: .voiceChat,
-          options: [.allowBluetoothHFP, .allowBluetoothA2DP, .defaultToSpeaker]
+          mode: .default,
+          options: [.allowBluetoothHFP]
         )
       case .coachingPhoneOnly:
         // Full-duplex with AEC, forced to built-in mic + loudspeaker even when
@@ -218,9 +244,39 @@ class AudioSessionManager: ObservableObject {
         forceBuiltInMicPreferred(session)
       }
       checkBluetoothRoute()
+
+      // Surface the actual route iOS picked so silent-audio bugs are
+      // diagnosable from the console. If a `.coaching` session ends up
+      // with `Built-in Mic` + `Speaker` instead of BT HFP ports, the
+      // glasses didn't engage their HFP profile — and the user will hear
+      // nothing through the glasses speakers / mic.
+      let route = session.currentRoute
+      let inputs = route.inputs.map { "\($0.portName)(\($0.portType.rawValue))" }.joined(separator: ", ")
+      let outputs = route.outputs.map { "\($0.portName)(\($0.portType.rawValue))" }.joined(separator: ", ")
+      print("[AudioSession] configured mode=\(mode), category=playAndRecord, inputs=[\(inputs)], outputs=[\(outputs)]")
+      didConfigureSession = true
     } catch {
       print("[AudioSession] Failed to configure audio session: \(error)")
     }
+  }
+
+  /// Public entry point that runs ONLY the session configure step (no
+  /// engine, no tap, no playback). Used by callers that need to insert
+  /// a delay between session activation and `engine.start()`. The
+  /// Meta DAT iOS docs at
+  /// https://wearables.developer.meta.com/docs/develop/dat/microphones-and-speakers#ios-sample-code
+  /// state: "When planning to use HFP and streaming simultaneously,
+  /// ensure that HFP is fully configured before initiating any
+  /// streaming session that requires audio functionality." The
+  /// canonical worked example uses a ~2-second delay. We mirror that:
+  /// `configureSessionOnly()` → `await Task.sleep(2 s)` →
+  /// `startCapture()` (which short-circuits its own configure step
+  /// via the `didConfigureSession` flag set above).
+  ///
+  /// Idempotent — re-calling after a successful configure is a no-op.
+  func configureSessionOnly() {
+    guard !didConfigureSession else { return }
+    configureAudioSession()
   }
 
   /// Pin the AVAudioSession input to the built-in iPhone mic. Called only from
@@ -248,6 +304,64 @@ class AudioSessionManager: ObservableObject {
         continuation.resume(returning: granted)
       }
     }
+  }
+
+  /// Multi-line snapshot of every audio subsystem state that could
+  /// explain a silent-mic failure. Called from `GeminiLiveSessionBase`
+  /// when the readiness gate times out, so a single console paste
+  /// surfaces:
+  ///   - The live (post-Settings-toggle) iOS record permission state.
+  ///   - Every input port iOS picked for the current route, with
+  ///     `portType` and UID — diagnoses "BT route shown but actually
+  ///     built-in" cases.
+  ///   - Input-node format the tap is actually receiving — a 0-rate
+  ///     format means the engine started but the input chain didn't.
+  ///   - `isVoiceProcessingEnabled` on the input node — diagnoses VPIO
+  ///     not engaging on the BT HFP input route.
+  ///   - System-level flags: `isInputAvailable`, `isOtherAudioPlaying`,
+  ///     `secondaryAudioShouldBeSilencedHint`. Eliminates "iOS muted
+  ///     us because another app holds the mic" hypotheses.
+  ///
+  /// Output is single-call-site, plain text — paste-into-bug-report
+  /// shaped, not machine-parsed.
+  func dumpAudioDiagnostics() -> String {
+    let session = AVAudioSession.sharedInstance()
+    let route = session.currentRoute
+    let inputs = route.inputs.map {
+      "    - \($0.portName) [type=\($0.portType.rawValue), uid=\($0.uid)]"
+    }.joined(separator: "\n")
+    let outputs = route.outputs.map {
+      "    - \($0.portName) [type=\($0.portType.rawValue), uid=\($0.uid)]"
+    }.joined(separator: "\n")
+    let inFmt = inputNode.inputFormat(forBus: 0)
+    let perm: String
+    switch AVAudioApplication.shared.recordPermission {
+    case .granted: perm = "granted"
+    case .denied: perm = "denied"
+    case .undetermined: perm = "undetermined"
+    @unknown default: perm = "unknown(\(AVAudioApplication.shared.recordPermission.rawValue))"
+    }
+    return """
+    ───── Audio diagnostic dump (mode=\(mode)) ─────
+      Engine state: isRunning=\(engine.isRunning), isCapturing=\(isCapturing)
+      iOS recordPermission: \(perm)
+      VPIO enabled on inputNode: \(inputNode.isVoiceProcessingEnabled)
+      Input-node format: rate=\(inFmt.sampleRate), channels=\(inFmt.channelCount), commonFormat=\(inFmt.commonFormat.rawValue)
+      Buffers since capture started: \(captureBuffersSinceLastFlush)
+      Last buffer received at: \(lastBufferReceivedAt.map { "\($0)" } ?? "nil (never)")
+      AVAudioSession.category: \(session.category.rawValue)
+      AVAudioSession.mode: \(session.mode.rawValue)
+      AVAudioSession.isInputAvailable: \(session.isInputAvailable)
+      AVAudioSession.isOtherAudioPlaying: \(session.isOtherAudioPlaying)
+      AVAudioSession.secondaryAudioShouldBeSilencedHint: \(session.secondaryAudioShouldBeSilencedHint)
+      Current route inputs (\(route.inputs.count)):
+    \(inputs.isEmpty ? "    (none — input chain is empty!)" : inputs)
+      Current route outputs (\(route.outputs.count)):
+    \(outputs.isEmpty ? "    (none)" : outputs)
+      Available inputs (\(session.availableInputs?.count ?? 0)):
+    \((session.availableInputs ?? []).map { "    - \($0.portName) [type=\($0.portType.rawValue)]" }.joined(separator: "\n"))
+    ─────────────────────────────────────────────────
+    """
   }
 
   /// Errors thrown out of `startCaptureAsync()`. Surfaced so the recording
@@ -305,9 +419,16 @@ class AudioSessionManager: ObservableObject {
     //    session. Recording mode pins it to plain RemoteIO so a prior
     //    coaching session can't leave a 5-channel VPIO format behind that
     //    would later fail input-chain validation.
+    //    Coaching mode mirrors `startCapture`'s VPIO+HFP bypass — if
+    //    the active input is BT HFP from Display glasses, skip VPIO
+    //    or `engine.start()` will return success but the engine will
+    //    immediately stop (see comment in `startCapture` for the
+    //    diagnostic background).
     do {
       if capturedMode == .coaching || capturedMode == .coachingPhoneOnly {
-        try node.setVoiceProcessingEnabled(true)
+        let isBTHFPInput = AVAudioSession.sharedInstance().currentRoute.inputs
+          .contains { $0.portType == .bluetoothHFP }
+        try node.setVoiceProcessingEnabled(!isBTHFPInput)
       } else {
         try node.setVoiceProcessingEnabled(false)
       }
@@ -349,7 +470,12 @@ class AudioSessionManager: ObservableObject {
         Self.configureSessionOffMain(mode: capturedMode)
         do {
           if capturedMode == .coaching || capturedMode == .coachingPhoneOnly {
-            try inputNode.setVoiceProcessingEnabled(true)
+            // Same VPIO+HFP bypass as `startCapture`. Display glasses
+            // BT HFP input crashes the VPIO unit silently — engine.start
+            // returns success but `isRunning` flips false immediately.
+            let isBTHFPInput = AVAudioSession.sharedInstance().currentRoute.inputs
+              .contains { $0.portType == .bluetoothHFP }
+            try inputNode.setVoiceProcessingEnabled(!isBTHFPInput)
           } else {
             try inputNode.setVoiceProcessingEnabled(false)
           }
@@ -543,21 +669,41 @@ class AudioSessionManager: ObservableObject {
   func startCapture() {
     guard !isCapturing else { return }
 
-    configureAudioSession()
+    // Skip if a prior `configureSessionOnly()` already ran the
+    // configure step — we don't want to re-post the route-change
+    // cascade (which would undo any HFP warmup delay the caller
+    // inserted between configure and start).
+    if !didConfigureSession {
+      configureAudioSession()
+    }
 
-    // For coaching modes, enable hardware voice processing on the input node —
-    // acoustic echo cancellation + noise suppression + automatic gain control.
-    // Required when the phone speaker plays Gemini's reply on loudspeaker while
-    // the mic is open; without this, the mic picks up the speaker output, the
-    // server-side VAD fires a barge-in, Gemini cuts its own reply, and the loop
-    // repeats. `.voiceChat` mode alone is tuned for earpiece and doesn't cancel
-    // loudspeaker well. `setVoiceProcessingEnabled(true)` must be called before
-    // `engine.start()` and reconfigures the input node's output format.
+    // For coaching modes, decide whether to enable hardware voice
+    // processing (AEC + noise suppression + AGC). VPIO is great when
+    // the input route is built-in mic or AirPods, but it has a known
+    // incompatibility with BT HFP from Meta Ray-Ban Display glasses:
+    // `engine.start()` returns success, but the underlying VPIO input
+    // unit can't initialize against that HFP route, the engine
+    // immediately stops itself (`isRunning` flips false), no buffers
+    // are ever delivered to the input tap. Diagnosed 2026-05-23 via
+    // the audio diagnostic dump.
+    //
+    // Trade-off when we skip VPIO on the glasses route: no hardware
+    // AEC for the BT speaker → BT mic loop. In practice Display
+    // glasses speakers are open-ear and point at the user's ears,
+    // and the BT HFP mic is in the temple front — physical separation
+    // is good enough that audible feedback is rare. Server-side VAD
+    // catches whatever residual echo bleeds through.
     if mode == .coaching || mode == .coachingPhoneOnly {
+      let session = AVAudioSession.sharedInstance()
+      let isBTHFPInput = session.currentRoute.inputs.contains { $0.portType == .bluetoothHFP }
+      let shouldUseVPIO = !isBTHFPInput
       do {
-        try inputNode.setVoiceProcessingEnabled(true)
+        try inputNode.setVoiceProcessingEnabled(shouldUseVPIO)
+        if !shouldUseVPIO {
+          print("[AudioSession] BT HFP input detected — disabling VPIO (known incompatibility with Display-glasses HFP unit; engine.start would silently stop)")
+        }
       } catch {
-        print("[AudioSession] ⚠ Failed to enable voice processing: \(error)")
+        print("[AudioSession] ⚠ Failed to set voice processing enabled=\(shouldUseVPIO): \(error)")
       }
     } else {
       // Defensive: a prior coaching session in this app launch may have
@@ -646,6 +792,10 @@ class AudioSessionManager: ObservableObject {
     // recording's `prewarm()` actually re-engages the input AU instead of
     // early-returning against a category we just flipped to `.playback`.
     didPrewarm = false
+    // Same rationale for `didConfigureSession`: this cycle's configure is
+    // about to be undone by the `.playback` switch below; the next cycle
+    // needs to re-configure from scratch.
+    didConfigureSession = false
 
     // Leave AVAudioSession in a state that plays nicely with whatever comes
     // next — review sheet's AVPlayer, another capture session, or idle.
@@ -908,6 +1058,47 @@ class AudioSessionManager: ObservableObject {
       return convertWithConverter(converter, buffer: buffer)
     }
     return convertWithConverter(converter, buffer: buffer)
+  }
+
+  /// Convert a mic capture buffer to a PCM16 16 kHz mono `AVAudioPCMBuffer`
+  /// for muxing as LinearPCM directly into an AVAssetWriter audio track.
+  /// Same converter + target format as `convertBufferForSend(_:)`; this
+  /// variant returns the buffer instead of extracting bytes into Data, so
+  /// the caller can hand it to a CMSampleBuffer builder.
+  ///
+  /// Used by glasses Expert recording — packaging PCM directly avoids the
+  /// AAC-at-HFP-rate encoder failure that poisons AVAssetWriter status with
+  /// `OSStatus -12651`.
+  func convertBufferToPcmRecording(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+    if audioConverter == nil { initializeConverterIfNeeded() }
+    guard let converter = audioConverter else { return nil }
+
+    let ratio = sendFormat.sampleRate / buffer.format.sampleRate
+    let outputFrameCount = AVAudioFrameCount(Double(buffer.frameLength) * ratio)
+    guard outputFrameCount > 0 else { return nil }
+
+    guard let outputBuffer = AVAudioPCMBuffer(
+      pcmFormat: sendFormat,
+      frameCapacity: outputFrameCount
+    ) else { return nil }
+
+    var error: NSError?
+    var hasData = false
+    converter.convert(to: outputBuffer, error: &error) { _, outStatus in
+      if hasData {
+        outStatus.pointee = .noDataNow
+        return nil
+      }
+      hasData = true
+      outStatus.pointee = .haveData
+      return buffer
+    }
+    if let error = error {
+      print("[AudioSession] PCM recording conversion error: \(error)")
+      return nil
+    }
+    guard outputBuffer.frameLength > 0 else { return nil }
+    return outputBuffer
   }
 
   private func convertWithConverter(_ converter: AVAudioConverter, buffer: AVAudioPCMBuffer) -> Data? {
