@@ -1,5 +1,7 @@
+import AVFAudio
 import MWDATCore
 import SwiftUI
+import UIKit
 
 struct LearnerProcedureDetailView: View {
   let procedureId: String
@@ -15,6 +17,11 @@ struct LearnerProcedureDetailView: View {
   @State private var isStartCoachingExpanded = false
   @State private var coachingStartingStep: Int?
   @State private var resumeTransport: CaptureTransport = .iPhone
+  /// Surfaced when the user has previously denied mic access — coaching
+  /// can't proceed without it, so the alert deep-links to Settings
+  /// instead of pushing the coaching view into a stranded state. See
+  /// Step 6b.5 in the native-lens-port plan.
+  @State private var showMicPermissionDeniedAlert = false
 
   var body: some View {
     RetraceScreen {
@@ -63,6 +70,19 @@ struct LearnerProcedureDetailView: View {
       GlassesInactiveSheet(iPhoneAlternativeTitle: "Coach with iPhone instead") {
         presentedCoaching = .iPhone
       }
+    }
+    .alert(
+      "Microphone access needed",
+      isPresented: $showMicPermissionDeniedAlert
+    ) {
+      Button("Open Settings") {
+        if let url = URL(string: UIApplication.openSettingsURLString) {
+          UIApplication.shared.open(url)
+        }
+      }
+      Button("Cancel", role: .cancel) {}
+    } message: {
+      Text("Coaching needs the microphone for two-way voice. Enable it in Settings → Retrace → Microphone.")
     }
     .safeAreaInset(edge: .bottom, spacing: 0) {
       if let procedure = viewModel.procedure {
@@ -362,20 +382,69 @@ struct LearnerProcedureDetailView: View {
 
   private func launchCoaching(transport: CaptureTransport, startingStep: Int?) {
     collapseStartCoachingCTA()
-    coachingStartingStep = startingStep
-    switch transport {
-    case .glasses:
-      // Pre-HOTFIX behavior restored 2026-05-21 — route on real glasses
-      // connectivity now that lens + DeviceSessionManager are wired.
-      if wearablesVM.registrationState != .registered {
-        showRegistrationSheet = true
-      } else if !wearablesVM.hasActiveDevice {
-        showGlassesInactiveSheet = true
-      } else {
-        presentedCoaching = .glasses
+    // Mic permission is checked BEFORE navigation so a denial doesn't
+    // strand the user in a coaching view that can't actually capture
+    // voice. DAT camera + registration are gated below (and via the
+    // separate DAT-permissions sheet on session start) — those don't
+    // apply to the iPhone transport so we only check them in the
+    // glasses branch.
+    Task { @MainActor in
+      let micOK = await ensureMicrophonePermission()
+      guard micOK else {
+        // Alert was surfaced inside the helper; nothing more to do.
+        return
       }
-    case .iPhone:
-      presentedCoaching = .iPhone
+      coachingStartingStep = startingStep
+      let pairedSnapshot = wearables.devices.map { id -> String in
+        if let d = wearables.deviceForIdentifier(id) {
+          return "\(d.nameOrId())(type=\(d.deviceType().rawValue),supportsDisplay=\(d.supportsDisplay()))"
+        } else {
+          return "\(id)(unresolved)"
+        }
+      }.joined(separator: ", ")
+      let permDescription = deviceSessionManager.cameraPermission.map { String(describing: $0) } ?? "unavailable"
+      print("[Retrace.Diag][launchGate] transport=\(transport) hasActiveDevice=\(wearablesVM.hasActiveDevice) devicesCount=\(wearables.devices.count) [\(pairedSnapshot)] registrationState=\(wearablesVM.registrationState) cameraPermission=\(permDescription)")
+      switch transport {
+      case .glasses:
+        // Pre-HOTFIX behavior restored 2026-05-21 — route on real glasses
+        // connectivity now that lens + DeviceSessionManager are wired.
+        if wearablesVM.registrationState != .registered {
+          print("[Retrace.Diag][launchGate] → routing to RegistrationPromptSheet (not .registered)")
+          showRegistrationSheet = true
+        } else if !wearablesVM.hasActiveDevice {
+          print("[Retrace.Diag][launchGate] → routing to GlassesInactiveSheet (registered but no active device)")
+          showGlassesInactiveSheet = true
+        } else {
+          print("[Retrace.Diag][launchGate] → presentedCoaching = .glasses")
+          presentedCoaching = .glasses
+        }
+      case .iPhone:
+        presentedCoaching = .iPhone
+      }
+    }
+  }
+
+  /// Mic preflight: granted → true; undetermined → prompt inline; denied
+  /// → surface the Settings deep-link alert and return false. iOS-native
+  /// path per `mwdat-ios:permissions-registration` (DAT 0.7 has no
+  /// `Permission.microphone`).
+  private func ensureMicrophonePermission() async -> Bool {
+    switch AVAudioApplication.shared.recordPermission {
+    case .granted:
+      return true
+    case .denied:
+      showMicPermissionDeniedAlert = true
+      return false
+    case .undetermined:
+      let granted = await AVAudioApplication.requestRecordPermission()
+      if !granted {
+        showMicPermissionDeniedAlert = true
+      }
+      return granted
+    @unknown default:
+      // Be permissive on future enum cases — let the in-session retry
+      // path surface the failure rather than blocking here.
+      return true
     }
   }
 

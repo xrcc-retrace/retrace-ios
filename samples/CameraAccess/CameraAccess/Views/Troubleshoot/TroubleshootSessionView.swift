@@ -20,6 +20,7 @@ struct TroubleshootSessionView: View {
 
   @Environment(\.dismiss) private var dismiss
   @EnvironmentObject private var appOrientationController: AppOrientationController
+  @EnvironmentObject private var lensSession: LensSession
   @StateObject private var viewModel: DiagnosticSessionViewModel
 
   @State private var showDismissConfirmation = false
@@ -182,6 +183,17 @@ struct TroubleshootSessionView: View {
       viewModel.onBackGesture = {
         showDismissConfirmation = true
       }
+      // Lens-side Start button (Step 8 `TroubleshootLensRenderer`)
+      // delegates here so the post-handoff navigation (which owns the
+      // `onExit(payload)` cover dismissal) stays on the view layer.
+      viewModel.onLensStartHandoff = { procedureId in
+        Task { await startHandoff(procedureId: procedureId) }
+      }
+      // Activate the troubleshoot lens renderer. Output is gated by
+      // `lensOutputEnabled` inside `LensSession.send`, so this is safe
+      // to call unconditionally — when the toggle is OFF, no sends
+      // reach the glasses.
+      lensSession.activate(.troubleshoot, vm: viewModel)
       if transport == .iPhone {
         // Match Coaching's orientation flow — broaden the allowed mask so
         // SwiftUI chrome can follow the phone into landscape, seed the
@@ -202,6 +214,12 @@ struct TroubleshootSessionView: View {
       await viewModel.startSession()
     }
     .onDisappear {
+      // Tear down the troubleshoot lens renderer first so its Combine
+      // subscriptions don't fire a final send while the VM is being
+      // released. The display capability itself stays attached (app-
+      // scoped via `LensDisplayCoordinator`).
+      lensSession.deactivate()
+      viewModel.onLensStartHandoff = nil
       viewModel.endSession()
       if transport == .iPhone {
         UIDevice.current.endGeneratingDeviceOrientationNotifications()
@@ -256,6 +274,22 @@ struct TroubleshootSessionView: View {
         },
         onCancel: {
           viewModel.pendingAudioRetry = false
+        }
+      )
+    }
+    // DAT helper update recovery — mirrors CoachingSessionView. Surfaced
+    // when the SDK throws `datAppOnTheGlassesUpdateRequired`. Routes the
+    // user through Meta AI's update flow via the SDK's built-in deep link.
+    .sheet(isPresented: $viewModel.pendingDATHelperUpdate) {
+      DATHelperUpdateRequiredSheet(
+        onOpenMetaAI: {
+          wearablesVM.openDATGlassesAppUpdate()
+        },
+        onRetry: {
+          Task { await viewModel.retryAfterDATHelperUpdate() }
+        },
+        onCancel: {
+          viewModel.pendingDATHelperUpdate = false
         }
       )
     }

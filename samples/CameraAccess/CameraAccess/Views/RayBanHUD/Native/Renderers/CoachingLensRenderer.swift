@@ -205,9 +205,32 @@ final class CoachingLensRenderer: LensRenderer {
         }
       },
       onReferenceClipTap: { [weak self] in
-        // Step 7 wires `LensSession.presentReferenceClip` — for now this
-        // is a no-op until the video handoff plumbing lands.
-        _ = self
+        guard let self else { return }
+        // Need a step + clip + procedure id to build a video URL. The
+        // thumbnail itself only renders when `hasClip == true` so the
+        // step-with-clip case is the only one that can reach here, but
+        // the URL builder still returns optional in case the server
+        // endpoint is unresolved.
+        guard
+          let step = self.viewModel.displayedStep,
+          step.clipUrl != nil,
+          let videoURL = LensImageURL.clipVideoURL(
+            procedureId: self.viewModel.lensProcedureId,
+            stepIndex: step.stepNumber
+          )
+        else { return }
+
+        Task { [weak self] in
+          await self?.lensSession?.presentReferenceClip(
+            uri: videoURL,
+            onEnded: { [weak self] in
+              // Return to the active snapshot tree. Re-collapsing here
+              // is optional UX — keeping `.referenceExpanded` so the
+              // user can replay without re-expanding feels natural.
+              self?.scheduleSend()
+            }
+          )
+        }
       },
       onCompletionExit: { [weak viewModel] in
         Task { @MainActor in

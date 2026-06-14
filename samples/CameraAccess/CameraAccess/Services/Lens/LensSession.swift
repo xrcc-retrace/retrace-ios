@@ -34,6 +34,13 @@ final class LensSession: ObservableObject {
   /// The active renderer. Single-slot; replaced on `activate(_:vm:)`.
   private var currentRenderer: LensRenderer?
 
+  /// Reason the last `send(_:)` was suppressed (or `.delivered` if it
+  /// actually went through). Used to log only on transitions so a
+  /// renderer pumping 8 BT-sends/sec doesn't flood the console with the
+  /// same suppression message. Cleared on `deactivate()`.
+  private enum SendState { case undecided, delivered, toggleOff, displayNil }
+  private var lastSendState: SendState = .undecided
+
   init(coordinator: LensDisplayCoordinator) {
     self.coordinator = coordinator
   }
@@ -44,8 +51,29 @@ final class LensSession: ObservableObject {
   /// Silently no-ops when the lens output toggle is off or no display
   /// is paired. Renderers and ad-hoc smoke tests call through here so
   /// the toggle gate stays in one place.
+  ///
+  /// Suppression reasons are logged once per state transition (not per
+  /// send) — so "lens output disabled" or "display unavailable on this
+  /// device" surfaces clearly in the console without spamming.
   func send(_ view: some DisplayableView) async {
-    guard UserDefaults.standard.bool(forKey: "lensOutputEnabled") else { return }
+    guard UserDefaults.standard.bool(forKey: "lensOutputEnabled") else {
+      if lastSendState != .toggleOff {
+        print("[LensSession] send suppressed — lensOutputEnabled=false in Server Settings → Debug")
+        lastSendState = .toggleOff
+      }
+      return
+    }
+    guard coordinator.display != nil else {
+      if lastSendState != .displayNil {
+        print("[LensSession] send suppressed — no display capability (non-display glasses or display not yet attached)")
+        lastSendState = .displayNil
+      }
+      return
+    }
+    if lastSendState != .delivered {
+      print("[LensSession] send delivering → glasses display")
+      lastSendState = .delivered
+    }
     await coordinator.send(view)
   }
 
@@ -69,9 +97,25 @@ final class LensSession: ObservableObject {
       currentRenderer = CoachingLensRenderer(viewModel: coachingVM, lensSession: self)
       print("[LensSession] activate(.coaching) ✓")
 
-    case .troubleshoot, .expert, .handoffToPhone, .idle:
-      // Step 8/9/10 land these. For now activation is a no-op and the
-      // lens retains whatever tree was last sent.
+    case .troubleshoot:
+      guard let diagnosticVM = vm as? DiagnosticSessionViewModel else {
+        print("[LensSession] activate(.troubleshoot) skipped — vm is not DiagnosticSessionViewModel")
+        return
+      }
+      currentRenderer = TroubleshootLensRenderer(viewModel: diagnosticVM, lensSession: self)
+      print("[LensSession] activate(.troubleshoot) ✓")
+
+    case .expert:
+      guard let context = vm as? ExpertLensContext else {
+        print("[LensSession] activate(.expert) skipped — vm is not ExpertLensContext")
+        return
+      }
+      currentRenderer = ExpertLensRenderer(context: context, lensSession: self)
+      print("[LensSession] activate(.expert) ✓")
+
+    case .handoffToPhone, .idle:
+      // Step 10 lands `.handoffToPhone`. For now activation is a no-op
+      // and the lens retains whatever tree was last sent.
       break
     }
   }
@@ -82,6 +126,68 @@ final class LensSession: ObservableObject {
   func deactivate() {
     currentRenderer?.cancel()
     currentRenderer = nil
+    lastSendState = .undecided
     currentFlow = .idle
+  }
+
+  // MARK: - Reference clip handoff (Step 7)
+
+  /// Present a reference clip in full-screen takeover mode. Per
+  /// `mwdat-ios:display-access`: *"Each `send(_:)` replaces the previous
+  /// content on the glasses... Use a root `FlexBox` for UI, or a root
+  /// `VideoPlayer` for video."* Sending a `VideoPlayer` here displaces
+  /// the active FlexBox tree entirely; on `.ended` / `.stopped`,
+  /// `onEnded` fires so the caller (the active renderer) can re-send
+  /// its current snapshot tree to return the UI.
+  ///
+  /// Critical contract from the plugin docs: install `onPlaybackEvent`
+  /// BEFORE sending the video so the terminal event isn't dropped on
+  /// the floor while the closure is being attached.
+  func presentReferenceClip(
+    uri: String,
+    onEnded: @escaping () -> Void
+  ) async {
+    guard UserDefaults.standard.bool(forKey: "lensOutputEnabled") else { return }
+    guard let display = coordinator.display else {
+      print("[LensSession] presentReferenceClip skipped — display not attached")
+      return
+    }
+
+    display.onPlaybackEvent = { [weak self] event in
+      if event.type == .ended || event.type == .stopped {
+        Task { @MainActor [weak self] in
+          self?.coordinator.display?.onPlaybackEvent = nil
+          onEnded()
+        }
+      }
+    }
+
+    // `MWDATDisplay.VideoPlayer` is qualified explicitly because this
+    // file imports SwiftUI (for `@MainActor` plumbing) and SwiftUI's
+    // `VideoPlayer` from AVKit can collide with the DSL one. Same rule
+    // applies in any renderer file that mixes SwiftUI + MWDATDisplay
+    // (per the plan's Constraint #8).
+    await coordinator.send(
+      MWDATDisplay.VideoPlayer(
+        provider: .uri(uri),
+        codec: .mp4,
+        onError: { error in
+          print("[LensSession] VideoPlayer error: \(error)")
+        }
+      )
+    )
+  }
+
+  /// User-initiated early exit during clip playback (e.g. Neural Band
+  /// back gesture). Sends a stop to the SDK, which triggers a `.stopped`
+  /// playback event — the handler installed by `presentReferenceClip`
+  /// then re-sends the active snapshot tree.
+  ///
+  /// Not wired yet from a back-gesture handler — Step 11 will add the
+  /// "interrupt playback on back gesture" path. This exists so that
+  /// path has a single call site to target.
+  func dismissReferenceClip() async {
+    guard let display = coordinator.display else { return }
+    await display.sendVideoStop()
   }
 }

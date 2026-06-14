@@ -307,10 +307,12 @@ class StreamSessionViewModel: ObservableObject {
   private var deviceMonitorTask: Task<Void, Never>?
   /// Phase 6: optional shared `DeviceSessionManager`. When the
   /// `deviceSessionManagerEnabled` toggle is ON, Expert recording's
-  /// DeviceSession lifecycle routes through the manager so it can
-  /// coexist with lens display on the same physical device (issue #180).
-  /// When OFF, the inline createSession + 5s-watchdog path is used —
-  /// preserved for sub-second on-device rollback during migration.
+  /// `DeviceSession` lifecycle routes through the manager so the camera
+  /// `Stream` can coexist with `Display` on the same physical device —
+  /// the SDK's capability-composition model requires both capabilities
+  /// to attach to one shared session. When OFF, the inline createSession
+  /// + 5s-watchdog path is used — preserved for sub-second on-device
+  /// rollback during migration.
   private let sessionManager: DeviceSessionManager?
 
   /// Reads the live debug toggle. Re-read on each `startSession`
@@ -738,14 +740,19 @@ class StreamSessionViewModel: ObservableObject {
   /// `attachStreamListeners`). Mirrors
   /// `IPhoneExpertRecordingViewModel.startHandTrackingIfAvailable()`.
   private func startHandTrackingIfAvailable() {
-    guard HandTrackingConfig.isAvailable else {
-      print("[Expert/Glasses] Hand tracking unavailable — model not bundled")
+    // Glasses transport never starts hand tracking — Neural Band drives
+    // input directly. This is the StreamSessionViewModel (glasses preview
+    // / expert recording on glasses), so `shouldStart(for: .glasses)`
+    // returns false by design.
+    guard HandGestureService.shouldStart(for: .glasses) else {
+      print("[Expert/Glasses] Hand tracking suppressed — glasses transport, Neural Band drives input")
       return
     }
-    if HandGestureService.isDisabled {
-      print("[Expert/Glasses] Hand tracking suppressed by user setting")
-      return
-    }
+    // Defensive: helper currently returns false for .glasses
+    // unconditionally; if the policy ever changes (e.g. fallback when no
+    // Neural Band is detected), this code path needs an audit before
+    // running MediaPipe alongside the BT Stream attach.
+    assertionFailure("Glasses-path hand tracking is intentionally disabled; reconsider before re-enabling")
 
     hudViewModel.resetHandTracking()
 

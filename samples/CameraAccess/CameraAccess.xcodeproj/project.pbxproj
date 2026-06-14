@@ -20,6 +20,7 @@
 		0E2B467EAC3577ACBC15E8E8 /* CategoryChip.swift in Sources */ = {isa = PBXBuildFile; fileRef = C06C456A852E3B95EE5276D9 /* CategoryChip.swift */; };
 		101A444CBB10C735597FE767 /* HandLandmarkFrame.swift in Sources */ = {isa = PBXBuildFile; fileRef = 933E46879747BC2AFD132A25 /* HandLandmarkFrame.swift */; };
 		119D42E78B75D53754A4A181 /* LensIconMap.swift in Sources */ = {isa = PBXBuildFile; fileRef = 437743A4ADFFCF60B70D7B94 /* LensIconMap.swift */; };
+		172647F9B58E6746C65D138B /* ExpertLensRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3B5460C8FE5E2C31A28C638 /* ExpertLensRenderer.swift */; };
 		17A84A169EE05C8797CEA6A7 /* HandLandmarkerService.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE4B498EB4BCCE6A4FA91784 /* HandLandmarkerService.swift */; };
 		190346D39465536B5E4715BC /* GlassesSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 543544C586DF3DB67C17B516 /* GlassesSettingsView.swift */; };
 		1CA0ACB531BDD10B287CE0C3 /* ManualUploadSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB606A2D9721475EF2447206 /* ManualUploadSheet.swift */; };
@@ -66,6 +67,7 @@
 		5C974C2AB0E8B6920F302AA2 /* MicroGestureRecognizerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F03B4126B7992B8C4EEED886 /* MicroGestureRecognizerTests.swift */; };
 		5D814FE48DB22EA1AC1F10D6 /* StepCompletionOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = 987E45559FBEF6734EBC7931 /* StepCompletionOverlay.swift */; };
 		5DD6406BB4A46418A2193B60 /* DiagnosticPhaseBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = C63E4DB6B45A9AAD0ECFEE8F /* DiagnosticPhaseBar.swift */; };
+		5F224BE08E76BCB0D411810B /* TroubleshootLensTrees.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02E640C3922837D64D773849 /* TroubleshootLensTrees.swift */; };
 		6046488EB1A7B0CF3EB2C214 /* ZoomableImageViewer.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD554B5BA2E45691C8771E44 /* ZoomableImageViewer.swift */; };
 		60DF4617925A0CACD6F03C7E /* CoachingSessionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 74A24F39AC3FBF21EED9B635 /* CoachingSessionView.swift */; };
 		623B4062A1C175AEF699FBF8 /* LensImageURL.swift in Sources */ = {isa = PBXBuildFile; fileRef = C07040CA9BE810FE60629C5E /* LensImageURL.swift */; };
@@ -87,6 +89,7 @@
 		7A7745B6AC3E22919F80AAF0 /* CoachingSessionViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5D424E4BA44D0156B45D29B0 /* CoachingSessionViewModel.swift */; };
 		7B21445C81C6DBCFA734FEA8 /* TroubleshootSearchingPage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 44C44034ACD8780D26CA09B2 /* TroubleshootSearchingPage.swift */; };
 		7EAA4CE4A7EE4242C794BCD5 /* CoachingExitConfirmationOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = F86E448C8274894E7FC76F49 /* CoachingExitConfirmationOverlay.swift */; };
+		7ECA4C74B78AA7E769C191C5 /* ExpertLensTrees.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1F5463EBDB459208BE6A297 /* ExpertLensTrees.swift */; };
 		7F9BF76287EFC794F249AF64 /* TroubleshootIntroView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 27A537C9E3DE698E50A68E87 /* TroubleshootIntroView.swift */; };
 		86B4DDA72180F3FDBA749D3F /* BonjourDiscovery.swift in Sources */ = {isa = PBXBuildFile; fileRef = 217E5F479DBBCD15000BF0DC /* BonjourDiscovery.swift */; };
 		883743AFA338E286CB815334 /* ExpertTabView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 948E4153AE26C2C238229983 /* ExpertTabView.swift */; };
@@ -131,6 +134,7 @@
 		9AF04D3F87B6DC700258DDF6 /* AudioSessionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 489D4C508C3B294BAD1E51D9 /* AudioSessionManager.swift */; };
 		9CDA420C85AF28FBDA910C5B /* ReferenceImagePicker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 499E43EF91E081B5BF03C682 /* ReferenceImagePicker.swift */; };
 		9EB646868A00AFD405367AB3 /* LocalProgressStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 07404D8FBB8C80A8A82E300C /* LocalProgressStore.swift */; };
+		9EB84C8AB96795BFD006919E /* TroubleshootLensRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 680141988DE561FE324072E8 /* TroubleshootLensRenderer.swift */; };
 		9ED5507B6DAF993CD2049D46 /* BottomDrawer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9335DB8EDEFA17CB49E9ABDD /* BottomDrawer.swift */; };
 		A0E547C58FF5989932C14DDC /* WorkflowListViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39E042E4AC27537C599E1532 /* WorkflowListViewModel.swift */; };
 		A1B2C3D4E5F60718293A4B5D /* WorkflowPlaybackAudioSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B5C /* WorkflowPlaybackAudioSession.swift */; };
@@ -144,6 +148,7 @@
 		A9D0B6E1F23C4A5B6789012B /* ProcedureStepContentViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9D0B6E1F23C4A5B6789012E /* ProcedureStepContentViews.swift */; };
 		AD3F4E629C7BFB63998BA513 /* ProcedureReviewView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 499F4D8E9A46087CEB86D631 /* ProcedureReviewView.swift */; };
 		AD8E4523B31F2076BF92260D /* TroubleshootSearchStatusView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F1F48F996DAFE48D0B5A27C /* TroubleshootSearchStatusView.swift */; };
+		ADDB46B688FF839AFE631527 /* DATHelperUpdateRequiredSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 907547C5BF9C2079BA5516E1 /* DATHelperUpdateRequiredSheet.swift */; };
 		B0934C0698578DF7A13EEA00 /* ControlsSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 86E5413DB0A9FB1820114C91 /* ControlsSection.swift */; };
 		B10F4D908D223171692074EC /* HUDInputEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6B3B48B0B9536392720FAC8D /* HUDInputEngine.swift */; };
 		B16F4E1B8C30E2DA0E987846 /* hand_landmarker.task in Resources */ = {isa = PBXBuildFile; fileRef = 2D8C417AB5C2291E6CC1281E /* hand_landmarker.task */; };
@@ -234,6 +239,7 @@
 
 /* Begin PBXFileReference section */
 		02D64FAE85BAC1BBD73CE88A /* SafariBrowserView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SafariBrowserView.swift; path = CameraAccess/Views/Components/SafariBrowserView.swift; sourceTree = SOURCE_ROOT; };
+		02E640C3922837D64D773849 /* TroubleshootLensTrees.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TroubleshootLensTrees.swift; path = CameraAccess/Views/RayBanHUD/Native/Renderers/TroubleshootLensTrees.swift; sourceTree = SOURCE_ROOT; };
 		07404D8FBB8C80A8A82E300C /* LocalProgressStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = LocalProgressStore.swift; path = CameraAccess/Services/LocalProgressStore.swift; sourceTree = SOURCE_ROOT; };
 		0A2A49089EA85DD526AB189F /* CaptureTransportPickerSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = CaptureTransportPickerSheet.swift; path = CameraAccess/Views/Components/CaptureTransportPickerSheet.swift; sourceTree = SOURCE_ROOT; };
 		0A444E4CB59DAEA56FF00E5D /* TroubleshootStageHeaderCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TroubleshootStageHeaderCard.swift; path = CameraAccess/Views/Troubleshoot/Components/TroubleshootStageHeaderCard.swift; sourceTree = SOURCE_ROOT; };
@@ -287,6 +293,7 @@
 		65304E7AB009BBE6224140C3 /* ServerSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ServerSettingsView.swift; path = CameraAccess/Views/ServerSettingsView.swift; sourceTree = SOURCE_ROOT; };
 		65A04FFD9D1423BDA575CAF0 /* CoachingLensRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = CoachingLensRenderer.swift; path = CameraAccess/Views/RayBanHUD/Native/Renderers/CoachingLensRenderer.swift; sourceTree = SOURCE_ROOT; };
 		65A849EA88ED898041402BAE /* LibraryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = LibraryView.swift; path = CameraAccess/Views/Learner/Library/LibraryView.swift; sourceTree = SOURCE_ROOT; };
+		680141988DE561FE324072E8 /* TroubleshootLensRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TroubleshootLensRenderer.swift; path = CameraAccess/Views/RayBanHUD/Native/Renderers/TroubleshootLensRenderer.swift; sourceTree = SOURCE_ROOT; };
 		68B622472F9383BA008690E4 /* AppIcon.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = AppIcon.icon; sourceTree = "<group>"; };
 		694941128E04DDBAAE271490 /* ExpertManualUploadSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ExpertManualUploadSheet.swift; path = CameraAccess/Views/Expert/ExpertManualUploadSheet.swift; sourceTree = SOURCE_ROOT; };
 		6B3B48B0B9536392720FAC8D /* HUDInputEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = HUDInputEngine.swift; path = CameraAccess/Views/RayBanHUD/HUDInputEngine.swift; sourceTree = SOURCE_ROOT; };
@@ -344,6 +351,7 @@
 		8FFD60532E849D0D0035E446 /* RegistrationView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RegistrationView.swift; sourceTree = "<group>"; };
 		8FFD605E2E84A2F70035E446 /* DebugMenuView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugMenuView.swift; sourceTree = "<group>"; };
 		8FFD605F2E84A2F70035E446 /* MainAppView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainAppView.swift; sourceTree = "<group>"; };
+		907547C5BF9C2079BA5516E1 /* DATHelperUpdateRequiredSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = DATHelperUpdateRequiredSheet.swift; path = CameraAccess/Views/Components/DATHelperUpdateRequiredSheet.swift; sourceTree = SOURCE_ROOT; };
 		9335DB8EDEFA17CB49E9ABDD /* BottomDrawer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = BottomDrawer.swift; path = CameraAccess/Views/Components/BottomDrawer.swift; sourceTree = SOURCE_ROOT; };
 		933E46879747BC2AFD132A25 /* HandLandmarkFrame.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = HandLandmarkFrame.swift; path = CameraAccess/HandTracking/HandLandmarkFrame.swift; sourceTree = SOURCE_ROOT; };
 		948E4153AE26C2C238229983 /* ExpertTabView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ExpertTabView.swift; path = CameraAccess/Views/Expert/ExpertTabView.swift; sourceTree = SOURCE_ROOT; };
@@ -400,6 +408,8 @@
 		DEB0447F881367FC38E1DC03 /* CachedAsyncImage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = CachedAsyncImage.swift; path = CameraAccess/Views/Components/CachedAsyncImage.swift; sourceTree = SOURCE_ROOT; };
 		DEE24314A04A02908FC09D8B /* ExpertRecordingLayout.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ExpertRecordingLayout.swift; path = CameraAccess/Views/Expert/HUD/ExpertRecordingLayout.swift; sourceTree = SOURCE_ROOT; };
 		E1974654B0A5928E8307DD25 /* CoachingStyleTile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = CoachingStyleTile.swift; path = CameraAccess/Views/Onboarding/Components/CoachingStyleTile.swift; sourceTree = SOURCE_ROOT; };
+		E1F5463EBDB459208BE6A297 /* ExpertLensTrees.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ExpertLensTrees.swift; path = CameraAccess/Views/RayBanHUD/Native/Renderers/ExpertLensTrees.swift; sourceTree = SOURCE_ROOT; };
+		E3B5460C8FE5E2C31A28C638 /* ExpertLensRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ExpertLensRenderer.swift; path = CameraAccess/Views/RayBanHUD/Native/Renderers/ExpertLensRenderer.swift; sourceTree = SOURCE_ROOT; };
 		E4032E6C4B7888AA4B354B6C /* GeminiLiveSessionBase.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = GeminiLiveSessionBase.swift; path = CameraAccess/ViewModels/GeminiLiveSessionBase.swift; sourceTree = SOURCE_ROOT; };
 		E61B9285EA1004D1AEEBDE44 /* CoachingExitConfirmHandler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = CoachingExitConfirmHandler.swift; path = CameraAccess/Views/Learner/Coaching/CoachingExitConfirmHandler.swift; sourceTree = SOURCE_ROOT; };
 		E66CC00D2F3E05D900B07379 /* CameraAccessUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = CameraAccessUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -617,6 +627,11 @@
 				0D1D4260B391140B6EA01007 /* DATCameraPermissionCTA.swift */,
 				6C264938B81217EF941CC0F9 /* PermissionRequiredSheet.swift */,
 				10C0450A9F6C7DC3F88B0750 /* AudioRecoverySheet.swift */,
+				907547C5BF9C2079BA5516E1 /* DATHelperUpdateRequiredSheet.swift */,
+				02E640C3922837D64D773849 /* TroubleshootLensTrees.swift */,
+				680141988DE561FE324072E8 /* TroubleshootLensRenderer.swift */,
+				E3B5460C8FE5E2C31A28C638 /* ExpertLensRenderer.swift */,
+				E1F5463EBDB459208BE6A297 /* ExpertLensTrees.swift */,
 			);
 			sourceTree = "<group>";
 		};
@@ -1120,6 +1135,11 @@
 				76CD480F96DC9C9A7BAECCE3 /* DATCameraPermissionCTA.swift in Sources */,
 				30004966B311BB91876F063B /* PermissionRequiredSheet.swift in Sources */,
 				EF0149E9A3124BF243B0B461 /* AudioRecoverySheet.swift in Sources */,
+				ADDB46B688FF839AFE631527 /* DATHelperUpdateRequiredSheet.swift in Sources */,
+				5F224BE08E76BCB0D411810B /* TroubleshootLensTrees.swift in Sources */,
+				9EB84C8AB96795BFD006919E /* TroubleshootLensRenderer.swift in Sources */,
+				172647F9B58E6746C65D138B /* ExpertLensRenderer.swift in Sources */,
+				7ECA4C74B78AA7E769C191C5 /* ExpertLensTrees.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -1159,7 +1179,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_ASSET_PATHS = "";
-				DEVELOPMENT_TEAM = 9SVBTR9GV3;
+				DEVELOPMENT_TEAM = V56DG94ZL5;
 				ENABLE_PREVIEWS = YES;
 				FRAMEWORK_SEARCH_PATHS = "";
 				INFOPLIST_FILE = CameraAccess/Info.plist;
@@ -1188,7 +1208,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_ASSET_PATHS = "";
-				DEVELOPMENT_TEAM = 9SVBTR9GV3;
+				DEVELOPMENT_TEAM = V56DG94ZL5;
 				ENABLE_PREVIEWS = YES;
 				INFOPLIST_FILE = CameraAccess/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;

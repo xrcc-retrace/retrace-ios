@@ -167,7 +167,7 @@ The HUD reads `HandGestureService.$state` to drive focus rings, the recede-and-a
 
 ### Glasses path
 
-- DAT SDK `StreamSession` via `wearables.createSession(deviceSelector:)` → `deviceSession.addStream(config:)` (0.6 API; `StreamSession` has no public init, it's attached as a capability to a `DeviceSession`).
+- DAT SDK `MWDATCamera.Stream` via `wearables.createSession(deviceSelector:)` → `deviceSession.addStream(config: StreamConfiguration(...))` (0.7 API; `Stream` is a capability attached to the `DeviceSession`, not a top-level type — there's no public init).
 - `AutoDeviceSelector` picks the best paired device.
 - Audio flows through BT HFP.
 
@@ -291,21 +291,29 @@ samples/CameraAccess/
 
 ## DAT SDK conventions
 
-- Three modules — `MWDATCore` (devices, registration, permissions, selectors), `MWDATCamera` (`StreamSession`, `VideoFrame`, photo capture), `MWDATMockDevice` (MockDeviceKit, MockRaybanMeta).
-- Entry point is `Wearables.shared` after `Wearables.configure()` at launch.
-- 0.6 API: `wearables.createSession(deviceSelector:)` → `deviceSession.addStream(config:)`. `StreamSession` has **no public init** — it's a capability attached to the `DeviceSession`.
-- Imports:
-  ```swift
-  import MWDATCore
-  import MWDATCamera
-  #if DEBUG
-  import MWDATMockDevice
-  #endif
-  ```
-- Use `async/await` for all SDK operations. Use `AsyncSequence` / publisher `.listen {}` to observe streams.
-- Annotate UI-updating code with `@MainActor`. Never block main with frame processing.
+**Canonical reference: the `mwdat-ios:*` plugin skills.** Meta ships its DAT iOS guidance as a Claude Code plugin (pinned at 0.7.0). Invoke the relevant skill rather than re-deriving from memory or this doc:
 
-Full DAT reference: [Meta Wearables DAT SDK docs](https://wearables.developer.meta.com/docs/develop/), plus `.claude/rules/dat-conventions.md` and `.cursor/rules/`.
+| Question | Invoke |
+|---|---|
+| How do I set up the SDK from scratch? | `mwdat-ios:getting-started` |
+| What's the canonical Swift pattern / type / import? | `mwdat-ios:dat-conventions` |
+| How do session/stream states behave? | `mwdat-ios:session-lifecycle` |
+| How do I attach a camera stream? | `mwdat-ios:camera-streaming` |
+| How do I render on the lens? | `mwdat-ios:display-access` |
+| How does the permission/registration flow work? | `mwdat-ios:permissions-registration` |
+| How do I test without hardware? | `mwdat-ios:mockdevice-testing` |
+| Something's broken — where do I start? | `mwdat-ios:debugging` |
+| What does a complete app look like? | `mwdat-ios:sample-app-guide` |
+
+Do NOT keep duplicate copies of the SDK's module list, type names, naming conventions, or example code in this file or in any project doc — those are the plugin's job and drift fast. Update the plugin pin instead.
+
+### Project-specific invariants on top of Meta's canonical guidance
+
+These are NOT in the plugin. They're Retrace-specific rules layered on top.
+
+1. **`Services/DeviceSessionManager.swift` owns every `DeviceSession`.** Never call `wearables.createSession(...)` directly from a new consumer. See `.claude/rules/dat-conventions.md` for the full invariant.
+2. **`MWDATCore.Permission` has only `.camera`** (0.7.0). Microphone gating is iOS-native via `AVAudioApplication.requestRecordPermission()`, prompted at session start by `AudioSessionManager`. Don't try `Permission.microphone` — it doesn't exist.
+3. **`datAppOnTheGlassesUpdateRequired` gets a dedicated recovery sheet** for both consumers (camera-streaming via `pendingDATHelperUpdate` → `DATHelperUpdateRequiredSheet`; display via `requiresDATAppUpdate` → Server Settings inline). Mirror for any new consumer; both deep-link to `wearables.openDATGlassesAppUpdate()`.
 
 ## Permissions (`Info.plist`)
 
@@ -372,7 +380,7 @@ When you ship a new pattern, **update the doc** so it stays authoritative.
 6. **Tool calls close the gate.** When Gemini issues a function call, the VM adds the id to `pendingToolCallIds` and clears the playback buffer so Gemini's half-spoken reply doesn't continue over the next turn. The gate reopens only when every in-flight tool id has a `toolResponse` ACKed.
 7. **Barge-in is server-detected.** `serverContent.interrupted` is Gemini's server-VAD telling us it cancelled generation because the learner talked over it. We must flush playback or the glasses speaker keeps playing the old reply.
 8. **Bonjour over hardcoded IPs.** `BonjourDiscovery` populates `UserDefaults["serverBaseURL"]`; `ServerSettingsView` provides manual override. No IPs in code.
-9. **Camera lifecycle is serialized.** `CoachingSessionViewModel.cameraLifecycleTask` chains every start/stop so a rapid dismiss + reopen can't race two `StreamSession` objects (DAT SDK returns WARP error 3 on that race).
+9. **Camera lifecycle is serialized.** `CoachingSessionViewModel.cameraLifecycleTask` chains every start/stop so a rapid dismiss + reopen can't race two `Stream` capabilities (DAT SDK returns WARP error 3 on that race).
 10. **No glasses registration gate.** The app used to require pairing before showing the mode selector; now glasses are checked on-demand when the user picks a glasses-backed action. iPhone-only flows never prompt.
 
 ## Swift patterns + gotchas

@@ -351,7 +351,7 @@ Requires `pip install pbxproj` once.
 
 ## Attribution
 
-Forked from Meta's [`meta-wearables-dat-ios`](https://github.com/facebook/meta-wearables-dat-ios) `CameraAccess` sample. All inherited Meta scaffolding — `LICENSE`, `NOTICE`, `CODE_OF_CONDUCT.md`, `CONTRIBUTING.md`, `AGENTS.md`, `CHANGELOG.md`, `install-skills.sh`, and the `.cursor/rules/` set — lives under [`meta-dat-fork/`](meta-dat-fork/) so the repo root reads as Retrace, not as a Meta SDK fork. The actively-developed Xcode project still lives at `samples/CameraAccess/`.
+Forked from Meta's [`meta-wearables-dat-ios`](https://github.com/facebook/meta-wearables-dat-ios) `CameraAccess` sample. The actively-developed Xcode project lives at `samples/CameraAccess/`. The Meta DAT SDK is consumed via Swift Package Manager (pinned at 0.7.0 in `Package.resolved`); canonical AI-coding guidance is delivered through the `mwdat-ios:*` Claude Code plugin (also pinned at 0.7.0). The previously vendored `meta-dat-fork/` snapshot was a stale 0.6.0 copy and has been removed — refresh the plugin or read Meta's upstream repo directly for new guidance.
 
 A second README at [`samples/CameraAccess/README.md`](samples/CameraAccess/README.md) covers the same iOS app at the Xcode-project scope (handy when navigating the project from inside Xcode).
 

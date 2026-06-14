@@ -233,7 +233,13 @@ class AudioSessionManager: ObservableObject {
           options: []  // no HFP / A2DP
         )
       }
-      try session.setActive(true)
+      // Per Meta's mic+speakers sample (verbatim):
+      //   setActive(true, options: .notifyOthersOnDeactivation)
+      // Hint to competing audio apps (Music, podcast players) that they
+      // should resume when we deactivate. Without it, music stays paused
+      // until the user manually taps play. Activation-time option, not
+      // deactivation-time — iOS associates it with the session lifecycle.
+      try session.setActive(true, options: .notifyOthersOnDeactivation)
       if mode == .coachingPhoneOnly {
         // Belt-and-suspenders: even with `.defaultToSpeaker`, an actively routed
         // HFP output could sneak through if the user paired glasses mid-session.
@@ -648,7 +654,10 @@ class AudioSessionManager: ObservableObject {
           options: []
         )
       }
-      try session.setActive(true)
+      // See `configureAudioSession` for the rationale — Meta's mic+speakers
+      // sample bakes `.notifyOthersOnDeactivation` into activation so Music
+      // resumes cleanly when we tear down.
+      try session.setActive(true, options: .notifyOthersOnDeactivation)
       if mode == .coachingPhoneOnly {
         try session.overrideOutputAudioPort(.speaker)
       }

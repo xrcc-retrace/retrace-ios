@@ -57,6 +57,17 @@ struct CameraAccessApp: App {
       UserDefaults.standard.set(true, forKey: cacheNukeKey)
     }
 
+    // DeviceSessionManager is now the production code path for every DAT
+    // consumer. The inline-fallback path (when this flag is off) was a
+    // Phase-3 migration safety net and missed downstream fixes — most
+    // recently the `.requiresDisplay → .any` selector change that lets
+    // non-display glasses (Oakley Meta Vanguard, regular Ray-Ban Meta)
+    // drive Coaching + Troubleshoot. Register `true` as the default so
+    // fresh installs and untouched UserDefaults get the manager path;
+    // users who explicitly toggled it OFF in Server Settings → Debug
+    // keep their choice.
+    UserDefaults.standard.register(defaults: ["deviceSessionManagerEnabled": true])
+
     let arguments = ProcessInfo.processInfo.arguments
     if arguments.contains("--ui-testing-reset-onboarding") {
       UserDefaults.standard.removeObject(forKey: OnboardingContainerView.completionKey)

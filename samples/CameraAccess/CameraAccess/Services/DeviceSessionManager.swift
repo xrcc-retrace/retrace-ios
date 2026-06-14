@@ -14,8 +14,9 @@
 //   - Two AutoDeviceSelectors exposed (filterless + supportsDisplay) so the
 //     Settings "Connected" pill and the lens path don't need their own
 //   - Single shared DeviceSession across capabilities (Stream + Display)
-//     per GitHub issue #180 — calling addDisplay on the same session that
-//     already has addStream is the only working coexistence pattern.
+//     per the SDK's capability-composition model — both addStream and
+//     addDisplay attach to the same DeviceSession; a second createSession
+//     against the same physical device throws sessionAlreadyExists.
 //   - withThrowingTaskGroup races stateStream() vs errorStream() so a
 //     `datAppOnTheGlassesUpdateRequired` fires immediately instead of
 //     timing out after 5 s (the bug in our old awaitDeviceSessionStarted).
@@ -55,16 +56,13 @@ final class DeviceSessionManager: ObservableObject {
   /// `cameraPermissionStatus()` or `ensureCameraPermissionGranted()` runs.
   /// Published so onboarding / Profile UI can react without polling.
   /// `nil` until the first query.
+  ///
+  /// Note: there is no DAT-side microphone permission in 0.7.0 — the
+  /// `MWDATCore.Permission` enum has only `.camera`. iOS-native
+  /// `AVAudioApplication.requestRecordPermission()` is the canonical
+  /// path for mic access; it's prompted at session start by
+  /// `AudioSessionManager.requestMicrophonePermission()`.
   @Published private(set) var cameraPermission: PermissionStatus?
-
-  /// Last observed DAT `Permission.microphone` status. Parallels
-  /// `cameraPermission`. The DAT 0.7 build-integration docs say the
-  /// mic uses iOS HFP (already prompted by `AVAudioSession`), but the
-  /// `Permission.microphone` enum case exists in the SDK and we've
-  /// observed BT HFP buffer timeouts on Display glasses where the
-  /// underlying cause appears to be a missing DAT-side mic grant.
-  /// So we treat it as a real prerequisite alongside camera.
-  @Published private(set) var microphonePermission: PermissionStatus?
 
   // MARK: - Public types
 
@@ -89,13 +87,6 @@ final class DeviceSessionManager: ObservableObject {
     /// (per the SDK contract — a device does not appear in `devicesStream`
     /// until the user has granted at least one DAT permission via Meta AI).
     case cameraPermissionDenied
-    /// DAT `Permission.microphone` was not `.granted`. Surfaces from
-    /// `ensureAllGlassesPermissionsGranted()` and any consumer that
-    /// explicitly checks the combined gate. Mic alone doesn't gate
-    /// `createSession` the same way camera does, but it appears to
-    /// gate actual PCM flow over BT HFP on Display glasses, so we
-    /// treat it as a hard prerequisite for any session needing audio.
-    case microphonePermissionDenied
     /// `checkPermissionStatus` / `requestPermission` itself threw — distinct
     /// from a user denial. Usually means the SDK couldn't reach Meta AI.
     case permissionCheckFailed(String)
@@ -114,8 +105,6 @@ final class DeviceSessionManager: ObservableObject {
         return "cancelled"
       case .cameraPermissionDenied:
         return "cameraPermissionDenied"
-      case .microphonePermissionDenied:
-        return "microphonePermissionDenied"
       case .permissionCheckFailed(let inner):
         return "permissionCheckFailed(\(inner))"
       }
@@ -227,6 +216,7 @@ final class DeviceSessionManager: ObservableObject {
       let after = try await wearables.requestPermission(.camera)
       cameraPermission = after
       log("ensureCameraPermissionGranted: post-prompt status = \(after)")
+      log("[Retrace.Diag][ensureCameraPermissionGranted] post-prompt wearables.devices.count=\(wearables.devices.count) hasAnyActive=\(hasAnyActiveDevice) hasDisplay=\(hasDisplayCapableDevice)")
       return after
     } catch {
       log("ensureCameraPermissionGranted: requestPermission threw: \(error)")
@@ -234,62 +224,25 @@ final class DeviceSessionManager: ObservableObject {
     }
   }
 
-  /// Microphone analogue of `cameraPermissionStatus()`. Non-prompting.
-  @discardableResult
-  func microphonePermissionStatus() async throws -> PermissionStatus {
-    do {
-      let status = try await wearables.checkPermissionStatus(.microphone)
-      microphonePermission = status
-      return status
-    } catch {
-      log("microphonePermissionStatus threw: \(error)")
-      throw AcquireError.permissionCheckFailed(error.localizedDescription)
-    }
-  }
-
-  /// Microphone analogue of `ensureCameraPermissionGranted()`. Same
-  /// check-then-prompt-via-Meta-AI flow.
-  @discardableResult
-  func ensureMicrophonePermissionGranted() async throws -> PermissionStatus {
-    let current = try await microphonePermissionStatus()
-    if current == .granted { return .granted }
-    log("ensureMicrophonePermissionGranted: not granted (\(current)) — prompting via Meta AI")
-    do {
-      let after = try await wearables.requestPermission(.microphone)
-      microphonePermission = after
-      log("ensureMicrophonePermissionGranted: post-prompt status = \(after)")
-      return after
-    } catch {
-      log("ensureMicrophonePermissionGranted: requestPermission threw: \(error)")
-      throw AcquireError.permissionCheckFailed(error.localizedDescription)
-    }
-  }
-
-  /// `true` iff BOTH DAT camera and DAT microphone permissions are
-  /// `.granted` per a fresh non-prompting status query. Used by the
-  /// session-start gate and the CTA component as a single check.
+  /// `true` iff DAT camera permission is `.granted`. Aliases
+  /// `cameraPermissionStatus() == .granted` for compatibility with
+  /// older call sites that expected a combined camera+microphone gate
+  /// (the DAT mic permission turned out not to exist in the 0.7.0
+  /// `Permission` enum — iOS-native record permission is the only
+  /// mic gate, and `AudioSessionManager.requestMicrophonePermission()`
+  /// handles that at session start).
   func allGlassesPermissionsGranted() async throws -> Bool {
-    async let camera = cameraPermissionStatus()
-    async let mic = microphonePermissionStatus()
-    let (c, m) = try await (camera, mic)
-    return c == .granted && m == .granted
+    return try await cameraPermissionStatus() == .granted
   }
 
-  /// Combined check-then-prompt for both DAT permissions. Sequential —
-  /// camera first (it's the historical pattern users associate with
-  /// glasses access), then mic. If either ends up denied, returns
-  /// `false`. If the user grants both, returns `true`.
-  ///
-  /// Two consecutive Meta AI deep-link bounces on first call; cached
-  /// fast-path on subsequent calls. We accept the two-bounce cost as
-  /// a one-time setup tax — the alternative (lazy mic prompt during
-  /// first coaching session) is worse UX.
+  /// Combined check-then-prompt for the DAT permissions needed by a
+  /// glasses session. As of 0.7.0 that's just camera (no DAT-side mic
+  /// permission). The iOS-native record permission is prompted at
+  /// session start by `AudioSessionManager` and isn't part of this
+  /// pre-flight gate.
   @discardableResult
   func ensureAllGlassesPermissionsGranted() async throws -> Bool {
-    let camera = try await ensureCameraPermissionGranted()
-    guard camera == .granted else { return false }
-    let mic = try await ensureMicrophonePermissionGranted()
-    return mic == .granted
+    return try await ensureCameraPermissionGranted() == .granted
   }
 
   // MARK: - Public API — sessions
@@ -327,19 +280,60 @@ final class DeviceSessionManager: ObservableObject {
       throw AcquireError.cameraPermissionDenied
     }
 
-    // Already-active session: reuse if requirements are satisfied.
+    // Already-active session: reuse if requirements are satisfied. Per Meta's
+    // session-lifecycle skill (`mwdat-ios:session-lifecycle`): "Don't restart
+    // during `paused` — wait for `started` or `stopped`." The same caution
+    // applies to `.starting` (transient — racing in with a fresh createSession
+    // would either be redundant or throw `sessionAlreadyExists`) and
+    // `.stopping` (must reach `.stopped` before we can create a replacement).
     if let session = deviceSession {
-      if session.state == .started {
+      switch session.state {
+      case .started:
         guard requirementsSatisfied(by: session, requirements: requirements) else {
           throw AcquireError.requirementsConflictWithActiveSession(requirements)
         }
         leases[consumerLabel] = Date()
         log("acquire(\(consumerLabel), req=\(requirements)) → reuse existing session, leases=\(leases.count)")
         return session
-      }
-      // A stale .stopped session left over — drop it.
-      if session.state == .stopped {
+
+      case .paused, .starting:
+        log("acquire(\(consumerLabel)) → existing session in .\(session.state); waiting for terminal/started state")
+        let resumed = await awaitSessionResumedOrTerminated(session: session, timeout: 10.0)
+        if resumed,
+          let current = deviceSession,
+          current === session,
+          current.state == .started {
+          guard requirementsSatisfied(by: current, requirements: requirements) else {
+            throw AcquireError.requirementsConflictWithActiveSession(requirements)
+          }
+          leases[consumerLabel] = Date()
+          log("acquire(\(consumerLabel)) → resumed to .started, leases=\(leases.count)")
+          return current
+        }
+        // Stopped (or timed out) while we waited — clear and fall through to
+        // a fresh createSession.
+        if deviceSession === session {
+          log("acquire(\(consumerLabel)) → previous session terminated while waiting; will create fresh")
+          deviceSession = nil
+          stopSessionObservers()
+        }
+
+      case .stopping:
+        log("acquire(\(consumerLabel)) → existing session in .stopping; waiting for .stopped before recreating")
+        await waitForSessionStopped(session)
+        if deviceSession === session {
+          deviceSession = nil
+          stopSessionObservers()
+        }
+
+      case .stopped:
         deviceSession = nil
+        stopSessionObservers()
+
+      @unknown default:
+        log("acquire(\(consumerLabel)) → existing session in unknown state \(session.state); dropping")
+        deviceSession = nil
+        stopSessionObservers()
       }
     }
 
@@ -356,6 +350,15 @@ final class DeviceSessionManager: ObservableObject {
 
     let selector = (requirements == .requiresDisplay) ? displayDeviceSelector : anyDeviceSelector
     do {
+      let paired = wearables.devices
+      let pairedDescriptions = paired.map { id -> String in
+        if let d = wearables.deviceForIdentifier(id) {
+          return "{name=\(d.nameOrId()) type=\(d.deviceType().rawValue) supportsDisplay=\(d.supportsDisplay()) compatibility=\(d.compatibility())}"
+        } else {
+          return "{id=\(id) unresolved}"
+        }
+      }.joined(separator: ", ")
+      log("[Retrace.Diag][acquire] pre-createSession: req=\(requirements) wearables.devices.count=\(paired.count) [\(pairedDescriptions)]")
       log("acquire(\(consumerLabel), req=\(requirements)) → createSession + start")
       let session = try wearables.createSession(deviceSelector: selector)
       deviceSession = session
@@ -467,7 +470,10 @@ final class DeviceSessionManager: ObservableObject {
       case .requiresDisplay: return hasDisplayCapableDevice
       }
     }
+    let started = Date()
+    log("[Retrace.Diag][awaitMatchingDevice] enter req=\(requirements) hasAnyActive=\(hasAnyActiveDevice) hasDisplay=\(hasDisplayCapableDevice) devicesCount=\(wearables.devices.count) cameraPermission=\(cameraPermission.map { String(describing: $0) } ?? "nil")")
     if available() {
+      log("[Retrace.Diag][awaitMatchingDevice] already-available exit req=\(requirements)")
       return
     }
     log("awaitMatchingDevice(req=\(requirements)) → waiting up to \(timeout)s")
@@ -475,11 +481,13 @@ final class DeviceSessionManager: ObservableObject {
     while Date() < deadline {
       try? await Task.sleep(nanoseconds: 150_000_000)
       if available() {
-        log("awaitMatchingDevice(req=\(requirements)) → matched")
+        let elapsed = Int(Date().timeIntervalSince(started) * 1000)
+        log("[Retrace.Diag][awaitMatchingDevice] matched after \(elapsed)ms req=\(requirements)")
         return
       }
     }
-    log("awaitMatchingDevice(req=\(requirements)) → timeout, proceeding (createSession will likely throw noEligibleDevice)")
+    let elapsed = Int(Date().timeIntervalSince(started) * 1000)
+    log("[Retrace.Diag][awaitMatchingDevice] TIMEOUT after \(elapsed)ms req=\(requirements) devicesCount=\(wearables.devices.count) hasAnyActive=\(hasAnyActiveDevice) hasDisplay=\(hasDisplayCapableDevice) — createSession will throw noEligibleDevice")
   }
 
   // MARK: - Private — start race
@@ -529,6 +537,35 @@ final class DeviceSessionManager: ObservableObject {
     }
   }
 
+  /// Wait for a `.paused` or `.starting` session to either resume to
+  /// `.started` or transition to the terminal `.stopped`. Returns `true`
+  /// if it resumed to `.started`, `false` if it stopped or the timeout
+  /// elapsed. Pure observation — never throws; the caller decides whether
+  /// timeout means "fall through to fresh createSession" or "surface error".
+  ///
+  /// Modeled after `waitForSessionStopped`'s best-effort stance. Used by
+  /// `acquire()` to honor Meta's "don't restart during `.paused`" guidance
+  /// from the `mwdat-ios:session-lifecycle` skill.
+  private func awaitSessionResumedOrTerminated(
+    session: DeviceSession,
+    timeout: TimeInterval
+  ) async -> Bool {
+    if session.state == .started { return true }
+    if session.state == .stopped { return false }
+
+    let stream = session.stateStream()
+    let deadline = Date().addingTimeInterval(timeout)
+    for await state in stream {
+      if state == .started { return true }
+      if state == .stopped { return false }
+      if Date() > deadline {
+        log("awaitSessionResumedOrTerminated: timeout, session state=\(state)")
+        return false
+      }
+    }
+    return false
+  }
+
   // MARK: - Private — session-state observers
 
   private func startSessionObservers(for session: DeviceSession) {
@@ -570,16 +607,30 @@ final class DeviceSessionManager: ObservableObject {
       // Inside the body we keep checking the original weak `self` so
       // cancellation drops the loop cleanly without retaining the manager.
       guard let strong = self else { return }
-      for await device in strong.anyDeviceSelector.activeDeviceStream() {
+      for await deviceId in strong.anyDeviceSelector.activeDeviceStream() {
         guard let strong = self else { return }
-        strong.hasAnyActiveDevice = device != nil
+        strong.hasAnyActiveDevice = deviceId != nil
+        if let deviceId = deviceId, let device = strong.wearables.deviceForIdentifier(deviceId) {
+          strong.log("[Retrace.Diag][monitorActive] emit: device=\(device.nameOrId()) type=\(device.deviceType().rawValue) supportsDisplay=\(device.supportsDisplay()) compatibility=\(device.compatibility())")
+        } else if let deviceId = deviceId {
+          strong.log("[Retrace.Diag][monitorActive] emit: deviceId=\(deviceId) (unresolved — wearables.deviceForIdentifier returned nil)")
+        } else {
+          strong.log("[Retrace.Diag][monitorActive] emit: device=nil (no eligible device visible to DAT)")
+        }
       }
     }
     displayDeviceMonitorTask = Task { [weak self] in
       guard let strong = self else { return }
-      for await device in strong.displayDeviceSelector.activeDeviceStream() {
+      for await deviceId in strong.displayDeviceSelector.activeDeviceStream() {
         guard let strong = self else { return }
-        strong.hasDisplayCapableDevice = device != nil
+        strong.hasDisplayCapableDevice = deviceId != nil
+        if let deviceId = deviceId, let device = strong.wearables.deviceForIdentifier(deviceId) {
+          strong.log("[Retrace.Diag][monitorDisplay] emit: device=\(device.nameOrId()) type=\(device.deviceType().rawValue) supportsDisplay=\(device.supportsDisplay()) compatibility=\(device.compatibility())")
+        } else if let deviceId = deviceId {
+          strong.log("[Retrace.Diag][monitorDisplay] emit: deviceId=\(deviceId) (unresolved — wearables.deviceForIdentifier returned nil)")
+        } else {
+          strong.log("[Retrace.Diag][monitorDisplay] emit: device=nil (no display-capable device visible)")
+        }
       }
     }
   }

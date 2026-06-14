@@ -108,6 +108,23 @@ final class HandGestureService: ObservableObject {
     UserDefaults.standard.bool(forKey: "disableHandTracking")
   }
 
+  /// Transport-aware start gate. Hand tracking exists to drive the
+  /// SwiftUI-emulated lens HUD on iPhone — on the real Meta Ray-Ban
+  /// Display path the Neural Band drives input directly (DAT auto-routes
+  /// to `FlexBox.onTap` / `Button.onClick`), so MediaPipe is pure
+  /// overhead AND a documented contributor to camera-stream-attach
+  /// failures (see Step 6b root cause: OpenGL/MediaPipe init runs
+  /// alongside the BT Stream attach, compounding profile churn).
+  ///
+  /// Single source of truth used by every camera-startup site. Returns
+  /// true only when iPhone transport is active AND the user hasn't
+  /// disabled it AND the bundled MediaPipe model is available.
+  static func shouldStart(for transport: CaptureTransport) -> Bool {
+    return transport == .iPhone
+      && !isDisabled
+      && HandTrackingConfig.isAvailable
+  }
+
   /// True when the latest landmark frame's orientation passes the same
   /// gates the recognizer FSM uses to arm — palm pointing roughly upward
   /// at sufficient size. Drives the on-lens hand-tracking status

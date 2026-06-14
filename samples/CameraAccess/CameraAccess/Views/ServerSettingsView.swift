@@ -55,10 +55,14 @@ struct DebugSettingsSection: View {
   /// GeminiLiveSessionBase, StreamSessionViewModel, WearablesViewModel)
   /// route their DAT DeviceSession lifecycle through the shared
   /// `DeviceSessionManager` instead of each creating their own session.
-  /// Phase 1 lands the manager but no consumer uses it yet — flipping
-  /// this toggle is a no-op until per-consumer migrations land in
-  /// subsequent phases. Default OFF until Phase 8 cleanup.
-  @AppStorage("deviceSessionManagerEnabled") private var deviceSessionManagerEnabled: Bool = false
+  /// Default ON as of 2026-06-14 — the inline-fallback path missed the
+  /// non-display-glasses `.any` selector fix, so toggling it OFF would
+  /// break Coaching on Oakley Meta Vanguard / regular Ray-Ban Meta.
+  /// `CameraAccessApp.init` also calls `UserDefaults.register(defaults:)`
+  /// with `true` so existing installs that never touched this toggle pick
+  /// up the new default; only users who explicitly toggled OFF keep that
+  /// preference.
+  @AppStorage("deviceSessionManagerEnabled") private var deviceSessionManagerEnabled: Bool = true
 
   @EnvironmentObject private var lensSession: LensSession
   @State private var smokeTestResult: String?

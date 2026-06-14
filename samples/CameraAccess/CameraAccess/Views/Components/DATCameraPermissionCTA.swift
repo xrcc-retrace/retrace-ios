@@ -239,33 +239,45 @@ struct DATCameraPermissionCTA: View {
   private var cardSubtitle: String {
     switch phase {
     case .granted: return "Glasses ready for coaching."
-    case .denied: return "Without camera + mic access, glasses sessions can't start."
-    case .requesting: return "Grant camera + mic in Meta AI."
+    case .denied: return "Without camera access, glasses sessions can't start."
+    case .requesting: return "Grant camera access in Meta AI."
     case .checking, .idle: return "Just a moment…"
-    case .needsRequest: return "Camera and microphone access needed."
+    case .needsRequest: return "Camera access needed."
     }
   }
 
   // MARK: - Permission flow
 
-  /// **What "granted" means here.** Both DAT camera AND DAT microphone
-  /// permissions are granted. The component name kept its
-  /// camera-focused legacy form, but it now gates the full glasses
-  /// access surface — the BT HFP audio path on Display glasses appears
-  /// to require the DAT mic grant in addition to the camera grant,
-  /// even though the SDK docs only call out camera. Treating both as
-  /// prerequisites is cheap (idempotent fast-path when granted) and
-  /// removes the silent-failure mode we observed on mic buffer flow.
+  /// **What "granted" means here.** DAT camera permission is granted.
+  /// As of MWDATCore 0.7.0 there is no DAT-side microphone permission —
+  /// the `Permission` enum has only `.camera`. iOS-native record
+  /// permission gates the mic and is prompted at session start by
+  /// `AudioSessionManager.requestMicrophonePermission()`.
   private func checkAfterRegistration() async {
     phase = .checking
     let granted: Bool? = await Self.runWithTimeout(
       seconds: Self.statusCheckTimeout
     ) { [sessionManager] in
-      try? await sessionManager.allGlassesPermissionsGranted()
+      // Inline do/catch so we surface the underlying error before the
+      // runWithTimeout race resolves — the original `try?` swallowed it
+      // and the outer "timed out" message was misleading (it fired
+      // immediately on a thrown error rather than after the actual
+      // 5s budget). Logging the real error tells us whether the SDK
+      // is returning .denied (action: prompt) vs throwing a
+      // PermissionError (action: investigate Dev Mode / DAT helper).
+      do {
+        let value = try await sessionManager.allGlassesPermissionsGranted()
+        print("[Retrace.Diag][CTA] allGlassesPermissionsGranted returned: \(value)")
+        return value
+      } catch {
+        print("[Retrace.Diag][CTA] allGlassesPermissionsGranted threw — type=\(String(describing: type(of: error))) value=\(error)")
+        return nil
+      }
     }
     if granted == nil {
-      // Timeout — give the user a CTA path instead of leaving them on
-      // the spinner indefinitely.
+      // Either a real 5s timeout OR the inner closure logged a throw
+      // immediately and we got here via that path. The Retrace.Diag
+      // log above is the source of truth.
       print("[DATCameraPermissionCTA] allGlassesPermissionsGranted timed out after \(Self.statusCheckTimeout)s — surfacing CTA")
     }
     if granted == true {
@@ -278,9 +290,10 @@ struct DATCameraPermissionCTA: View {
 
   private func requestPermission() async {
     phase = .requesting
-    // Bumped budget to cover TWO sequential Meta AI bounces (camera +
-    // mic). First-time users go: tap → Meta AI (grant camera) →
-    // return → app re-bounces → Meta AI (grant mic) → return.
+    // Budget covers the single Meta AI bounce for camera permission.
+    // (Earlier revision sized this for two sequential bounces — camera
+    // and DAT-side mic — but MWDATCore 0.7.0's `Permission` enum has
+    // only `.camera`; mic gating is iOS-native, handled separately.)
     let granted: Bool? = await Self.runWithTimeout(
       seconds: Self.requestPromptTimeout
     ) { [sessionManager] in

@@ -56,9 +56,10 @@ final class LensDisplayCoordinator: ObservableObject {
   /// Phase 2: optional shared `DeviceSessionManager`. When the
   /// `deviceSessionManagerEnabled` toggle is ON, all session lifecycle
   /// routes through this manager so camera + display can coexist on
-  /// one DeviceSession (issue #180). When OFF (default during migration)
-  /// the coordinator falls back to its own `wearables.createSession`
-  /// path — preserved so we have a sub-second on-device rollback.
+  /// one `DeviceSession` per the SDK's capability-composition model.
+  /// When OFF (default during migration) the coordinator falls back to
+  /// its own `wearables.createSession` path — preserved so we have a
+  /// sub-second on-device rollback.
   private let sessionManager: DeviceSessionManager?
   private var deviceSelector: AutoDeviceSelector
   private var deviceSession: DeviceSession?
@@ -217,6 +218,26 @@ final class LensDisplayCoordinator: ObservableObject {
       requiresDATAppUpdate = true
       didFailToStartSession = true
       errorMessage = DeviceSessionError.datAppOnTheGlassesUpdateRequired.localizedDescription
+    } catch DeviceSessionManager.AcquireError.requirementsConflictWithActiveSession(_) {
+      // The active DeviceSession is on a device that doesn't support
+      // display (Vanguard, regular RBM, etc.). Coaching / Troubleshoot
+      // already acquired with `.any`, so the lens path can't piggy-back
+      // on the same session. This is an EXPECTED outcome on non-display
+      // glasses — the phone-side SwiftUI emulator is the UI. Not an
+      // error to surface in the UI; just log the diagnosis and leave
+      // `display = nil` so `LensSession.send(_:)` no-ops cleanly.
+      print("[LensDisplayCoordinator] lens output unavailable — active glasses do not support display capability (non-display DAT model); phone UI takes over")
+      requiresDATAppUpdate = false
+      didFailToStartSession = false
+    } catch DeviceSessionManager.AcquireError.noEligibleDevice {
+      // No display-capable device is currently reachable. Same outcome
+      // as the requirements-conflict case: the phone UI takes over, lens
+      // stays inert. Distinct log so the user can tell "no Display
+      // glasses paired" from "another consumer pinned a non-display
+      // device first."
+      print("[LensDisplayCoordinator] lens output unavailable — no display-capable glasses reachable (no Ray-Ban Meta Display paired or active)")
+      requiresDATAppUpdate = false
+      didFailToStartSession = false
     } catch {
       print("[LensDisplayCoordinator] manager.acquire threw → \(error)")
       requiresDATAppUpdate = false

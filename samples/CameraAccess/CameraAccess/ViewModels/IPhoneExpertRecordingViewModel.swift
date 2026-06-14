@@ -120,17 +120,16 @@ final class IPhoneExpertRecordingViewModel: ObservableObject {
   /// (model file not bundled, previews, etc.) so the rest of the pipeline
   /// runs unchanged on devices without the `.task` asset.
   private func startHandTrackingIfAvailable() {
-    guard HandTrackingConfig.isAvailable else {
-      print("[Expert] Hand tracking unavailable — model not bundled")
-      return
-    }
-
-    // User kill switch (Server Settings → Debug → "Disable hand
-    // tracking"). When on, don't spin up MediaPipe at all — saves CPU
-    // and battery. The service-level `ingest(_:)` early-out is the
-    // belt-and-suspenders for mid-session toggle flips.
-    if HandGestureService.isDisabled {
-      print("[Expert] Hand tracking suppressed by user setting")
+    // Routed through the shared `HandGestureService.shouldStart(for:)`
+    // helper so every start site (Coaching iPhone path, Troubleshoot
+    // iPhone path, Expert iPhone path) shares one truth table — and
+    // glasses-transport call sites never start MediaPipe.
+    guard HandGestureService.shouldStart(for: .iPhone) else {
+      if !HandTrackingConfig.isAvailable {
+        print("[Expert] Hand tracking unavailable — model not bundled")
+      } else if HandGestureService.isDisabled {
+        print("[Expert] Hand tracking suppressed by user setting")
+      }
       return
     }
 

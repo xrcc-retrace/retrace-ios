@@ -79,6 +79,7 @@ private struct IPhoneRecordingEngine: View {
 
   @Environment(\.dismiss) private var dismiss
   @EnvironmentObject private var appOrientationController: AppOrientationController
+  @EnvironmentObject private var lensSession: LensSession
   @StateObject private var viewModel: IPhoneExpertRecordingViewModel
 
   @AppStorage("debugMode") private var debugMode: Bool = false
@@ -152,8 +153,27 @@ private struct IPhoneRecordingEngine: View {
       // Seed the preview from the scene's actual interface orientation so
       // the layout matches the current phone orientation.
       viewModel.camera.setPreviewInterfaceOrientation(resolved)
+      // Step 9: wire the expert lens renderer. Stop confirms here fire
+      // the same flow the phone Stop button uses — finalize the .mp4,
+      // bubble up via `onRecordingComplete`. Output is gated by
+      // `lensOutputEnabled` inside `LensSession.send`.
+      let context = ExpertLensContext(
+        recordingManager: viewModel.recordingManager,
+        hudViewModel: viewModel.hudViewModel,
+        transport: .iPhone,
+        onStopConfirmed: {
+          Task {
+            if let result = await viewModel.stopRecording() {
+              onRecordingComplete(result.0, result.1)
+            }
+          }
+        },
+        onExitRequested: { dismiss() }
+      )
+      lensSession.activate(.expert, vm: context)
     }
     .onDisappear {
+      lensSession.deactivate()
       Task { await viewModel.teardown() }
       UIDevice.current.endGeneratingDeviceOrientationNotifications()
       appOrientationController.unlock()
@@ -181,6 +201,7 @@ private struct GlassesRecordingEngine: View {
   let onRecordingComplete: (URL, TimeInterval) -> Void
 
   @Environment(\.dismiss) private var dismiss
+  @EnvironmentObject private var lensSession: LensSession
   @StateObject private var viewModel: StreamSessionViewModel
 
   @AppStorage("debugMode") private var debugMode: Bool = false
@@ -243,7 +264,27 @@ private struct GlassesRecordingEngine: View {
     .task {
       await viewModel.prepare()
     }
+    .onAppear {
+      // Step 9: wire the expert lens renderer for the glasses path.
+      // Hand-tracking status reads "Neural Band" on this transport
+      // (glasses use the band for input, not MediaPipe — per Step 6b.2).
+      let context = ExpertLensContext(
+        recordingManager: viewModel.recordingManager,
+        hudViewModel: viewModel.hudViewModel,
+        transport: .glasses,
+        onStopConfirmed: {
+          Task {
+            if let result = await viewModel.stopRecording() {
+              onRecordingComplete(result.0, result.1)
+            }
+          }
+        },
+        onExitRequested: { dismiss() }
+      )
+      lensSession.activate(.expert, vm: context)
+    }
     .onDisappear {
+      lensSession.deactivate()
       Task { await viewModel.teardown() }
     }
     .alert("Error", isPresented: $viewModel.showError) {

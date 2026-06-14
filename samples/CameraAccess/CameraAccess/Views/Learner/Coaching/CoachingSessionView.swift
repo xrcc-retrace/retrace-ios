@@ -233,6 +233,25 @@ struct CoachingSessionView: View {
         }
       )
     }
+    // DAT helper update recovery — fires when the SDK throws
+    // `datAppOnTheGlassesUpdateRequired` from `manager.acquire` (or the
+    // inline `createSession` fallback). The user must update the DAT
+    // helper app via Meta AI before any DeviceSession can start.
+    // Mirrors `LensDisplayCoordinator.requiresDATAppUpdate` — same SDK
+    // signal, parallel UI surface for the camera-streaming consumer.
+    .sheet(isPresented: $viewModel.pendingDATHelperUpdate) {
+      DATHelperUpdateRequiredSheet(
+        onOpenMetaAI: {
+          wearablesVM.openDATGlassesAppUpdate()
+        },
+        onRetry: {
+          Task { await viewModel.retryAfterDATHelperUpdate() }
+        },
+        onCancel: {
+          viewModel.pendingDATHelperUpdate = false
+        }
+      )
+    }
   }
 
   private func resolveInterfaceOrientation() -> UIInterfaceOrientation {

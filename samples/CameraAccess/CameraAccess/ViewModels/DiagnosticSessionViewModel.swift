@@ -24,6 +24,14 @@ class DiagnosticSessionViewModel: GeminiLiveSessionBase {
   @Published var handoffInFlight = false
   @Published var handoffError: String?
 
+  /// Set by `TroubleshootSessionView` in `.onAppear` so the lens-side
+  /// Start button (Step 8 — `TroubleshootLensRenderer.onStartProcedure`)
+  /// can invoke the same `startHandoff(procedureId:)` flow the SwiftUI
+  /// Resolved page uses. The view owns the post-handoff `onExit(payload)`
+  /// navigation, so the renderer can't reach it directly — this hook is
+  /// the bridge. Cleared on `.onDisappear`.
+  var onLensStartHandoff: ((String) -> Void)?
+
   /// True after `identify_product` returns and before the user has
   /// confirmed (or rejected) it. Drives the lens confirmation overlay.
   /// Cleared when `confirm_identification` returns or when the user
