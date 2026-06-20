@@ -918,13 +918,22 @@ class AudioSessionManager: ObservableObject {
     scheduledBufferCount = 0
     isAISpeaking = false
     aiOutputPeak = 0
-    // Only re-prime the player if the engine is still running. Barge-in can
-    // fire after stopCapture() has torn the engine down; calling
-    // playerNode.play() on a stopped engine is a no-op that logs an
-    // AVAudioEngine error (AVAudioPlayerNodeImpl.mm line-noise) without
-    // any meaningful signal for the caller.
+    // Re-prime the player. Normally the engine is still running and we just
+    // restart the node. But in the AEC-off Mac-route demo an early flush could
+    // leave the node stopped with no path back — so if the engine has dropped
+    // *while we're still capturing*, restart it before play() so a flush can
+    // never permanently strand playback. We still skip the restart entirely
+    // once capture has been torn down (barge-in can fire after stopCapture()),
+    // where playerNode.play() on a dead engine is just AVAudioEngine line-noise.
     if engine.isRunning {
       playerNode.play()
+    } else if isCapturing {
+      do {
+        try engine.start()
+        playerNode.play()
+      } catch {
+        print("[AudioSession] ⚠ clearPlaybackBuffer engine restart failed: \(error)")
+      }
     }
   }
 

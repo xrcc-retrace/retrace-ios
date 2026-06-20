@@ -369,6 +369,16 @@ class DiagnosticSessionViewModel: GeminiLiveSessionBase {
   /// the demo flag, so it only surfaces in the Mac-route demo.
   override var supportsPushToTalk: Bool { true }
 
+  /// Troubleshoot fires tool calls (identify_product → confirm_identification →
+  /// search_procedures → web_search_for_fix) immediately and back-to-back while
+  /// the AI is still narrating. In the push-to-talk Mac-route demo the mic is
+  /// gated closed, so the open-mic self-echo that the tool-call flush defends
+  /// against can't happen — flushing on every tool call would only chop the AI's
+  /// voice (and, with AEC off, can strand the player → total silence on the Mac).
+  /// So skip the flush exactly when push-to-talk is active. Outside the demo
+  /// (`isPushToTalkActive == false`) we keep the default flush, matching coaching.
+  override var flushPlaybackOnToolCall: Bool { !isPushToTalkActive }
+
   // MARK: - Library-miss hold
 
   /// Start the synthetic 3-second `.libraryMissed` moment. Called when

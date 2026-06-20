@@ -270,6 +270,18 @@ class GeminiLiveSessionBase: ObservableObject {
   /// mutations are safe.
   func handleToolCallExtras(name: String, args: [String: Any], result: [String: Any]) async {}
 
+  /// Whether a tool call should flush queued AI playback (`clearPlaybackBuffer`)
+  /// so a half-spoken reply doesn't continue over the next turn. Default `true`
+  /// — Coaching keeps this behavior unchanged in every state, including the
+  /// Mac-route demo. Troubleshoot overrides it to skip the flush in the
+  /// push-to-talk demo: it fires tool calls (identify/confirm/search) back-to-back
+  /// while the AI is still narrating, and with the mic gated closed by push-to-talk
+  /// there's no open-mic self-echo for the flush to defend against — so flushing on
+  /// every tool call only chops the AI's voice (and, in the AEC-off demo graph, can
+  /// leave the player stopped → total silence). Barge-in (line ~499) and the
+  /// Talk-button flush (line ~341) are unaffected.
+  var flushPlaybackOnToolCall: Bool { true }
+
   /// Audio-session mode for the current transport. Coaching picks
   /// `.coaching` with HFP glasses or `.coachingPhoneOnly` with iPhone.
   /// Default `.coachingPhoneOnly` works for iPhone-only modes.
@@ -840,7 +852,9 @@ class GeminiLiveSessionBase: ObservableObject {
 
     pendingToolCallIds.insert(id)
     pendingToolCallNames[id] = name
-    audioManager?.clearPlaybackBuffer(reason: "tool-call")
+    if flushPlaybackOnToolCall {
+      audioManager?.clearPlaybackBuffer(reason: "tool-call")
+    }
 
     let startedAt = Date()
     print("[GeminiLive] ▶ Tool call START name=\(name) id=\(id) args=\(args)")
