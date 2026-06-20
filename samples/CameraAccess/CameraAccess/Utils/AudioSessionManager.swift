@@ -195,9 +195,23 @@ class AudioSessionManager: ObservableObject {
   }
 
   func configureAudioSession() {
+    Self.applySessionConfiguration(mode: mode)
+    // `checkBluetoothRoute()` touches `@Published` state, so it lives here on the
+    // main actor rather than in the shared off-main helper.
+    checkBluetoothRoute()
+  }
+
+  /// Single source of truth for AVAudioSession setup: category/mode/options for
+  /// the given mode, activation, the demo-aware speaker override, and built-in-mic
+  /// pinning. Both `configureAudioSession()` (main actor) and
+  /// `configureSessionOffMain()` (detached, off-main capture path) delegate here so
+  /// the demo-route branching lives in exactly one place and the two paths can't
+  /// drift. Touches no `@Published` state; `AVAudioSession` APIs are documented
+  /// thread-safe.
+  nonisolated private static func applySessionConfiguration(mode: AudioSessionMode) {
     let session = AVAudioSession.sharedInstance()
     #if DEBUG
-    let demoRoute = AudioSessionManager.routeAudioToMacForDemo
+    let demoRoute = routeAudioToMacForDemo
     #else
     let demoRoute = false
     #endif
@@ -252,9 +266,8 @@ class AudioSessionManager: ObservableObject {
         try session.overrideOutputAudioPort(.speaker)
       }
       if mode == .coachingPhoneOnly || mode == .recordingPhoneOnly {
-        forceBuiltInMicPreferred(session)
+        pinBuiltInMic(session)
       }
-      checkBluetoothRoute()
     } catch {
       print("[AudioSession] Failed to configure audio session: \(error)")
     }
@@ -262,8 +275,8 @@ class AudioSessionManager: ObservableObject {
 
   /// Pin the AVAudioSession input to the built-in iPhone mic. Called only from
   /// the `*PhoneOnly` modes so HFP glasses (even if paired) don't steal the
-  /// input route.
-  private func forceBuiltInMicPreferred(_ session: AVAudioSession) {
+  /// input route. Off-main-safe (no `@Published` access).
+  nonisolated private static func pinBuiltInMic(_ session: AVAudioSession) {
     guard
       let builtIn = session.availableInputs?.first(where: { $0.portType == .builtInMic })
     else {
@@ -522,58 +535,10 @@ class AudioSessionManager: ObservableObject {
   /// it's safe to run off the main actor. `AVAudioSession` APIs are
   /// documented thread-safe.
   nonisolated private static func configureSessionOffMain(mode: AudioSessionMode) {
-    let session = AVAudioSession.sharedInstance()
-    #if DEBUG
-    let demoRoute = routeAudioToMacForDemo
-    #else
-    let demoRoute = false
-    #endif
-    do {
-      switch mode {
-      case .coaching:
-        try session.setCategory(
-          .playAndRecord,
-          mode: .voiceChat,
-          options: [.allowBluetoothHFP, .allowBluetoothA2DP, .defaultToSpeaker]
-        )
-      case .coachingPhoneOnly:
-        try session.setCategory(
-          .playAndRecord,
-          mode: demoRoute ? .default : .voiceChat,
-          options: demoRoute ? [] : [.defaultToSpeaker]
-        )
-      case .recording:
-        // A2DP is invalid with `.record` (output-only profile); see the
-        // sibling `configureAudioSession()` for the full reasoning. HFP
-        // alone is what DAT SDK glasses actually route their mic through.
-        try session.setCategory(
-          .record,
-          mode: .default,
-          options: [.allowBluetoothHFP]
-        )
-      case .recordingPhoneOnly:
-        try session.setCategory(
-          .record,
-          mode: .default,
-          options: []
-        )
-      }
-      try session.setActive(true)
-      if mode == .coachingPhoneOnly, !demoRoute {
-        try session.overrideOutputAudioPort(.speaker)
-      }
-      if mode == .coachingPhoneOnly || mode == .recordingPhoneOnly {
-        if let builtIn = session.availableInputs?.first(where: { $0.portType == .builtInMic }) {
-          do {
-            try session.setPreferredInput(builtIn)
-          } catch {
-            print("[AudioSession] Failed to pin built-in mic input: \(error)")
-          }
-        }
-      }
-    } catch {
-      print("[AudioSession] Failed to configure audio session: \(error)")
-    }
+    // Same setup as the main-actor `configureAudioSession()`, minus the
+    // `@Published`-touching `checkBluetoothRoute()`. Shared body keeps the two
+    // paths from drifting (notably the demo-route branching).
+    applySessionConfiguration(mode: mode)
   }
 
   func startCapture() {
