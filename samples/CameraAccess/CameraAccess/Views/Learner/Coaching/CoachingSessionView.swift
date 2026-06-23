@@ -44,7 +44,7 @@ struct CoachingSessionView: View {
     serverBaseURL: String,
     transport: CaptureTransport = .glasses,
     startingStep: Int? = nil,
-    sessionManager: DeviceSessionManager? = nil
+    sessionManager: DeviceSessionManager
   ) {
     self.procedure = procedure
     self.wearables = wearables
@@ -144,17 +144,45 @@ struct CoachingSessionView: View {
     // The previous `.alert("End Session?", …)` system dialog has been
     // retired so the exit flow stays inside the Ray-Ban aesthetic.
     .onAppear {
-      // Double index-finger pinch ("back" gesture) → exit confirmation,
-      // same destination as the dev finger-double-tap on lens background.
-      viewModel.onBackGesture = {
+      // Double index-finger pinch ("back" gesture). Precedence: while a
+      // reference clip is playing full-screen on the lens, "back" interrupts
+      // the clip and returns to the step (→ dismissReferenceClip, which
+      // resumes Gemini and repaints). Otherwise it opens the exit
+      // confirmation — same destination as the dev finger-double-tap on the
+      // lens background.
+      // Weak-capture viewModel so the closure stored on it can't retain it
+      // (mirrors onExitConfirmed below).
+      viewModel.onBackGesture = { [weak viewModel] in
+        guard let viewModel else { return }
+        if viewModel.isClipPlaying {
+          viewModel.onClipDismissRequested?()
+          return
+        }
         withAnimation(.spring(response: 0.32, dampingFraction: 0.85)) {
           showDismissConfirmation = true
         }
       }
+      // Native lens exit overlay confirms ON the glasses (not the phone), so
+      // its "Confirm exit" needs the same terminal action the phone overlay
+      // runs — endSession + dismiss — both of which live here in the view.
+      // Weak-capture viewModel so the closure stored on it can't retain it.
+      viewModel.onExitConfirmed = { [weak viewModel] in
+        guard let viewModel else { return }
+        viewModel.endSession(progressStore: progressStore)
+        dismiss()
+      }
       // Native lens path (Step 6) — mirrors this session's state onto the
       // glasses display. Silent no-op when the "Send to glasses lens"
       // toggle is off or no Display capability is available.
-      lensSession.activate(.coaching, vm: viewModel)
+      //
+      // DEFERRED until `isReadyForNativeLens`: the Display capability shares
+      // the glasses' BT radio with the HFP mic. Starting it during the HFP
+      // warmup makes iOS drop the glasses mic route (falls back to AirPods),
+      // so we wait until audio + camera are confirmed up. See the matching
+      // `.onChange` below and `GeminiLiveSessionBase.isReadyForNativeLens`.
+      if viewModel.isReadyForNativeLens {
+        lensSession.activate(.coaching, vm: viewModel)
+      }
       viewModel.startSession(progressStore: progressStore, startingStep: startingStep)
       if transport == .iPhone {
         // Broaden the allowed orientation mask so the user can naturally
@@ -172,6 +200,15 @@ struct CoachingSessionView: View {
         let resolved = resolveInterfaceOrientation()
         currentInterfaceOrientation = resolved
         viewModel.setPreviewInterfaceOrientation(resolved)
+      }
+    }
+    // Bring the native lens up the moment audio + camera are confirmed
+    // ready (see the deferred activate in `.onAppear`). This is the normal
+    // path — at appear time the session is still starting, so the flag is
+    // false; it flips true mid-startup and we activate here.
+    .onChange(of: viewModel.isReadyForNativeLens) { _, ready in
+      if ready {
+        lensSession.activate(.coaching, vm: viewModel)
       }
     }
     .onDisappear {
@@ -566,15 +603,25 @@ struct CoachingSessionView: View {
     }
   }
 
-  private var currentStepClipURL: URL? {
-    guard let step = viewModel.currentStep,
-          let clipUrl = step.clipUrl else { return nil }
-    return URL(string: "\(serverBaseURL)\(clipUrl)")
+  /// Resolve the current step's reference media (video clip vs. manual page
+  /// image vs. none) from its REAL clip_url + the procedure's source_type.
+  /// Without this, a manual procedure's page PNG would be handed to AVPlayer
+  /// as a "clip" and silently fail to play.
+  private var currentStepMedia: StepReferenceMedia {
+    guard let step = viewModel.currentStep else { return .none }
+    return step.referenceMedia(sourceType: procedure.sourceType, baseURL: serverBaseURL)
   }
 
-  /// Procedure-level expert reference image (not per-step). Resolved from
-  /// the procedure's `reference_image_url`; nil when none was attached.
-  private var procedureReferenceImageURL: URL? {
+  private var currentStepClipURL: URL? {
+    if case .video(let url) = currentStepMedia { return url }
+    return nil
+  }
+
+  /// Image shown in the reference panel. A per-step manual page image takes
+  /// precedence; otherwise fall back to the procedure-level expert reference
+  /// image (`reference_image_url`). nil when neither exists.
+  private var currentStepReferenceImageURL: URL? {
+    if case .image(let url) = currentStepMedia { return url }
     guard let path = procedure.referenceImageUrl else { return nil }
     return URL(string: "\(serverBaseURL)\(path)")
   }
@@ -598,7 +645,7 @@ struct CoachingSessionView: View {
         viewModel: viewModel,
         stepCount: procedure.steps.count,
         clipURL: currentStepClipURL,
-        referenceImageURL: procedureReferenceImageURL,
+        referenceImageURL: currentStepReferenceImageURL,
         // Pass through the exit-overlay flag so the step card's
         // auto-scrolling description suspends while the recede recipe
         // is up — the user's scroll position is preserved across the

@@ -37,6 +37,15 @@ class WearablesViewModel: ObservableObject {
   /// `AutoDeviceSelector.activeDeviceStream()` path is kept as a fallback
   /// for instances constructed without a manager.
   @Published var hasActiveDevice: Bool = false
+  /// True when the glasses are connected right now, for connection-status UI
+  /// (the Settings "Connected" pill). Defined as: the DAT transport link is up
+  /// (`hasConnectedDevice`) **or** the auto-selector has latched a
+  /// session-eligible device (`hasActiveDevice`). The OR matters because the
+  /// two SDK signals answer different questions and either one being true means
+  /// the glasses are genuinely reachable — using only the selector signal made
+  /// the pill read "Not connected" for paired, link-up, compatible glasses
+  /// whenever the selector hadn't latched yet.
+  @Published var isConnected: Bool = false
   @Published var showGettingStartedSheet: Bool = false
   @Published var showError: Bool = false
   @Published var errorMessage: String = ""
@@ -50,7 +59,6 @@ class WearablesViewModel: ObservableObject {
   private var registrationTask: Task<Void, Never>?
   private var deviceStreamTask: Task<Void, Never>?
   private var setupDeviceStreamTask: Task<Void, Never>?
-  private var activeDeviceTask: Task<Void, Never>?
   private let wearables: WearablesInterface
   private var compatibilityListenerTokens: [DeviceIdentifier: AnyListenerToken] = [:]
   /// Per-device compatibility cache, refreshed on each `monitorDeviceCompatibility`
@@ -60,8 +68,10 @@ class WearablesViewModel: ObservableObject {
   /// Combine binding to the manager's `hasAnyActiveDevice` when the manager
   /// is available. Stored so it lives as long as this VM.
   private var hasActiveDeviceCancellable: AnyCancellable?
+  /// Combine binding for `isConnected` — `hasConnectedDevice || hasAnyActiveDevice`.
+  private var isConnectedCancellable: AnyCancellable?
 
-  init(wearables: WearablesInterface, sessionManager: DeviceSessionManager? = nil) {
+  init(wearables: WearablesInterface, sessionManager: DeviceSessionManager) {
     self.wearables = wearables
     self.devices = wearables.devices
     self.hasMockDevice = false
@@ -82,33 +92,29 @@ class WearablesViewModel: ObservableObject {
       }
     }
 
-    // Phase 3: prefer the manager's published `hasAnyActiveDevice`. When the
-    // manager isn't injected (legacy callers / tests), fall back to a local
-    // filterless `AutoDeviceSelector.activeDeviceStream()` — preserved so
-    // behavior doesn't regress for any caller that hasn't been updated.
-    if let manager = sessionManager {
-      hasActiveDeviceCancellable = manager.$hasAnyActiveDevice
-        .receive(on: DispatchQueue.main)
-        .assign(to: \.hasActiveDevice, on: self)
-    } else {
-      let activeSelector = AutoDeviceSelector(wearables: wearables)
-      activeDeviceTask = Task { [weak self] in
-        for await device in activeSelector.activeDeviceStream() {
-          guard let self else { return }
-          await MainActor.run {
-            self.hasActiveDevice = device != nil
-          }
-        }
-      }
-    }
+    // Mirror the manager's published `hasAnyActiveDevice` — the single
+    // source of truth for whether any glasses are reachable.
+    hasActiveDeviceCancellable = sessionManager.$hasAnyActiveDevice
+      .receive(on: DispatchQueue.main)
+      .assign(to: \.hasActiveDevice, on: self)
+
+    // "Connected" pill is true when EITHER signal says the glasses are
+    // reachable: the transport link is up, or the auto-selector latched a
+    // session-eligible device. See `isConnected` doc for why the OR matters.
+    isConnectedCancellable = sessionManager.$hasConnectedDevice
+      .combineLatest(sessionManager.$hasAnyActiveDevice)
+      .map { $0 || $1 }
+      .removeDuplicates()
+      .receive(on: DispatchQueue.main)
+      .assign(to: \.isConnected, on: self)
   }
 
   deinit {
     registrationTask?.cancel()
     deviceStreamTask?.cancel()
     setupDeviceStreamTask?.cancel()
-    activeDeviceTask?.cancel()
     hasActiveDeviceCancellable?.cancel()
+    isConnectedCancellable?.cancel()
   }
 
   private func setupDeviceStream() async {

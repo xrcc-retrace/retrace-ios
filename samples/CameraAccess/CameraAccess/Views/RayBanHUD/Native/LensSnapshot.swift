@@ -54,8 +54,14 @@ struct CoachingLensSnapshot: Equatable {
   let stepTitle: String
   let stepDescription: String                 // full text; renderer paginates
   let expansion: LensCoachingExpansion
-  let hasClip: Bool
-  let clipPosterURL: String?                  // HTTPS, from LensImageURL
+  // Reference media (resolved from the step's real clip_url + source_type via
+  // `StepReferenceMedia`). The renderer no longer reconstructs a .mp4 URL —
+  // video plays the authoritative clip, manual shows the page image.
+  let hasReference: Bool                       // any reference media → show the pill
+  let referenceIsVideo: Bool                   // true → playable clip; false → static image
+  let referencePosterURL: String?             // video → .jpg poster; image → the image URL itself
+  let referenceVideoURL: String?              // absolute .mp4 URL, only when referenceIsVideo
+  let clipErrorMessage: String?               // transient: set when a clip fails to load
   let insights: [InsightItem]
   let descPage: Int                           // active page in paginated description
   let descPagesTotal: Int                     // computed by renderer from stepDescription
@@ -67,10 +73,16 @@ struct CoachingLensSnapshot: Equatable {
 
   /// Local mirror of `CoachingStepPage.ExpansionState`. The renderer
   /// owns the canonical mapping when projecting the snapshot.
+  ///
+  /// `referenceInline` / `insightsInline` are *in-page* expansions: the
+  /// step page stays mounted and the clip / insights panel appears
+  /// inline beneath a truncated step card (mirrors the on-phone emulator
+  /// in `CoachingStepPage`). They are NOT separate trees — both route
+  /// back through `collapsedStepTree`.
   enum LensCoachingExpansion: Equatable {
     case collapsed
-    case referenceExpanded
-    case insightsExpanded
+    case referenceInline
+    case insightsInline
     case stepExpanded
   }
 
@@ -148,9 +160,6 @@ struct ExpertLensSnapshot: Equatable {
   let totalTips: Int                          // typically 7
   let currentTipTitle: String
   let currentTipBody: String
-
-  // Hand tracking ambient indicator
-  let handTrackingStatusLabel: String         // "Hands on" / "Hands off" / "Tracking..."
 
   // Stop-confirm overlay
   let stopFlowActive: Bool

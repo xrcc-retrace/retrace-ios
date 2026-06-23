@@ -81,7 +81,7 @@ struct GlassesSettingsView: View {
 
       Spacer()
 
-      if wearablesVM.hasActiveDevice {
+      if wearablesVM.isConnected {
         HStack(spacing: Spacing.xxs) {
           Circle()
             .fill(Color.green)

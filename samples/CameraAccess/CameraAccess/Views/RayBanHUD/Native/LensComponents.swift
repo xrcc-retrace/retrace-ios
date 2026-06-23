@@ -67,9 +67,12 @@ enum LensComponents {
     .background(.card)
   }
 
-  /// Bottom-anchored row with mute and exit affordances. The two
-  /// `FlexBox`-with-onTap wrappers expose each icon as a focusable
-  /// tap target (Buttons would force a label).
+  /// Bottom-anchored row, split to opposite corners: Mute/Unmute as its own
+  /// labelled pill on the LEFT, Exit as its own labelled pill on the RIGHT —
+  /// mirroring the top band's Reference/Insights split. Each pill carries its
+  /// own `.card` background (two separate buttons, not one shared bar); an
+  /// empty `flexGrow(1)` spacer pushes them apart (the `Alignment` enum has
+  /// no `spaceBetween`).
   ///
   /// Tree order: mute first, exit second. D-pad traversal follows.
   static func audioActionRow(
@@ -79,38 +82,58 @@ enum LensComponents {
   ) -> FlexBox {
     FlexBox(
       direction: MWDATDisplay.Direction.row,
-      spacing: 12,
-      alignment: .end,
+      spacing: 8,
+      alignment: .start,
       crossAlignment: .center
     ) {
-      FlexBox(direction: MWDATDisplay.Direction.row, spacing: 0, alignment: .center, crossAlignment: .center) {
+      // Mute / Unmute — bottom-left. Icon reflects state, label the action.
+      FlexBox(direction: MWDATDisplay.Direction.row, spacing: 6, alignment: .start, crossAlignment: .center) {
         Icon(name: isMuted ? .speakerOff : .speakerWithThreeArcs, style: .outline)
+        Text(isMuted ? "Unmute" : "Mute", style: .meta, color: .primary)
       }
       .padding(6)
+      .background(.card)
       .onTap(onMute)
 
-      FlexBox(direction: MWDATDisplay.Direction.row, spacing: 0, alignment: .center, crossAlignment: .center) {
+      // Grow-spacer pushes Exit to the right edge.
+      FlexBox(direction: MWDATDisplay.Direction.row, spacing: 0, alignment: .center, crossAlignment: .center) {}
+      .flexGrow(1)
+
+      // Exit — bottom-right.
+      FlexBox(direction: MWDATDisplay.Direction.row, spacing: 6, alignment: .start, crossAlignment: .center) {
         Icon(name: .x, style: .outline)
+        Text("Exit", style: .meta, color: .primary)
       }
       .padding(6)
+      .background(.card)
       .onTap(onExit)
     }
-    .padding(8)
-    .background(.card)
   }
 
-  /// "Use your phone" card. Routed via `LensFlow.handoffToPhone(reason:)`.
-  /// Static, no interactive elements — the user is expected to act on the
-  /// phone screen.
-  static func handoffCard(reason: String) -> FlexBox {
+  /// "Press on your phone to continue" card. Routed via
+  /// `LensFlow.handoffToPhone(reason:)`. Static, no interactive elements —
+  /// the user is expected to act on the phone screen.
+  ///
+  /// `heading` defaults to the canonical imperative ("Press on your phone
+  /// to continue") so existing call sites need only pass `reason:`. Other
+  /// phone-only surfaces can pass an action-specific heading like
+  /// "Open Server Settings" or "Pick a mode on your phone".
+  ///
+  /// The icon row was dropped 2026-06-14: `.metaAi` rendered as a faint
+  /// white-in-rectangle blob against the `.card` background, and there's
+  /// no mapped phone/tap glyph in `LensIconMap` that would clearly convey
+  /// "act on the phone." Leading with the imperative text alone is cleaner.
+  static func handoffCard(
+    heading: String = "Press on your phone to continue",
+    reason: String
+  ) -> FlexBox {
     FlexBox(
       direction: MWDATDisplay.Direction.column,
       spacing: 12,
       alignment: .center,
       crossAlignment: .center
     ) {
-      Icon(name: .metaAi, style: .outline)
-      Text("Use your phone", style: .heading, color: .primary)
+      Text(heading, style: .heading, color: .primary)
       Text(reason, style: .body, color: .secondary)
     }
     .padding(24)

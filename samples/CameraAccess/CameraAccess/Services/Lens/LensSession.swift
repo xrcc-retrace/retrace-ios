@@ -114,14 +114,20 @@ final class LensSession: ObservableObject {
     }
   }
 
-  /// Tear down the active renderer. Leaves the last-sent tree on the
-  /// lens — the next `activate()` will repaint. The display capability
-  /// itself stays attached (it's app-scoped via `LensDisplayCoordinator`).
+  /// Tear down the active renderer and CLEAR the lens. The display capability
+  /// itself stays attached (it's app-scoped via `LensDisplayCoordinator`), but
+  /// we send an empty root so stale content (e.g. the coaching steps / exit
+  /// overlay) doesn't linger on the glasses after the session ends — the next
+  /// `activate()` repaints. Without this clear, exiting a session left the
+  /// last tree frozen on the display.
   func deactivate() {
     currentRenderer?.cancel()
     currentRenderer = nil
     lastLoggedToggleState = nil
     currentFlow = .idle
+    Task { [weak self] in
+      await self?.send(FlexBox(direction: MWDATDisplay.Direction.column) {})
+    }
   }
 
   // MARK: - Reference clip handoff (Step 7)
@@ -137,13 +143,32 @@ final class LensSession: ObservableObject {
   /// Critical contract from the plugin docs: install `onPlaybackEvent`
   /// BEFORE sending the video so the terminal event isn't dropped on
   /// the floor while the closure is being attached.
+  /// `onError` fires with a human-readable reason when the clip can't be
+  /// shown — display not attached, a malformed/non-HTTP(S) URL, or an SDK
+  /// playback/load failure (e.g. the server 404'd the .mp4). The renderer
+  /// uses it to surface a visible "couldn't load clip" card on the lens
+  /// instead of failing silently.
   func presentReferenceClip(
     uri: String,
-    onEnded: @escaping () -> Void
+    onStarted: @escaping () -> Void = {},
+    onEnded: @escaping () -> Void,
+    onError: @escaping (String) -> Void = { _ in }
   ) async {
     guard UserDefaults.standard.bool(forKey: "lensOutputEnabled") else { return }
     guard let display = coordinator.display else {
       print("[LensSession] presentReferenceClip skipped — display not attached")
+      onError("Display not attached")
+      return
+    }
+
+    // Pre-validate: the DAT VideoPlayer throws DisplayError.invalidVideoURL
+    // on blank/non-HTTP(S) URLs. Catch it here so we surface a clear reason
+    // rather than letting it get swallowed inside coordinator.send.
+    guard let parsed = URL(string: uri),
+          let scheme = parsed.scheme?.lowercased(),
+          scheme == "http" || scheme == "https" else {
+      print("[LensSession] presentReferenceClip skipped — invalid video URL: \(uri)")
+      onError("Invalid clip URL")
       return
     }
 
@@ -156,6 +181,14 @@ final class LensSession: ObservableObject {
       }
     }
 
+    // All guards have passed and we're committed to displaying the clip —
+    // signal "started" now so the caller can pause the Gemini loop. Firing
+    // here (not before the guards) guarantees a matching terminal event
+    // (`.ended` / `.stopped`) will arrive to un-pause; the silent
+    // `lensOutputEnabled`-off early-return above never reaches this point,
+    // so the caller can't latch the gate closed forever.
+    onStarted()
+
     // `MWDATDisplay.VideoPlayer` is qualified explicitly because this
     // file imports SwiftUI (for `@MainActor` plumbing) and SwiftUI's
     // `VideoPlayer` from AVKit can collide with the DSL one. Same rule
@@ -167,6 +200,12 @@ final class LensSession: ObservableObject {
         codec: .mp4,
         onError: { error in
           print("[LensSession] VideoPlayer error: \(error)")
+          // Hand the failure back to the renderer on the main actor so it
+          // can paint an error card. Clear the now-stale playback handler.
+          Task { @MainActor [weak self] in
+            self?.coordinator.display?.onPlaybackEvent = nil
+            onError(String(describing: error))
+          }
         }
       )
     )

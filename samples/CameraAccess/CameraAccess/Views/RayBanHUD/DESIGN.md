@@ -135,7 +135,9 @@ Compact, capsule-shaped, often with an icon + label. Used for:
 - Action buttons inside cards (Cancel / Confirm)
 - Status indicators (recording chip, mic source badge)
 
-Toggle pills get a `Capsule().fill(white @ 0.95)` background + black text **only when their panel is open** (i.e. `expansion == .referenceExpanded` for the Reference toggle, `.insightsExpanded` for the Insights toggle). The fill says "this is the active panel," not "the cursor is here." Inactive toggles: clear background + white text.
+Toggle pills get a `Capsule().fill(white @ 0.95)` background + black text **only when their panel is open** (i.e. `expansion == .referenceInline` for the Reference toggle, `.insightsInline` for the Insights toggle). The fill says "this is the active panel," not "the cursor is here." Inactive toggles: clear background + white text.
+
+> **Native-lens caveat (the real `MWDATDisplay` FlexBox tree, `Native/Renderers/*`).** The on-glasses DSL's `Background` enum is only `.none` / `.card` — there is **no** white-fill option, so the white-active-capsule treatment above is the SwiftUI *emulator* only. On the native lens, a pill's active state is signalled by an **icon + label swap**: the Reference pill flips to `.x` / "Hide ref" while its panel is open, Insights to `.x` / "Hide insights". Same semantics ("this panel is open, tap to close"), different mechanism, because the API can't fill a capsule. Keep the two surfaces behaviorally identical even though the active cue differs.
 
 A **primary-action pill** (the page's forward-path action — `startProcedure`, `uploadManual`, `confirmIdentification`) is signaled by a **leading SF Symbol icon + full-opacity white text + larger size**: `arrow.right` for "Start", `square.and.arrow.up` for "Upload a manual", `checkmark` for "That's it", and so on. The icon does the visual work that a permanent yellow stroke used to do — it tells the user "this is the recommended next action" the moment the page renders, without ever stealing the focus signal. Default focus on each page lands the cursor on the primary pill, so the unified hover ring appears there on appear and reinforces the cue without competing with it.
 
@@ -387,8 +389,12 @@ Pattern: in-page expandable panels.
 
 - Default state shows a compact card; truncated content hints at "more available."
 - Toggle affordances at top declare what *can* expand. Hidden when there's nothing to expand to.
+- **Top band splits left/right: Reference on the left edge, Insights on the right.** This holds on *both* surfaces. The SwiftUI emulator uses `HStack { … ; Spacer(minLength: 0); … }`. The native lens has no `Spacer` node and the `Alignment` enum has no `spaceBetween` — but `FlexBox.flexGrow(_:)` exists, so an **empty `FlexBox { }.flexGrow(1)` grow-spacer** sits between the two pills and pushes them apart. Keep the spacer present even when one pill is absent, so a lone Insights pill still lands right and a lone Reference pill stays left.
+- **Reference / Insights expand IN-PAGE, not to a separate page.** Opening a panel never navigates away — it's the same step-page tree re-sent. On the native lens the panel **replaces the step card** in a single content slot directly under the top band (the card is removed entirely, not truncated or pushed down — Reference, Insights, and the step card are mutually exclusive in that slot). A reference panel shows a playable clip (poster + "Tap to play"), a static manual image, or a load-error card; insights shows the bullet list. (Tapping the clip poster *does* hand off to the full-screen `VideoPlayer` — a deliberate media takeover, the only real root swap.)
 - Tapping a toggle uses the asymmetric inline-content transition above.
 - Other expansion states are **mutually exclusive** — one expanded panel at a time. Tapping a different toggle smoothly switches.
+
+The native-lens mirror of this lives in `Native/Renderers/CoachingLensTrees.collapsedStepTree`, which drives `.collapsed` / `.referenceInline` / `.insightsInline` from a single tree (there is intentionally no separate `referenceExpandedTree` / `insightsExpandedTree` — they were removed when these states went inline). The emulator equivalent is `CoachingStepPage.topAffordances` + `contentArea`.
 
 **Pinch-select on `.stepCard` is overloaded by current state**:
 - Card is **collapsed** → expand to `.stepExpanded`.

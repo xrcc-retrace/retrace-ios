@@ -64,7 +64,11 @@ class ViewModelIntegrationTests: XCTestCase {
     // Setup camera feed
     await camera.setCameraFeed(fileURL: videoURL)
 
-    let viewModel = StreamSessionViewModel(wearables: Wearables.shared, uploadService: UploadService())
+    let viewModel = StreamSessionViewModel(
+      wearables: Wearables.shared,
+      uploadService: UploadService(),
+      sessionManager: DeviceSessionManager(wearables: Wearables.shared)
+    )
 
     // Initially not streaming
     XCTAssertEqual(viewModel.streamingStatus, .stopped)
@@ -114,7 +118,11 @@ class ViewModelIntegrationTests: XCTestCase {
     await camera.setCameraFeed(fileURL: videoURL)
     await camera.setCapturedImage(fileURL: imageURL)
 
-    let viewModel = StreamSessionViewModel(wearables: Wearables.shared, uploadService: UploadService())
+    let viewModel = StreamSessionViewModel(
+      wearables: Wearables.shared,
+      uploadService: UploadService(),
+      sessionManager: DeviceSessionManager(wearables: Wearables.shared)
+    )
 
     // Initially not streaming
     XCTAssertEqual(viewModel.streamingStatus, .stopped)

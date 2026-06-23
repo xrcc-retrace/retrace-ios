@@ -40,8 +40,22 @@ final class DeviceSessionManager: ObservableObject {
   // MARK: - Public observable state
 
   /// True when ANY device is reachable right now (filterless AutoDeviceSelector).
-  /// Drives the Settings "Connected" pill and the Expert "no active device" guard.
+  /// This is the SDK's *session-eligibility* signal — "is there a device I can
+  /// start a `DeviceSession` on this instant" — NOT raw Bluetooth connection
+  /// state. Used by the Expert "no active device" launch guard and the launch
+  /// gate. Do **not** use it for a "Connected" pill: a paired, link-up,
+  /// compatible device can still report `false` here if the auto-selector
+  /// hasn't latched it as session-eligible yet. Use `hasConnectedDevice` for
+  /// connection-status UI.
   @Published private(set) var hasAnyActiveDevice: Bool = false
+
+  /// True when ANY paired device reports `LinkState.connected` — i.e. the DAT
+  /// transport link to the glasses is actually up. This is the honest answer
+  /// to "are the glasses connected right now", independent of whether the
+  /// auto-selector has picked one for a session. Drives the Settings
+  /// "Connected" pill. Fed by per-device `addLinkStateListener` (event-driven,
+  /// no polling).
+  @Published private(set) var hasConnectedDevice: Bool = false
 
   /// True when a display-capable device (Meta Ray-Ban Display) is reachable.
   /// Drives the lens path's selector requirement.
@@ -138,9 +152,16 @@ final class DeviceSessionManager: ObservableObject {
   /// `Self.teardownInFlight` gate.
   private var lifecycleTask: Task<Void, Never>?
 
+  /// Per-device `LinkState` cache + listener tokens, keyed by `DeviceIdentifier`.
+  /// Refreshed whenever `devicesStream()` emits and whenever a device's
+  /// `addLinkStateListener` fires. Derives `hasConnectedDevice`.
+  private var deviceLinkState: [DeviceIdentifier: LinkState] = [:]
+  private var linkStateTokens: [DeviceIdentifier: AnyListenerToken] = [:]
+
   /// Background observation tasks.
   private var anyDeviceMonitorTask: Task<Void, Never>?
   private var displayDeviceMonitorTask: Task<Void, Never>?
+  private var deviceLinkMonitorTask: Task<Void, Never>?
   private var sessionStateTask: Task<Void, Never>?
   private var sessionErrorTask: Task<Void, Never>?
   private var registrationTask: Task<Void, Never>?
@@ -155,12 +176,14 @@ final class DeviceSessionManager: ObservableObject {
       filter: { $0.supportsDisplay() }
     )
     startDeviceMonitoring()
+    startLinkStateMonitoring()
     observeRegistration()
   }
 
   deinit {
     anyDeviceMonitorTask?.cancel()
     displayDeviceMonitorTask?.cancel()
+    deviceLinkMonitorTask?.cancel()
     sessionStateTask?.cancel()
     sessionErrorTask?.cancel()
     registrationTask?.cancel()
@@ -261,6 +284,16 @@ final class DeviceSessionManager: ObservableObject {
   /// from the SDK's `errorStream()` and are raced against `stateStream()`'s
   /// transition to `.started`, so failures surface immediately rather
   /// than waiting for a timeout.
+  /// Names of the currently-paired Meta devices, from `Device.nameOrId()`.
+  /// `wearables.devices` only ever contains Meta glasses (not AirPods or other
+  /// BT peripherals), so these are exactly the names `AudioSessionManager`
+  /// matches against `AVAudioSessionPortDescription.portName` to pin the
+  /// glasses' BT HFP input. Returns an empty array when no glasses are paired —
+  /// the audio layer then falls back to its name heuristics / iOS default.
+  static func pairedDeviceNames(from wearables: WearablesInterface) -> [String] {
+    wearables.devices.compactMap { wearables.deviceForIdentifier($0)?.nameOrId() }
+  }
+
   func acquire(
     consumerLabel: String,
     requirements: DeviceRequirements = .any
@@ -618,6 +651,74 @@ final class DeviceSessionManager: ObservableObject {
         strong.hasDisplayCapableDevice = deviceId != nil
       }
     }
+  }
+
+  // MARK: - Private — link-state (connection) monitoring
+
+  /// Tracks the DAT transport link of each paired device via
+  /// `Device.addLinkStateListener`, deriving `hasConnectedDevice`. This is the
+  /// honest "are the glasses connected" signal — distinct from
+  /// `hasAnyActiveDevice` (auto-selector session-eligibility), which can lag or
+  /// stay `false` even while a compatible device is linked.
+  ///
+  /// `devicesStream()` tells us the set of paired devices; we (re)attach a
+  /// link-state listener per device on each emission and seed the cache from
+  /// the device's current `linkState`. Event-driven — no polling.
+  private func startLinkStateMonitoring() {
+    deviceLinkMonitorTask = Task { [weak self] in
+      guard let strong = self else { return }
+      // Seed from the devices already known at construction time.
+      strong.refreshLinkListeners(for: strong.wearables.devices)
+      for await devices in strong.wearables.devicesStream() {
+        guard let strong = self else { return }
+        strong.refreshLinkListeners(for: devices)
+      }
+    }
+  }
+
+  /// Drop listeners/cache for departed devices, attach a fresh listener +
+  /// seed the current `linkState` for present devices, then recompute.
+  private func refreshLinkListeners(for devices: [DeviceIdentifier]) {
+    let present = Set(devices)
+
+    // Forget devices that are no longer paired so a removed device can't keep
+    // `hasConnectedDevice` stuck on.
+    for (id, token) in linkStateTokens where !present.contains(id) {
+      Task { await token.cancel() }
+      linkStateTokens.removeValue(forKey: id)
+    }
+    deviceLinkState = deviceLinkState.filter { present.contains($0.key) }
+
+    for deviceId in devices {
+      guard let device = wearables.deviceForIdentifier(deviceId) else { continue }
+      // Always reseed the current link state (covers devices we already had a
+      // listener on but whose state changed before the listener attached).
+      deviceLinkState[deviceId] = device.linkState
+
+      guard linkStateTokens[deviceId] == nil else { continue }
+      let token = device.addLinkStateListener { [weak self] state in
+        Task { @MainActor [weak self] in
+          guard let self else { return }
+          self.deviceLinkState[deviceId] = state
+          self.recomputeConnectivity()
+        }
+      }
+      linkStateTokens[deviceId] = token
+    }
+
+    recomputeConnectivity()
+  }
+
+  /// Recompute `hasConnectedDevice` from the per-device link cache. Idempotent.
+  private func recomputeConnectivity() {
+    let connected = deviceLinkState.values.contains(.connected)
+    if connected != hasConnectedDevice {
+      hasConnectedDevice = connected
+    }
+    let snapshot = deviceLinkState
+      .map { "\(wearables.deviceForIdentifier($0.key)?.nameOrId() ?? $0.key)=\($0.value)" }
+      .joined(separator: ", ")
+    log("connectivity: hasConnectedDevice=\(hasConnectedDevice) hasAnyActive=\(hasAnyActiveDevice) links=[\(snapshot)]")
   }
 
   // MARK: - Private — registration observation

@@ -4,7 +4,7 @@ struct ProfileView: View {
   @ObservedObject var wearablesVM: WearablesViewModel
   let onExit: () -> Void
   @AppStorage(VoiceSettings.storageKey) private var geminiVoice = VoiceSettings.defaultVoice
-  @AppStorage("autoAdvanceEnabled") private var autoAdvanceEnabled = true
+  @AppStorage("activeMonitoringEnabled") private var activeMonitoringEnabled = true
   @AppStorage(OnboardingContainerView.completionKey) private var onboardingCompleted = true
 
   var body: some View {
@@ -43,7 +43,7 @@ struct ProfileView: View {
             NavigationLink {
               GlassesSettingsView(wearablesVM: wearablesVM)
             } label: {
-              let isConnected = wearablesVM.hasActiveDevice
+              let isConnected = wearablesVM.isConnected
               HStack(spacing: Spacing.lg) {
                 Image(systemName: "eyeglasses")
                   .font(.system(size: 20))
@@ -127,23 +127,23 @@ struct ProfileView: View {
               Divider().background(Color.borderSubtle)
 
               HStack {
-                Image(systemName: "forward.fill")
+                Image(systemName: "eye.fill")
                   .font(.system(size: 20))
                   .foregroundColor(.textPrimary)
                   .frame(width: 32)
 
                 VStack(alignment: .leading, spacing: Spacing.xxs) {
-                  Text("Auto-Advance Steps")
+                  Text("Active Monitoring")
                     .font(.retraceBody)
                     .foregroundColor(.textPrimary)
-                  Text("Advance when visual verification confirms completion")
+                  Text("AI watches as you work — speaks up on mistakes and advances steps automatically. Off: reactive, verbal-only.")
                     .font(.retraceCaption1)
                     .foregroundColor(.textSecondary)
                 }
 
                 Spacer()
 
-                Toggle("", isOn: $autoAdvanceEnabled)
+                Toggle("", isOn: $activeMonitoringEnabled)
                   .tint(.green)
               }
             }

@@ -32,6 +32,15 @@ final class CoachingLensRenderer: LensRenderer {
 
   private var expansion: CoachingLensSnapshot.LensCoachingExpansion = .collapsed
   private var descPage: Int = 0
+  /// Transient: set when a reference clip fails to load (404, bad URL,
+  /// display detached). Painted as an error card in the inline reference
+  /// panel; cleared on the next toggle or retry.
+  private var clipErrorMessage: String?
+  /// Lens-side exit-confirmation overlay flag. When true, `tree()` renders
+  /// `exitConfirmationTree` over the step page. Toggled by the Exit pill and
+  /// the overlay's Cancel/Confirm buttons — the confirmation lives ON the
+  /// glasses, not the phone.
+  private var showExitConfirmation = false
 
   // MARK: - Subscriptions
 
@@ -42,12 +51,20 @@ final class CoachingLensRenderer: LensRenderer {
   init(viewModel: CoachingSessionViewModel, lensSession: LensSession) {
     self.viewModel = viewModel
     self.lensSession = lensSession
+    // Let the back-gesture path interrupt an in-flight clip: while
+    // `isClipPlaying`, "back" routes here (→ sendVideoStop) instead of the
+    // exit-session overlay. The resulting `.stopped` event runs the same
+    // `onEnded` path that resumes Gemini and repaints the step.
+    viewModel.onClipDismissRequested = { [weak lensSession] in
+      Task { await lensSession?.dismissReferenceClip() }
+    }
     subscribe()
   }
 
   // MARK: - LensRenderer
 
   func cancel() {
+    viewModel.onClipDismissRequested = nil
     cancellables.removeAll()
   }
 
@@ -91,26 +108,46 @@ final class CoachingLensRenderer: LensRenderer {
     // shrunk after a step transition).
     let safePage = pages.indices.contains(descPage) ? descPage : 0
 
-    let posterURL: String? = {
-      guard let step, step.clipUrl != nil else { return nil }
-      return LensImageURL.clipPosterURL(
-        procedureId: viewModel.lensProcedureId,
-        stepIndex: step.stepNumber
-      )
-    }()
+    // Resolve the step's REAL reference media (video clip vs. manual page
+    // image vs. none) from clip_url + source_type — never reconstruct a
+    // .mp4 URL. For a video, the still poster is the .jpg first-frame route;
+    // for a manual image, the poster IS the image itself.
+    let media = resolveReferenceMedia()
+    let referenceIsVideo: Bool
+    let referenceVideoURL: String?
+    let referencePosterURL: String?
+    switch media {
+    case .video(let url):
+      referenceIsVideo = true
+      referenceVideoURL = url.absoluteString
+      referencePosterURL = step.map {
+        LensImageURL.clipPosterURL(procedureId: viewModel.lensProcedureId, stepIndex: $0.stepNumber)
+      } ?? nil
+    case .image(let url):
+      referenceIsVideo = false
+      referenceVideoURL = nil
+      referencePosterURL = url.absoluteString
+    case .none:
+      referenceIsVideo = false
+      referenceVideoURL = nil
+      referencePosterURL = nil
+    }
 
     return CoachingLensSnapshot(
       pageKind: viewModel.isCompleted ? .completion : .step,
       isMuted: viewModel.isMuted,
       connection: connectionStatus(),
-      showDismissConfirmation: false,  // wired up in a future iteration
+      showDismissConfirmation: showExitConfirmation,
       stepIndex: viewModel.displayedStepIndex,
       totalSteps: viewModel.lensTotalSteps,
       stepTitle: step?.title ?? "",
       stepDescription: description,
       expansion: expansion,
-      hasClip: step?.clipUrl != nil,
-      clipPosterURL: posterURL,
+      hasReference: media != .none,
+      referenceIsVideo: referenceIsVideo,
+      referencePosterURL: referencePosterURL,
+      referenceVideoURL: referenceVideoURL,
+      clipErrorMessage: clipErrorMessage,
       insights: insights,
       descPage: safePage,
       descPagesTotal: pages.count,
@@ -118,6 +155,29 @@ final class CoachingLensRenderer: LensRenderer {
       procedureTitle: viewModel.lensProcedureTitle,
       formattedSessionDuration: viewModel.formattedSessionDuration
     )
+  }
+
+  /// Resolve the displayed step's reference media from its authoritative
+  /// `clip_url` + the procedure's `source_type`. Shared by snapshot
+  /// projection and the clip-tap handler so both agree on video-vs-image.
+  private func resolveReferenceMedia() -> StepReferenceMedia {
+    guard let step = viewModel.displayedStep else { return .none }
+    let media = step.referenceMedia(
+      sourceType: viewModel.lensProcedureSourceType,
+      baseURL: ServerEndpoint.shared.resolvedBaseURL
+    )
+    // The native lens streams over the Bluetooth Display link, so request the
+    // small `?profile=lens` server variant (~8x fewer bytes) for faster, smoother
+    // first-frame playback. Only `.video` is rewritten — manual-page `.image`
+    // and `.none` pass through. The phone PiP resolves its own URL in
+    // CoachingSessionView and intentionally keeps the full-res clip. Falls back
+    // to the original URL if it doesn't parse; the server also degrades an
+    // unknown/failed profile back to the full clip, so this is purely additive.
+    guard case .video(let url) = media,
+          var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+    else { return media }
+    components.queryItems = (components.queryItems ?? []) + [URLQueryItem(name: "profile", value: "lens")]
+    return components.url.map { .video($0) } ?? media
   }
 
   private func buildInsights(from step: ProcedureStepResponse?) -> [CoachingLensSnapshot.InsightItem] {
@@ -158,14 +218,18 @@ final class CoachingLensRenderer: LensRenderer {
     CoachingLensCallbacks(
       onToggleReference: { [weak self] in
         guard let self else { return }
-        self.expansion = (self.expansion == .referenceExpanded) ? .collapsed : .referenceExpanded
+        // Toggle the inline reference panel. Tapping it while Insights is
+        // open swaps panels (current != .referenceInline → opens it).
+        self.expansion = (self.expansion == .referenceInline) ? .collapsed : .referenceInline
         self.descPage = 0
+        self.clipErrorMessage = nil  // fresh open — drop any stale error
         self.scheduleSend()
       },
       onToggleInsights: { [weak self] in
         guard let self else { return }
-        self.expansion = (self.expansion == .insightsExpanded) ? .collapsed : .insightsExpanded
+        self.expansion = (self.expansion == .insightsInline) ? .collapsed : .insightsInline
         self.descPage = 0
+        self.clipErrorMessage = nil
         self.scheduleSend()
       },
       onExpandStep: { [weak self] in
@@ -197,52 +261,75 @@ final class CoachingLensRenderer: LensRenderer {
           viewModel?.toggleMute()
         }
       },
-      onExit: { [weak viewModel] in
+      onExit: { [weak self] in
         Task { @MainActor in
-          // Fire the same callback that the lens middle-pinch fires,
-          // surfacing the exit-confirmation overlay on the phone side.
-          viewModel?.onBackGesture?()
+          // Show the exit confirmation ON the lens (was: route to the phone
+          // overlay via viewModel.onBackGesture).
+          guard let self else { return }
+          self.showExitConfirmation = true
+          self.scheduleSend()
         }
       },
       onReferenceClipTap: { [weak self] in
         guard let self else { return }
-        // Need a step + clip + procedure id to build a video URL. The
-        // thumbnail itself only renders when `hasClip == true` so the
-        // step-with-clip case is the only one that can reach here, but
-        // the URL builder still returns optional in case the server
-        // endpoint is unresolved.
-        guard
-          let step = self.viewModel.displayedStep,
-          step.clipUrl != nil,
-          let videoURL = LensImageURL.clipVideoURL(
-            procedureId: self.viewModel.lensProcedureId,
-            stepIndex: step.stepNumber
-          )
-        else { return }
+        // Only a genuine VIDEO clip is playable. Manual page images resolve
+        // to `.image` and are shown inline (no full-screen takeover); `.none`
+        // can't reach here because the pill is hidden. Use the REAL clip URL
+        // from the server (never a reconstructed .mp4 — that 404s for manual).
+        guard case .video(let url) = self.resolveReferenceMedia() else { return }
+        self.clipErrorMessage = nil
 
         Task { [weak self] in
           await self?.lensSession?.presentReferenceClip(
-            uri: videoURL,
+            uri: url.absoluteString,
+            onStarted: { [weak self] in
+              // Clip is committed to the lens — pause the Gemini loop
+              // (mic/voice/frames) so the clip's audio isn't fed back, the
+              // model doesn't talk over it, and frames can't trip advance.
+              self?.viewModel.setReferenceClipPlaying(true)
+            },
             onEnded: { [weak self] in
-              // Return to the active snapshot tree. Re-collapsing here
-              // is optional UX — keeping `.referenceExpanded` so the
-              // user can replay without re-expanding feels natural.
+              // Resume the Gemini loop, then return to the active snapshot
+              // tree. Re-collapsing here is optional UX — keeping
+              // `.referenceInline` so the user can replay without
+              // re-expanding feels natural.
+              self?.viewModel.setReferenceClipPlaying(false)
               self?.scheduleSend()
+            },
+            onError: { [weak self] _ in
+              // Resume the loop (the clip never actually played) and surface
+              // a visible error card instead of failing silently.
+              // (The concrete reason is logged in LensSession.)
+              guard let self else { return }
+              self.viewModel.setReferenceClipPlaying(false)
+              self.clipErrorMessage = "Couldn't load clip"
+              self.scheduleSend()
             }
           )
         }
+      },
+      onRetryClip: { [weak self] in
+        guard let self else { return }
+        self.clipErrorMessage = nil
+        self.scheduleSend()
       },
       onCompletionExit: { [weak viewModel] in
         Task { @MainActor in
           viewModel?.onBackGesture?()
         }
       },
-      onExitConfirmCancel: {
-        // No-op until exit overlay wiring lands (snapshot.showDismissConfirmation
-        // stays false in this iteration, so this never fires).
+      onExitConfirmCancel: { [weak self] in
+        guard let self else { return }
+        self.showExitConfirmation = false
+        self.scheduleSend()
       },
-      onExitConfirmConfirm: {
-        // Same — placeholder.
+      onExitConfirmConfirm: { [weak self] in
+        guard let self else { return }
+        self.showExitConfirmation = false
+        // Run the host-installed terminal exit (endSession + dismiss). The
+        // phone view tears down the session and pops itself; the lens flow
+        // returns to idle as the session ends.
+        self.viewModel.onExitConfirmed?()
       }
     )
   }

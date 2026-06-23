@@ -58,7 +58,7 @@ struct TroubleshootSessionView: View {
     serverBaseURL: String,
     transport: CaptureTransport,
     onExit: @escaping (LearnerSessionStartResponse?) -> Void,
-    sessionManager: DeviceSessionManager? = nil
+    sessionManager: DeviceSessionManager
   ) {
     self.wearables = wearables
     self.wearablesVM = wearablesVM
@@ -193,7 +193,16 @@ struct TroubleshootSessionView: View {
       // `lensOutputEnabled` inside `LensSession.send`, so this is safe
       // to call unconditionally — when the toggle is OFF, no sends
       // reach the glasses.
-      lensSession.activate(.troubleshoot, vm: viewModel)
+      //
+      // DEFERRED until `isReadyForNativeLens`: the Display capability shares
+      // the glasses' BT radio with the HFP mic. Starting it during the HFP
+      // warmup makes iOS drop the glasses mic route (falls back to AirPods).
+      // We wait until audio + camera are confirmed up; the `.onChange` below
+      // activates the lens once the session signals ready. (Parallel to
+      // CoachingSessionView; see `GeminiLiveSessionBase.isReadyForNativeLens`.)
+      if viewModel.isReadyForNativeLens {
+        lensSession.activate(.troubleshoot, vm: viewModel)
+      }
       if transport == .iPhone {
         // Match Coaching's orientation flow — broaden the allowed mask so
         // SwiftUI chrome can follow the phone into landscape, seed the
@@ -212,6 +221,14 @@ struct TroubleshootSessionView: View {
     // when the user dismisses mid-handshake.
     .task {
       await viewModel.startSession()
+    }
+    // Bring the native lens up once audio + camera are confirmed ready (see
+    // the deferred activate in `.onAppear`). Normal path: at appear time the
+    // session is still starting (flag false); it flips true mid-startup.
+    .onChange(of: viewModel.isReadyForNativeLens) { _, ready in
+      if ready {
+        lensSession.activate(.troubleshoot, vm: viewModel)
+      }
     }
     .onDisappear {
       // Tear down the troubleshoot lens renderer first so its Combine
@@ -547,8 +564,13 @@ struct TroubleshootSessionView: View {
   }
 
   private func startHandoff(procedureId: String) async {
-    let autoAdvance = UserDefaults.standard.object(forKey: "autoAdvanceEnabled") as? Bool ?? true
-    if let payload = await viewModel.executeHandoff(procedureId: procedureId, autoAdvance: autoAdvance) {
+    // Single Active/Passive setting drives both wire flags (see Profile).
+    let activeMonitoring = UserDefaults.standard.object(forKey: "activeMonitoringEnabled") as? Bool ?? true
+    if let payload = await viewModel.executeHandoff(
+      procedureId: procedureId,
+      autoAdvance: activeMonitoring,
+      activeMonitoring: activeMonitoring
+    ) {
       // Tag this exit as a handoff BEFORE bubbling up — when the parent
       // flips its phase, our `onDisappear` will run, and the gate there
       // depends on this flag to skip `unlock()` so the learner view

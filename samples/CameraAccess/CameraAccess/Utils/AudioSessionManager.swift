@@ -60,6 +60,19 @@ class AudioSessionManager: ObservableObject {
 
   let mode: AudioSessionMode
 
+  /// Names of the DAT-paired Meta glasses (from `Device.nameOrId()`), supplied
+  /// by the caller for glasses-transport sessions. Used in the glasses modes
+  /// (`.coaching` / `.recording`) to explicitly `setPreferredInput` the glasses'
+  /// BT HFP port so a second connected HFP device (e.g. AirPods) can't win the
+  /// input route. Empty in iPhone-transport sessions — the `*PhoneOnly` modes
+  /// pin the built-in mic instead and never consult this. See
+  /// `selectGlassesInput(from:names:)` for the matching strategy.
+  var preferredGlassesNames: [String] = []
+
+  /// True for the glasses-transport modes that should prefer the glasses' BT
+  /// HFP input over any other connected HFP device.
+  private var isGlassesMode: Bool { mode == .coaching || mode == .recording }
+
   private let engine = AVAudioEngine()
   private var inputNode: AVAudioInputNode { engine.inputNode }
 
@@ -151,8 +164,9 @@ class AudioSessionManager: ObservableObject {
     inputNode.inputFormat(forBus: 0)
   }
 
-  init(mode: AudioSessionMode = .coaching) {
+  init(mode: AudioSessionMode = .coaching, preferredGlassesNames: [String] = []) {
     self.mode = mode
+    self.preferredGlassesNames = preferredGlassesNames
 
     // Attach player node only for coaching modes. Recording has no playback
     // and attaching the node forces `.playAndRecord`, which pulls in output-port
@@ -249,6 +263,12 @@ class AudioSessionManager: ObservableObject {
       if mode == .coachingPhoneOnly || mode == .recordingPhoneOnly {
         forceBuiltInMicPreferred(session)
       }
+      if isGlassesMode {
+        // Pin the glasses' BT HFP input so a second connected HFP device
+        // (e.g. AirPods) can't win the route. Done before the caller's
+        // HFP warmup delay so iOS brings up the *glasses* SCO link.
+        forceGlassesInputPreferred(session)
+      }
       checkBluetoothRoute()
 
       // Surface the actual route iOS picked so silent-audio bugs are
@@ -283,6 +303,71 @@ class AudioSessionManager: ObservableObject {
   func configureSessionOnly() {
     guard !didConfigureSession else { return }
     configureAudioSession()
+  }
+
+  /// Match heuristics applied (in `selectGlassesInput`) to a `.bluetoothHFP`
+  /// port name when no DAT device name matched — covers the window where
+  /// `wearables.devices` is briefly empty but the glasses are BT-paired.
+  /// Lowercased substrings checked against a lowercased port name.
+  private static let glassesNameHeuristics = [
+    "meta", "ray-ban", "rayban", "rb display", "vanguard",
+  ]
+
+  /// Find the BT HFP input port that belongs to the Meta glasses, among the
+  /// session's `availableInputs`. Match strategy, most → least specific:
+  ///   1. Exact (case-insensitive) `portName == datName`.
+  ///   2. One name contains the other (minor suffix/prefix drift).
+  ///   3. Heuristic: an HFP port whose name contains a known glasses token.
+  /// Returns nil when nothing matches — caller then leaves routing to iOS
+  /// rather than pinning a non-glasses device.
+  nonisolated static func selectGlassesInput(
+    from session: AVAudioSession,
+    names: [String]
+  ) -> AVAudioSessionPortDescription? {
+    let inputs = session.availableInputs ?? []
+    let datNames = names.map { $0.lowercased() }
+
+    // 1 + 2: match against the DAT-reported glasses names.
+    for port in inputs {
+      let portName = port.portName.lowercased()
+      for datName in datNames where !datName.isEmpty {
+        if portName == datName
+            || portName.contains(datName)
+            || datName.contains(portName) {
+          return port
+        }
+      }
+    }
+
+    // 3: heuristic fallback, restricted to HFP ports so we never grab the
+    // built-in mic or a non-glasses device.
+    for port in inputs where port.portType == .bluetoothHFP {
+      let portName = port.portName.lowercased()
+      if glassesNameHeuristics.contains(where: { portName.contains($0) }) {
+        return port
+      }
+    }
+
+    return nil
+  }
+
+  /// Pin the AVAudioSession input to the Meta glasses' BT HFP port. Called from
+  /// the glasses modes (`.coaching` / `.recording`) so a second connected HFP
+  /// device (e.g. AirPods) can't steal the input route. No-op (leaves iOS
+  /// default routing) when no glasses port is found.
+  private func forceGlassesInputPreferred(_ session: AVAudioSession) {
+    guard let glasses = Self.selectGlassesInput(from: session, names: preferredGlassesNames) else {
+      let available = (session.availableInputs ?? [])
+        .map { "\($0.portName)(\($0.portType.rawValue))" }.joined(separator: ", ")
+      print("[AudioSession] ⚠ No glasses input found to pin (names=\(preferredGlassesNames), available=[\(available)]) — leaving routing to iOS")
+      return
+    }
+    do {
+      try session.setPreferredInput(glasses)
+      print("[AudioSession] glasses input pinned: \(glasses.portName)")
+    } catch {
+      print("[AudioSession] Failed to pin glasses input \(glasses.portName): \(error)")
+    }
   }
 
   /// Pin the AVAudioSession input to the built-in iPhone mic. Called only from
@@ -408,12 +493,13 @@ class AudioSessionManager: ObservableObject {
     if didPrewarm { return }
 
     let capturedMode = mode
+    let capturedNames = preferredGlassesNames
 
     // 1) Move the audio session into our target category off-main so the
     //    main thread keeps rendering the camera preview while
     //    setCategory + setActive + setPreferredInput run.
     await Task.detached(priority: .userInitiated) {
-      Self.configureSessionOffMain(mode: capturedMode)
+      Self.configureSessionOffMain(mode: capturedMode, preferredGlassesNames: capturedNames)
     }.value
 
     // 2) FIRST access of `engine.inputNode` — now the audio session is in
@@ -467,13 +553,14 @@ class AudioSessionManager: ObservableObject {
     guard !isCapturing else { return }
 
     let capturedMode = mode
+    let capturedNames = preferredGlassesNames
 
     // Phase 1 — bring the audio session + input AU into the right state.
     // If `prewarm()` already ran, this is a cheap no-op; otherwise we
     // do the same work synchronously here as a fallback.
     if !didPrewarm {
       await Task.detached(priority: .userInitiated) { [inputNode = self.inputNode] in
-        Self.configureSessionOffMain(mode: capturedMode)
+        Self.configureSessionOffMain(mode: capturedMode, preferredGlassesNames: capturedNames)
         do {
           if capturedMode == .coaching || capturedMode == .coachingPhoneOnly {
             // Same VPIO+HFP bypass as `startCapture`. Display glasses
@@ -500,7 +587,7 @@ class AudioSessionManager: ObservableObject {
     if !ensureValidInputFormat() {
       // One recovery pass: re-run session config + drain.
       await Task.detached(priority: .userInitiated) {
-        Self.configureSessionOffMain(mode: capturedMode)
+        Self.configureSessionOffMain(mode: capturedMode, preferredGlassesNames: capturedNames)
       }.value
       try? await Task.sleep(nanoseconds: 100_000_000)  // 100 ms
       if !ensureValidInputFormat() {
@@ -561,6 +648,7 @@ class AudioSessionManager: ObservableObject {
   private func startEngineWithRetry() async throws {
     let capturedMode = mode
     let capturedEngine = engine
+    let capturedNames = preferredGlassesNames
 
     let firstAttempt: NSError? = await Task.detached(priority: .userInitiated) {
       capturedEngine.prepare()
@@ -583,7 +671,7 @@ class AudioSessionManager: ObservableObject {
     capturedEngine.reset()
 
     await Task.detached(priority: .userInitiated) { [inputNode = self.inputNode] in
-      Self.configureSessionOffMain(mode: capturedMode)
+      Self.configureSessionOffMain(mode: capturedMode, preferredGlassesNames: capturedNames)
       do {
         if capturedMode == .coaching || capturedMode == .coachingPhoneOnly {
           try inputNode.setVoiceProcessingEnabled(true)
@@ -622,7 +710,10 @@ class AudioSessionManager: ObservableObject {
   /// `configureAudioSession()` without touching any `@Published` state, so
   /// it's safe to run off the main actor. `AVAudioSession` APIs are
   /// documented thread-safe.
-  nonisolated private static func configureSessionOffMain(mode: AudioSessionMode) {
+  nonisolated private static func configureSessionOffMain(
+    mode: AudioSessionMode,
+    preferredGlassesNames: [String] = []
+  ) {
     let session = AVAudioSession.sharedInstance()
     do {
       switch mode {
@@ -667,6 +758,19 @@ class AudioSessionManager: ObservableObject {
             try session.setPreferredInput(builtIn)
           } catch {
             print("[AudioSession] Failed to pin built-in mic input: \(error)")
+          }
+        }
+      }
+      if mode == .coaching || mode == .recording {
+        // Glasses modes: prefer the glasses' BT HFP port over any other
+        // connected HFP device. Mirrors `forceGlassesInputPreferred` on the
+        // main-thread path (kept inline here since this is `nonisolated static`).
+        if let glasses = selectGlassesInput(from: session, names: preferredGlassesNames) {
+          do {
+            try session.setPreferredInput(glasses)
+            print("[AudioSession] glasses input pinned (off-main): \(glasses.portName)")
+          } catch {
+            print("[AudioSession] Failed to pin glasses input \(glasses.portName): \(error)")
           }
         }
       }
@@ -1181,10 +1285,35 @@ class AudioSessionManager: ObservableObject {
            .override,
            .categoryChange,
            .routeConfigurationChange:
+        // Glasses modes: if another HFP device (e.g. AirPods connecting
+        // mid-session) grabbed the route, re-pin the glasses input. The
+        // subsequent setPreferredInput re-fires this handler; the
+        // already-pinned guard below makes that a no-op so we don't loop.
+        self.reassertGlassesInputIfNeeded()
         self.rebindMicTapIfCapturing(reason: reasonLabel)
       default:
         break
       }
+    }
+  }
+
+  /// Re-pin the glasses' BT HFP input when in a glasses mode and the current
+  /// input isn't already the glasses. No-op otherwise — including when the
+  /// glasses are already the active input, which breaks the
+  /// setPreferredInput → routeConfigurationChange → re-pin feedback loop.
+  private func reassertGlassesInputIfNeeded() {
+    guard isGlassesMode, isCapturing else { return }
+    let session = AVAudioSession.sharedInstance()
+    guard let glasses = Self.selectGlassesInput(from: session, names: preferredGlassesNames) else {
+      return
+    }
+    let alreadyGlasses = session.currentRoute.inputs.contains { $0.uid == glasses.uid }
+    guard !alreadyGlasses else { return }
+    do {
+      try session.setPreferredInput(glasses)
+      print("[AudioSession] glasses input re-pinned after route change: \(glasses.portName)")
+    } catch {
+      print("[AudioSession] Failed to re-pin glasses input \(glasses.portName): \(error)")
     }
   }
 

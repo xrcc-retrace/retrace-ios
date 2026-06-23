@@ -69,6 +69,14 @@ class CoachingSessionViewModel: GeminiLiveSessionBase {
   private weak var progressStore: LocalProgressStore?
   private var pendingStartingStep: Int?
 
+  // Active/Passive monitoring (read from "activeMonitoringEnabled" at session
+  // start). The Active/Passive toggle is the master switch for proactive
+  // visual monitoring: when false the `[check]` heartbeat is never armed, so
+  // the model gets no silent-period evaluation turns — no visual interjection
+  // and no visual step advance. Captured here so onConnectedExtra() (which also
+  // fires on resumption reconnects) keeps honoring it.
+  private var activeMonitoring = true
+
   // MARK: - Heartbeat
   //
   // Design (see .claude/plans/snappy-singing-harbor.md):
@@ -195,6 +203,18 @@ class CoachingSessionViewModel: GeminiLiveSessionBase {
   var lensProcedureId: String { procedure.id }
   var lensProcedureTitle: String { procedure.title }
   var lensTotalSteps: Int { procedure.steps.count }
+  /// Procedure-level `source_type` (`video` / `manual` / `web`). The lens
+  /// renderer needs it to decide whether a step's reference is a playable
+  /// clip or a static manual-page image. See `StepReferenceMedia`.
+  var lensProcedureSourceType: String? { procedure.sourceType }
+
+  /// Fired when the user confirms exit from the **native lens** exit overlay.
+  /// The host (`CoachingSessionView`) installs the same terminal action its
+  /// own overlay runs — `endSession(progressStore:)` + SwiftUI `dismiss()` —
+  /// because both the progress store and the navigation dismiss live in the
+  /// view layer and aren't reachable from the lens renderer. Mirrors the
+  /// `onBackGesture` bridge pattern.
+  var onExitConfirmed: (() -> Void)?
 
   var formattedSessionDuration: String {
     let elapsed: TimeInterval
@@ -217,7 +237,7 @@ class CoachingSessionViewModel: GeminiLiveSessionBase {
     wearables: WearablesInterface,
     serverBaseURL: String,
     transport: CaptureTransport = .glasses,
-    sessionManager: DeviceSessionManager? = nil
+    sessionManager: DeviceSessionManager
   ) {
     self.procedure = procedure
     self._transport = transport
@@ -300,8 +320,10 @@ class CoachingSessionViewModel: GeminiLiveSessionBase {
   // MARK: - Base overrides (template hooks)
 
   override func mintSession() async throws -> SessionStartPayload {
-    let autoAdvance = UserDefaults.standard.object(forKey: "autoAdvanceEnabled") as? Bool ?? true
-    print("[Coaching] auto_advance = \(autoAdvance) (from UserDefaults)")
+    // Single Active/Passive setting drives both wire flags: Active = monitoring
+    // + auto-advance on; Passive = both off (fully reactive, verbal-only).
+    activeMonitoring = UserDefaults.standard.object(forKey: "activeMonitoringEnabled") as? Bool ?? true
+    print("[Coaching] active_monitoring = \(activeMonitoring) (from UserDefaults; auto_advance follows)")
     let selectedVoice = VoiceSettings.storedVoice()
     print("[Coaching] voice = \(selectedVoice) (from UserDefaults)")
 
@@ -309,7 +331,8 @@ class CoachingSessionViewModel: GeminiLiveSessionBase {
     let response = try await apiService.startLearnerSession(
       procedureId: procedure.id,
       voice: selectedVoice,
-      autoAdvance: autoAdvance,
+      autoAdvance: activeMonitoring,
+      activeMonitoring: activeMonitoring,
       startingStep: pendingStartingStep
     )
     return SessionStartPayload(
@@ -338,6 +361,16 @@ class CoachingSessionViewModel: GeminiLiveSessionBase {
     // Heartbeat arms on every .connected transition (including resumption
     // reconnects). scheduleNextHeartbeat cancels any prior tick before
     // starting, so this is safe to call more than once.
+    //
+    // Passive mode (Active Monitoring off) is the master switch: never arm the
+    // heartbeat, so no `[check]` markers are sent and the model gets no
+    // silent-period evaluation turns — fully reactive, no visual interjection
+    // and no visual advance.
+    guard activeMonitoring else {
+      heartbeatEnabled = false
+      print("[Coaching] passive mode — heartbeat disabled")
+      return
+    }
     heartbeatEnabled = true
     scheduleNextHeartbeat()
   }

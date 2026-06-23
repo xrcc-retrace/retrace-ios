@@ -102,9 +102,9 @@ final class ExpertLensRenderer: LensRenderer {
 
   // MARK: - Subscription wiring
 
-  /// Single CombineLatest3 over the published signals the lens cares about:
-  /// recording state (drives the handoff/tip routing + the timer), tip
-  /// index (carousel), and HUD-active gate (warmup vs recording).
+  /// CombineLatest over the published signals the lens cares about:
+  /// recording state (drives the handoff/tip routing + the timer + the
+  /// warmup gate, bundled as a CombineLatest3) and the tip index (carousel).
   ///
   /// The recording duration is debounced to whole-second granularity in
   /// `projectSnapshot()` — the underlying float fires at ~30 Hz which
@@ -115,15 +115,14 @@ final class ExpertLensRenderer: LensRenderer {
       context.recordingManager.$recordingDuration,
       context.recordingManager.$isWarmingUp
     )
-    Publishers.CombineLatest(
-      recording,
-      context.hudViewModel.$tipIndex
-    )
-    .throttle(for: .milliseconds(120), scheduler: DispatchQueue.main, latest: true)
-    .sink { [weak self] _ in
-      self?.scheduleSend()
-    }
-    .store(in: &cancellables)
+    Publishers.CombineLatest(recording, context.hudViewModel.$tipIndex)
+      .throttle(for: .milliseconds(120), scheduler: DispatchQueue.main, latest: true)
+      .sink { [weak self] _ in
+        // `lastSentSnapshot` equality in `scheduleSend()` suppresses sends
+        // when nothing visible actually changed.
+        self?.scheduleSend()
+      }
+      .store(in: &cancellables)
   }
 
   // MARK: - Snapshot projection
@@ -138,26 +137,9 @@ final class ExpertLensRenderer: LensRenderer {
       totalTips: ExpertCoachingTips.pool.count,
       currentTipTitle: tip.title,
       currentTipBody: tip.body,
-      handTrackingStatusLabel: handTrackingStatusLabel(),
       stopFlowActive: stopFlowActive,
       stopCountdownRemaining: stopCountdownRemaining
     )
-  }
-
-  /// "Hands on" / "Hands off" / "Tracking…" cue. Glasses transport never
-  /// runs hand tracking (per Step 6b.2), so we surface an explicit
-  /// "Neural Band" label there instead of trying to infer status from a
-  /// pipeline that doesn't exist.
-  private func handTrackingStatusLabel() -> String {
-    if context.transport == .glasses {
-      return "Neural Band"
-    }
-    if HandGestureService.isDisabled {
-      return "Hands off"
-    }
-    return HandGestureService.shared.latestHandFrame == nil
-      ? "Tracking…"
-      : "Hands on"
   }
 
   // MARK: - Send pipeline

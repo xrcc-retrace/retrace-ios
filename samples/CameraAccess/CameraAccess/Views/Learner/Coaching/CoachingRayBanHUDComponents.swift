@@ -319,8 +319,13 @@ struct RayBanHUDDetailPanel: View {
   /// Whether the panel should currently render the reference image rather
   /// than the clip: either the Image tab is selected (tabs shown), or this
   /// is an image-only step (no clip but a reference image exists).
+  ///
+  /// An image-only reference (e.g. a manual page — no video clip) always
+  /// renders, even when `referenceImageEnabled` is off: that flag gates the
+  /// experimental Video|Image *tab* feature, not whether a manual procedure
+  /// can show its only reference. Gating it would silently hide the image.
   private var showingImage: Bool {
-    guard referenceImageEnabled, referenceImageURL != nil else { return false }
+    guard referenceImageURL != nil else { return false }
     if showTabs { return mediaTab == .image }
     return clipURL == nil
   }

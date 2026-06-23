@@ -3,7 +3,10 @@ import SwiftUI
 struct OnboardingCoachingStyleView: View {
   let onNext: () -> Void
 
-  @AppStorage("autoAdvanceEnabled") private var autoAdvanceEnabled = true
+  // Single Active/Passive coaching setting (same key the Profile toggle uses).
+  // Active = proactive monitoring + visual auto-advance; Passive = reactive,
+  // verbal-only.
+  @AppStorage("activeMonitoringEnabled") private var activeMonitoringEnabled = true
 
   var body: some View {
     VStack(spacing: 0) {
@@ -27,18 +30,18 @@ struct OnboardingCoachingStyleView: View {
               icon: "waveform",
               name: "Active",
               description: "Gemini speaks up on its own — narrates steps, catches errors as they happen, and advances when you're done.",
-              isSelected: autoAdvanceEnabled
+              isSelected: activeMonitoringEnabled
             ) {
-              autoAdvanceEnabled = true
+              activeMonitoringEnabled = true
             }
 
             CoachingStyleTile(
               icon: "hand.raised.fill",
               name: "Passive",
               description: "Gemini stays quiet until you ask. Best for learners who want to work at their own pace.",
-              isSelected: !autoAdvanceEnabled
+              isSelected: !activeMonitoringEnabled
             ) {
-              autoAdvanceEnabled = false
+              activeMonitoringEnabled = false
             }
           }
           .padding(.horizontal, Spacing.screenPadding)

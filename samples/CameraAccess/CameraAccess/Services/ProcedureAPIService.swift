@@ -107,6 +107,7 @@ class ProcedureAPIService: ObservableObject {
     procedureId: String,
     voice: String,
     autoAdvance: Bool,
+    activeMonitoring: Bool,
     startingStep: Int? = nil
   ) async throws -> LearnerSessionStartResponse {
     guard let url = URL(string: "\(serverBaseURL)/api/learner/session/start") else {
@@ -122,6 +123,7 @@ class ProcedureAPIService: ObservableObject {
       "procedure_id": procedureId,
       "voice": voice,
       "auto_advance": autoAdvance,
+      "active_monitoring": activeMonitoring,
     ]
     if let startingStep {
       body["starting_step"] = startingStep
@@ -219,6 +221,7 @@ class ProcedureAPIService: ObservableObject {
     sessionId: String,
     procedureId: String,
     autoAdvance: Bool,
+    activeMonitoring: Bool,
     voice: String
   ) async throws -> LearnerSessionStartResponse {
     guard let url = URL(string: "\(serverBaseURL)/api/troubleshoot/session/\(sessionId)/handoff") else {
@@ -230,6 +233,7 @@ class ProcedureAPIService: ObservableObject {
     let body: [String: Any] = [
       "procedure_id": procedureId,
       "auto_advance": autoAdvance,
+      "active_monitoring": activeMonitoring,
       "voice": voice,
     ]
     request.httpBody = try JSONSerialization.data(withJSONObject: body)

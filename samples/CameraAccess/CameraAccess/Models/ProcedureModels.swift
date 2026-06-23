@@ -155,6 +155,44 @@ struct ProcedureStepResponse: Codable, Identifiable, Equatable {
   }
 }
 
+// MARK: - Reference media resolution
+
+/// What a step's `clip_url` actually points at. The server returns the
+/// authoritative path — an `.mp4` for video-sourced procedures, a page
+/// `.png` for manual-sourced ones, or nothing. The client must NOT blindly
+/// reconstruct a `.mp4` URL (that 404s for manual/web procedures); it should
+/// resolve the real media type from `clip_url` + the procedure's
+/// `source_type`. This is the single source of truth shared by both lens
+/// surfaces (native glasses lens + on-phone emulator).
+enum StepReferenceMedia: Equatable {
+  case video(URL)   // playable clip — tap to play full-screen
+  case image(URL)   // static reference image (manual page) — show, don't play
+  case none         // no reference media for this step
+}
+
+extension ProcedureStepResponse {
+  /// Resolve this step's reference media from its `clip_url` and the parent
+  /// procedure's `source_type`. `baseURL` prefixes server-relative paths
+  /// (the server emits `/api/...`; absolute `http(s)` URLs pass through).
+  ///
+  /// Mirrors the gating already used by `ProcedureChapterDetailContent`
+  /// (`hasPlayableVideo` / `inlineManualImageURL`) and `PiPReferenceView`
+  /// (`isImage`) so all surfaces agree on video-vs-image.
+  func referenceMedia(sourceType: String?, baseURL: String) -> StepReferenceMedia {
+    guard let path = clipUrl, !path.isEmpty else { return .none }
+    let absolute = path.hasPrefix("http") ? path : baseURL + path
+    guard let url = URL(string: absolute) else { return .none }
+    let ext = (path as NSString).pathExtension.lowercased()
+    if ext == "mp4" || (sourceType ?? "video").lowercased() == "video" {
+      return .video(url)
+    }
+    if ["png", "jpg", "jpeg"].contains(ext) {
+      return .image(url)
+    }
+    return .none
+  }
+}
+
 // MARK: - List response (lighter model from GET /api/procedures)
 
 struct ProcedureListItem: Codable, Identifiable {

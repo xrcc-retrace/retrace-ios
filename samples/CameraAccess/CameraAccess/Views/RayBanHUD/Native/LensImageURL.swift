@@ -21,7 +21,7 @@ import Foundation
 @MainActor
 enum LensImageURL {
   /// JPEG poster for a procedure step's clip — used as the thumbnail
-  /// in coaching's `.referenceExpanded` lens surface (Step 7 adds the
+  /// in coaching's `.referenceInline` lens surface (Step 7 adds the
   /// backend route at `GET /api/clips/{id}/step_{n}.jpg`).
   static func clipPosterURL(procedureId: String, stepIndex: Int) -> String? {
     guard !procedureId.isEmpty else { return nil }

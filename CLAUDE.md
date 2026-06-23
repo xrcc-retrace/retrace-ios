@@ -25,7 +25,7 @@ The backend server lives in a separate repo (`main-local-server-test`). See the 
 
 ## Prerequisites
 
-- iOS 17.0+, Xcode 15+
+- iOS 17.0+ (app deployment target), Xcode 16+ (the project is `objectVersion = 70`; CI builds on `latest-stable` ≈ Xcode 26.x)
 - The Retrace backend running on the same Wi-Fi
 - A Meta developer account with Developer Mode enabled, plus the Meta AI app installed (for DAT SDK registration)
 - Ray-Ban Meta glasses are **optional** — `MockDeviceKit` works without hardware in DEBUG builds, and the full app runs end-to-end on iPhone alone.
@@ -43,7 +43,14 @@ open samples/CameraAccess/CameraAccess.xcodeproj
 
 ### Server discovery
 
-The app runs an `NWBrowser` on Bonjour (`_retrace._tcp`) and auto-discovers the backend when it's on the same Wi-Fi. A "Server Connected" toast appears on discovery. Manual override lives behind the gear icon on the mode selector (**Server Settings**) — stored in `UserDefaults` under `"serverBaseURL"`. Default fallback: `http://192.168.1.100:8000`.
+`Services/ServerEndpoint.swift` resolves the backend through a 4-mode priority chain (`Mode`: `.auto` / `.local` / `.cloud` / `.custom`):
+
+- `.local` / `.auto` — `NWBrowser` Bonjour discovery (`_retrace._tcp`) on the same Wi-Fi; a "Server Connected" toast appears on discovery.
+- `.cloud` — a compiled-in HTTPS URL `https://retracexrcc.duckdns.org` (`ServerEndpoint.cloudBaseURL`), for use off the LAN.
+- `.custom` — a manual override entered behind the gear icon on the mode selector (**Server Settings**).
+- LAN fallback when nothing resolves: `http://192.168.1.100:8000` (`lanFallbackURL`).
+
+The resolved value is mirrored back into `UserDefaults["serverBaseURL"]` for legacy callers, so old code that reads that key still works.
 
 ### Mock device (no glasses required)
 
@@ -80,7 +87,8 @@ Manual fallback: GitHub Actions UI → **TestFlight Deploy** → **Run workflow*
 
 ### App identity
 
-- **Bundle ID:** `com.xrcc.retrace.ios.v1`
+- **Bundle ID (CI / signing / App Store Connect):** `com.xrcc.retrace.ios.v1` — used by Fastlane (`Fastfile`, `Matchfile`, `Appfile`) and the ASC record.
+- ⚠️ **The local `project.pbxproj` checks in `com.xrccart.retrace.ios.v1`** (note the extra `art`) for the `CameraAccess` target. CI's `update_code_signing_settings` rewrites it to the `com.xrcc.*` id at archive time, so the divergence is invisible to TestFlight but real for local UI-build signing. Don't "fix" one side without reconciling both. Two build configs also carry an orphaned `com.retrace.xrcc.v1.display` id with `CODE_SIGN_STYLE = Manual` — there is no `display` native target, it's leftover; ignore it.
 - **Team ID:** `V56DG94ZL5`
 - **App Store Connect record:** Retrace, SKU `retrace-ios-2026`
 
@@ -95,7 +103,7 @@ This is intentional. Pushing tags is safe — it cannot accidentally distribute 
 
 ### Required Build Phase: "Patch MediaPipeTasksVision Info.plist"
 
-The `SwiftTasksVision` SPM package's `MediaPipeTasksVision.framework` ships with a malformed `Info.plist` (missing `CFBundleVersion`, `CFBundleShortVersionString`, `MinimumOSVersion`). App Store validation rejects any build containing it. The Run Script Build Phase positioned **after** Embed Frameworks patches the plist and re-signs the framework. Do not delete or reorder this build phase — every TestFlight build needs it.
+The `SwiftTasksVision` SPM package (`github.com/paescebu/SwiftTasksVision.git`, pinned `0.10.21`)'s `MediaPipeTasksVision.framework` ships with a malformed `Info.plist` (missing `CFBundleVersion`, `CFBundleShortVersionString`, `MinimumOSVersion`). App Store validation rejects any build containing it. The "Patch MediaPipeTasksVision Info.plist" Run Script Build Phase, positioned **after** Embed Frameworks, uses `PlistBuddy` to add those keys (hard-coded `0.10.21` / `MinimumOSVersion 17.0`) and re-signs the framework. Do not delete or reorder this build phase — every TestFlight build needs it. Bump the hard-coded version string if you bump the package.
 
 ### Common failure modes
 
@@ -140,7 +148,7 @@ Record a procedure end-to-end from the glasses or the iPhone, review the raw cap
 - **Discover** — all procedures from the server.
 - **Library** — saved + in-progress procedures, tracked locally via `LocalProgressStore`.
 - **Progress** — session history (completed / abandoned / in-progress).
-- **Profile** — voice picker with audio previews fetched from the server (`/api/learner/voices`), plus an auto-advance toggle.
+- **Profile** — voice picker with audio previews fetched from the server (`/api/learner/voices`), plus a single **Active Monitoring** toggle (`activeMonitoringEnabled`). Active = the coaching VM arms the `[check]` heartbeat, the AI watches for mistakes and auto-advances on visual completion; Passive = no heartbeat, fully reactive, verbal-only. The single toggle drives both wire flags (`active_monitoring` + `auto_advance`, always equal) in the `/api/learner/session/start` body; the heartbeat itself is gated in `CoachingSessionViewModel.onConnectedExtra()`.
 - **Coaching** — the headline flow. Gemini Live voice coaching with PiP reference-clip overlay, activity feed (learner transcripts, AI replies, tool calls), mute, and live connection status.
 - **Troubleshoot** (`Views/Troubleshoot/`) — Parallel Live session backed by `/api/troubleshoot/*`. `TroubleshootSessionView` + `DiagnosticSessionViewModel` orchestrate the diagnose-then-coach flow: user describes a broken product, Gemini issues `identify_product` → `confirm_identification`, then `search_procedures`; on no-match the model calls `web_search_for_fix` (returns a procedure with cited sources) and finally `handoff_to_learner` to spawn a normal coaching session. Includes `DiagnosticPhaseBar`, `DiagnosticResolutionPanel`, `ManualUploadSheet`, `TroubleshootConfirmOverlay`, `TroubleshootPageHandler`, and HUD `Pages/`.
 
@@ -175,7 +183,7 @@ The HUD reads `HandGestureService.$state` to drive focus rings, the recede-and-a
 
 - `Utils/IPhoneCameraCapture.swift` wraps `AVCaptureSession` (720×1280 portrait — matches the glasses stream geometry so the writer settings work unchanged).
 - `ViewModels/IPhoneExpertRecordingViewModel.swift` drives the recording path.
-- `ViewModels/IPhoneCoachingCameraSource.swift` throttles sample buffers to ≈0.5 fps JPEG for the coaching path, matching the glasses frame rate so the token budget is the same.
+- `ViewModels/IPhoneCoachingCameraSource.swift` throttles sample buffers to ≈1 fps JPEG (`videoMinInterval = 1.0 s`, quality 0.85) for the coaching path, matching the glasses frame rate so the token budget is the same.
 - Audio is forced onto the built-in mic + loudspeaker.
 
 ### AudioSessionManager modes
@@ -211,18 +219,42 @@ The HUD reads `HandGestureService.$state` to drive focus rings, the recede-and-a
 - `forceRefresh(handle: String? = nil)` is called on auth errors or before a resumption-aware reconnect. Dedups concurrent callers via a `Task<EphemeralTokenResponse, Error>?`.
 - Passes `?handle=...` to the server's token endpoint so the new token carries `SessionResumptionConfig(handle=...)`.
 
+## Lens (on-glasses Display) subsystem
+
+There are **two parallel lens surfaces**, both driven off the same per-flow view models:
+
+1. **On-phone emulator** — `Views/RayBanHUD/RayBanHUDEmulator` + pages, with hover/swipe input via `HUDInputEngine`. This is what you see rendered over the live camera on the iPhone.
+2. **Real native lens** — actual `MWDATDisplay` output on the glasses, via a `FlexBox`/`VideoPlayer` tree:
+
+```
+per-flow VM ──► LensSession (Services/Lens, dispatcher; @AppStorage("lensOutputEnabled")-gated)
+                   │
+                   ▼
+            *LensRenderer  (Coaching / Expert / Troubleshoot, in Views/RayBanHUD/Native/Renderers)
+                   │  builds pure *LensTrees (FlexBox / VideoPlayer)
+                   ▼
+            LensDisplayCoordinator  (ViewModels — owns the Display capability, lazy-attach, pendingAction queue)
+                   │
+                   ▼
+            DeviceSessionManager  (consumer "lens")
+```
+
+- `LensDisplayCoordinator` is the **`"lens"` Display consumer** of `DeviceSessionManager`. With the `deviceSessionManagerEnabled` debug toggle ON it calls `acquire(consumerLabel: "lens", requirements: .requiresDisplay)` + `session.addDisplay()`, sharing one `DeviceSession` with the camera consumer (`"gemini-live"`); OFF it falls back to inline `wearables.createSession`. The DSM consumers in use are `"expert"`, `"gemini-live"`, and `"lens"`.
+- Support types in `Views/RayBanHUD/Native/`: `LensIconMap` (SF Symbol → DAT 0.7's fixed 127-icon set), `LensImageURL` (HTTPS URIs for `MWDATDisplay.Image`/`VideoPlayer`, reads `ServerEndpoint` — the lens can't take raw frames, so it pulls server URLs like the `/api/clips/.../step_n.jpg` poster), `LensSnapshot` (Equatable value snapshots so `.removeDuplicates()` cuts BT traffic), `LensComponents`.
+- **Both native paths are OFF by default**, behind the `lensOutputEnabled` + `deviceSessionManagerEnabled` toggles in **Server Settings → Debug**. `Info.plist`'s `MWDAT.DAMEnabled = true` is load-bearing — without it `MWDATDisplay.capability.start()` silently no-ops.
+
 ## Project Layout
 
 ```
 samples/CameraAccess/
 ├── CameraAccess.xcodeproj
 ├── CameraAccess/
-│   ├── CameraAccessApp.swift          # Wearables.configure(), BonjourDiscovery.start, UI-test MockDeviceKit auto-wire
+│   ├── CameraAccessApp.swift          # Wearables.configure(); injects DeviceSessionManager / LensDisplayCoordinator / LensSession as @StateObjects; RetraceAppDelegate (@UIApplicationDelegateAdaptor) + AppOrientationController; URLCache install; Bonjour tied to scenePhase; UI-test MockDeviceKit auto-wire
 │   ├── Info.plist                     # MWDAT, mic, camera, Bonjour (_retrace._tcp), photos, entitlements
 │   ├── CameraAccess.entitlements
 │   ├── Assets.xcassets
 │   ├── TestResources/                 # plant.mp4, plant.png for MockDeviceKit
-│   ├── Resources/                     # Bundled fonts, icons, lottie/animation assets
+│   ├── Resources/                     # Fonts/ (Golos + Inter TTFs) and Models/hand_landmarker.task (MediaPipe hand-pose model)
 │   ├── DiamondLogoDither.metal        # Custom shader used by the splash + brand surfaces
 │   ├── HandTracking/                  # Hand-pose substrate for HUD hover-then-select
 │   │   ├── HandLandmarkerService.swift
@@ -238,10 +270,16 @@ samples/CameraAccess/
 │   │   └── ProcedureModels.swift      # Codable mirrors of server models (procedures, steps, session, voices, SessionRecord)
 │   ├── Services/
 │   │   ├── BonjourDiscovery.swift     # NWBrowser for _retrace._tcp; caches serverBaseURL
+│   │   ├── ServerEndpoint.swift       # 4-mode backend resolver (.auto/.local/.cloud/.custom) + compiled-in cloud URL; mirrors result to UserDefaults["serverBaseURL"]
 │   │   ├── GeminiLiveService.swift    # Direct WebSocket, binary-frame JSON sniffing, resumption, barge-in, tool plumbing
 │   │   ├── GeminiTokenManager.swift   # actor — force-refresh with optional resumption handle, concurrent-caller dedup
 │   │   ├── LocalProgressStore.swift   # Saved procedures + session history (UserDefaults)
 │   │   ├── ProcedureAPIService.swift  # REST client for /api/procedures and /api/learner
+│   │   ├── CompletionFeedback.swift / WorkflowPlaybackAudioSession.swift
+│   │   ├── Lens/                      # On-glasses MWDATDisplay rendering — see "Lens (on-glasses Display) subsystem" below
+│   │   │   ├── LensSession.swift          # Top-level dispatcher; @AppStorage("lensOutputEnabled")-gated
+│   │   │   ├── LensFlow.swift             # enum: .idle/.coaching/.troubleshoot/.expert/.handoffToPhone
+│   │   │   └── LensRendererProtocol.swift
 │   │   └── VoicePreviewPlayer.swift
 │   ├── Utils/
 │   │   ├── AudioSessionManager.swift  # Four modes (coaching / coachingPhoneOnly / recording / recordingPhoneOnly)
@@ -254,7 +292,8 @@ samples/CameraAccess/
 │   │   ├── StreamSessionViewModel.swift       # glasses stream preview
 │   │   ├── IPhoneExpertRecordingViewModel.swift
 │   │   ├── IPhoneCoachingCameraSource.swift
-│   │   ├── GeminiLiveSessionBase.swift        # Shared base — token lifecycle, reconnect-on-goAway, setup-complete gate. Used by Coaching + Diagnostic VMs.
+│   │   ├── GeminiLiveSessionBase.swift        # Shared base — token lifecycle, reconnect-on-goAway, setup-complete gate, JPEG frame throttle (videoMinInterval 1.0s / videoJpegQuality 0.85), pendingToolCallIds, cameraLifecycleTask. Used by Coaching + Diagnostic VMs.
+│   │   ├── LensDisplayCoordinator.swift       # Owns the DAT Display capability (the "lens" DeviceSessionManager consumer); lazy-attach, pendingAction queue, requiresDATAppUpdate. See Lens subsystem below.
 │   │   ├── CoachingSessionViewModel.swift     # the big one — Gemini Live orchestration, transport switch, transcripts, tool calls, resumption
 │   │   ├── DiagnosticSessionViewModel.swift   # Troubleshoot-mode Live session. Forwards tool calls to /api/troubleshoot/*; on handoff_to_learner, transitions into a fresh coaching session.
 │   │   ├── DiscoverViewModel.swift
@@ -270,12 +309,12 @@ samples/CameraAccess/
 │       ├── RegistrationView.swift
 │       ├── ServerSettingsView.swift   # Manual serverBaseURL override + glasses pairing management
 │       ├── DebugMenuView.swift
-│       ├── StreamView.swift / NonStreamView.swift / IPhoneCameraPreview.swift / PhotoPreviewView.swift / ExpertRecordingReviewView.swift  # Capture-side primitives reused by Expert + Coaching
+│       ├── IPhoneCameraPreview.swift / PhotoPreviewView.swift / ExpertRecordingReviewView.swift  # Capture-side primitives reused by Expert + Coaching (StreamView/NonStreamView were removed)
 │       ├── Components/                # CardView, CategoryChip, ModeCard, StepProgressBar, GlassPanelModifier, etc.
 │       ├── Onboarding/                # OnboardingContainerView + Screens/ + Components/ — first-launch flow
-│       ├── RayBanHUD/                 # Lens design system — see DESIGN.md before touching lens UI
+│       ├── RayBanHUD/                 # Lens design system — see DESIGN.md before touching lens UI. RayBanHUDEmulator/View/HUDInputEngine = the on-phone SwiftUI emulator; Native/ (LensComponents, LensIconMap, LensImageURL, LensSnapshot, Renderers/) = the real MWDATDisplay FlexBox tree builders
 │       ├── Troubleshoot/              # TroubleshootSessionView, TroubleshootIntroView, DiagnosticPhaseBar, DiagnosticResolutionPanel, ManualUploadSheet, TroubleshootConfirmOverlay, TroubleshootPageHandler, Pages/, Components/
-│       ├── Expert/                    # ExpertTabView, RecordTabView, IPhoneRecordingView, WorkflowListView, ProcedureDetailView, ProcedureEditView, StepEditView
+│       ├── Expert/                    # ExpertTabView, RecordTabView, IPhoneRecordingView, WorkflowListView, ProcedureDetailView, ProcedureEditView, StepEditView, ExpertManualUploadSheet + PDFPreviewView (PDF → SOP via /api/expert/manuals), ProcedureReviewView, HUD/ (lens recording chrome)
 │       ├── MockDeviceKit/
 │       └── Learner/
 │           ├── LearnerTabView.swift
@@ -283,7 +322,7 @@ samples/CameraAccess/
 │           ├── Discover/              DiscoverView.swift
 │           ├── Library/               LibraryView.swift
 │           ├── Coaching/              CoachingSessionView.swift, PiPReferenceView.swift
-│           ├── Profile/               ProfileView.swift, VoiceSelectionView.swift
+│           ├── Profile/               ProfileView.swift, VoiceSelectionView.swift, GlassesSettingsView.swift, ServerSettingsDetailView.swift, TechnicianBadgeView.swift
 │           └── Progress/              LearnerProgressView.swift
 ├── CameraAccessTests/
 └── CameraAccessUITests/
@@ -323,10 +362,12 @@ Already configured:
 - `NSCameraUsageDescription` — iPhone capture path + coaching camera.
 - `NSMicrophoneUsageDescription` — expert narration + AI coaching.
 - `NSLocalNetworkUsageDescription` + `NSBonjourServices = ["_retrace._tcp"]` — server discovery.
-- `NSPhotoLibraryAddUsageDescription` — save captured photos.
-- `UIBackgroundModes = ["bluetooth-peripheral", "external-accessory"]` — DAT glasses stay connected in background.
+- `NSPhotoLibraryAddUsageDescription` (save captured photos) + `NSPhotoLibraryUsageDescription` (read, for uploading existing videos).
+- `UIBackgroundModes = ["bluetooth-central", "bluetooth-peripheral", "external-accessory", "processing"]` — DAT glasses stay connected in background.
 - `UISupportedExternalAccessoryProtocols = ["com.meta.ar.wearable"]`.
-- Portrait-only on iPhone.
+- `MWDAT` dict with `DAMEnabled = true` — Display Access Mode; **load-bearing** for the native lens. Without it `MWDATDisplay.capability.start()` silently no-ops.
+- `CFBundleURLTypes` (`cameraaccess://` scheme), `UIAppFonts` (Golos + Inter).
+- **Not portrait-only:** `UISupportedInterfaceOrientations = [Portrait, LandscapeLeft, LandscapeRight]`; `Utils/AppOrientationController.swift` manages orientation dynamically per screen.
 
 ## REQUIRED: Adding new Swift files to the Xcode project
 
@@ -391,6 +432,6 @@ When you ship a new pattern, **update the doc** so it stays authoritative.
 - **Don't reuse ephemeral tokens.** Google documents `uses=1`. Every retry and resumption path mints a new one. If an initial handshake fails, call `tokenManager.forceRefresh()` before retry.
 - **Teardown order in `stopGeminiLiveSession` matters.** Close send gate → drop Combine subs → stop audio capture → disconnect Gemini → null the service. Any other order causes "notConnected" spam or a racy `onAudioData` into a deallocated manager.
 - **Room-tone on mic start.** The first few mic buffers can be silent — `AudioSessionManager` has diagnostics for this. If you see "silent mic" warnings, check `AudioSessionMode` is correct for the transport.
-- **JPEG sent from glasses path is driven off the DAT video publisher.** One frame decodes to `UIImage` → `jpegData(compressionQuality: 0.5)` → WebSocket. Keep the 2 s throttle + quality 0.5 unless you re-run the token-budget math.
+- **JPEG sent from glasses path is driven off the DAT video publisher.** Each frame is encoded straight from the pixel buffer via `CIContext.jpegRepresentation(...)` (no `UIImage` round-trip) at `videoJpegQuality = 0.85`, throttled to `videoMinInterval = 1.0 s` (≈1 fps) — both constants live on `GeminiLiveSessionBase`. Re-run the token-budget math before changing the interval or quality.
 - **HUD confirm registrations are token-stamped.** `HUDHoverCoordinator.registerConfirm` returns a `UUID`; `unregisterConfirm(id:token:)` is gated on it. SwiftUI fires the new view's `.onAppear` before the old view's `.onDisappear` during page transitions, so an unkeyed unregister would wipe the new page's freshly-installed closure whenever two pages share a `HUDControl` id (e.g. `.diagnosticToggleMute` / `.diagnosticExit` on every Troubleshoot page). Failure mode is asymmetric and easy to miss: touch tap keeps working (it captures `onConfirm` directly via `.onTapGesture`) while pinch-select / voice-select silently no-ops on every page after the first. If you ever stand up a parallel id-keyed registry, mirror the token pattern.
 - **HUD handler-stack pushes are token-stamped too.** `HUDHoverCoordinator.push` returns a `UUID`; `pop(token:)` is a no-op for stack removal *and* for `hovered` re-anchoring unless that token is currently topmost. Same lifecycle ordering means an outgoing page's pop can race an incoming overlay's push: without the topmost guard, the page's pop stomps the overlay's freshly-set `hovered` (e.g. `.confirmIdentification`) and pinch-select fires whatever the page had selected before the overlay opened (`.diagnosticToggleMute`). Same asymmetric failure as the confirm-registry version — touch tap is fine, pinch / voice select goes to the wrong control. The `.hudInputHandler { … }` modifier is the only call-site of `push` / `pop`; preserve that contract instead of letting overlays hand-roll `.onAppear { hovered = … }`.

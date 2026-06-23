@@ -14,13 +14,13 @@
 // result is dispatched to the lens. Animations are SDK-decided.
 //
 // Surfaces handled here (per the original plan inventory):
-//   1. Step page — .collapsed
-//   2. Step page — .referenceExpanded
-//   3. Step page — .insightsExpanded
-//   4. Step page — .stepExpanded (paginated description)
-//   5. Step completion celebration (1.5s window)
-//   6. Completion page
-//   7. Exit confirmation overlay
+//   1. Step page — .collapsed / .referenceInline / .insightsInline
+//      (one tree; the clip / insights panel expands INLINE beneath a
+//       truncated step card — there is no separate reference/insights page)
+//   2. Step page — .stepExpanded (paginated description)
+//   3. Step completion celebration (1.5s window)
+//   4. Completion page
+//   5. Exit confirmation overlay
 //
 // Tree-order = focus-order: the FIRST tappable element in the tree
 // receives default focus from the SDK's Captouch/Neural Band traversal.
@@ -45,6 +45,7 @@ struct CoachingLensCallbacks {
   let onMuteToggle: @Sendable () -> Void
   let onExit: @Sendable () -> Void
   let onReferenceClipTap: () -> Void
+  let onRetryClip: () -> Void
   let onCompletionExit: @Sendable () -> Void
   let onExitConfirmCancel: () -> Void
   let onExitConfirmConfirm: () -> Void
@@ -71,148 +72,165 @@ enum CoachingLensTrees {
       return completionTree(snapshot: s, callbacks: cb)
     case .step:
       switch s.expansion {
-      case .collapsed:          return collapsedStepTree(snapshot: s, callbacks: cb)
-      case .referenceExpanded:  return referenceExpandedTree(snapshot: s, callbacks: cb)
-      case .insightsExpanded:   return insightsExpandedTree(snapshot: s, callbacks: cb)
-      case .stepExpanded:       return stepExpandedTree(snapshot: s, callbacks: cb)
+      // `.collapsed`, `.referenceInline`, and `.insightsInline` are all the
+      // SAME page — the reference clip / insights panel expands inline under
+      // a truncated step card rather than swapping to a separate surface.
+      // `collapsedStepTree` differentiates internally on `s.expansion`.
+      case .collapsed, .referenceInline, .insightsInline:
+        return collapsedStepTree(snapshot: s, callbacks: cb)
+      case .stepExpanded:
+        return stepExpandedTree(snapshot: s, callbacks: cb)
       }
     }
   }
 
-  // MARK: - 1. Collapsed step page
+  // MARK: - 1. Step page — collapsed / reference-inline / insights-inline
 
+  /// The canonical learner surface. One tree drives three states, with a
+  /// single content slot directly under the top band:
+  ///
+  ///   • `.collapsed`        — top band + step card + audio row
+  ///   • `.referenceInline`  — the clip/image panel REPLACES the step card
+  ///                           (card removed entirely; Reference pill → "Hide ref")
+  ///   • `.insightsInline`   — the insights panel REPLACES the step card
+  ///                           (card removed entirely; Insights pill → "Hide insights")
+  ///
+  /// Reference and Insights pills sit on OPPOSITE ends of the top band
+  /// (Reference left, Insights right) via a `flexGrow(1)` spacer — the
+  /// DAT `Alignment` enum has no `spaceBetween`, but `FlexBox.flexGrow`
+  /// exists, so an empty grow-spacer pushes the two pills apart. This
+  /// mirrors the on-phone emulator (`CoachingStepPage.topAffordances`).
   static func collapsedStepTree(
     snapshot s: CoachingLensSnapshot,
     callbacks cb: CoachingLensCallbacks
   ) -> FlexBox {
-    FlexBox(
+    let referenceOpen = s.expansion == .referenceInline
+    let insightsOpen = s.expansion == .insightsInline
+
+    return FlexBox(
       direction: MWDATDisplay.Direction.column,
       spacing: 8,
       alignment: .start,
       crossAlignment: .stretch
     ) {
-      // Top toggle pills row (only if their content exists)
-      if s.hasClip || !s.insights.isEmpty {
+      // Top band — Reference / Insights as opposite-end pills. Active pill
+      // shows an icon/label swap ("Hide …" + .x), because the native DSL
+      // `Background` enum is only `.none`/`.card` (no white-fill active state).
+      //
+      // Default focus: the DAT DSL exposes NO focus API (verified — no
+      // defaultFocus/initialFocus/selected). The SDK gives default focus to
+      // the FIRST tappable element in TREE order. So when Insights is open we
+      // emit its pill FIRST and flip the row to `.rowReverse` — that keeps it
+      // rendered on the right while making "Hide insights" the default-focused
+      // control so the user can immediately toggle it back off. Reference
+      // already gets default focus when collapsed/open (it's emitted first).
+      if s.hasReference || !s.insights.isEmpty {
         FlexBox(
-          direction: MWDATDisplay.Direction.row,
+          direction: insightsOpen ? MWDATDisplay.Direction.rowReverse : MWDATDisplay.Direction.row,
           spacing: 8,
           alignment: .start,
           crossAlignment: .center
         ) {
-          if s.hasClip {
-            togglePill(
-              icon: .videoCamera,
-              label: "Reference",
-              onTap: cb.onToggleReference
-            )
-          }
-          if !s.insights.isEmpty {
-            togglePill(
-              icon: .exclamationTriangle,
-              label: "Insights",
-              onTap: cb.onToggleInsights
-            )
-          }
-        }
-      }
-
-      // Step card — onTap expands to .stepExpanded
-      LensComponents.cardPanel(spacing: 8, padding: 14) {
-        Text("STEP \(s.stepIndex + 1) OF \(s.totalSteps)", style: .meta, color: .secondary)
-        Text(s.stepTitle, style: .heading, color: .primary)
-        Text(LensComponents.truncate(s.stepDescription, max: 180), style: .body, color: .primary)
-      }
-      .onTap(cb.onExpandStep)
-
-      LensComponents.audioActionRow(
-        isMuted: s.isMuted,
-        onMute: cb.onMuteToggle,
-        onExit: cb.onExit
-      )
-    }
-    .padding(12)
-  }
-
-  // MARK: - 2. Reference expanded
-
-  static func referenceExpandedTree(
-    snapshot s: CoachingLensSnapshot,
-    callbacks cb: CoachingLensCallbacks
-  ) -> FlexBox {
-    FlexBox(
-      direction: MWDATDisplay.Direction.column,
-      spacing: 8,
-      alignment: .start,
-      crossAlignment: .stretch
-    ) {
-      // "Hide ref" dismiss pill
-      togglePill(icon: .x, label: "Hide ref", onTap: cb.onCollapse)
-
-      // Clip thumbnail panel — tap to play full-screen (Step 7 wires the video handoff)
-      LensComponents.cardPanel(spacing: 8, padding: 12) {
-        if let posterURI = s.clipPosterURL {
-          Image(uri: posterURI, sizePreset: .fill, cornerRadius: .medium)
-        } else {
-          // Fallback when poster route hasn't been deployed yet — just text.
-          Text("Reference clip", style: .heading, color: .primary)
-        }
-        Text("Tap to play full-screen", style: .meta, color: .secondary)
-      }
-      .onTap(cb.onReferenceClipTap)
-
-      // Compact step header
-      LensComponents.cardPanel(spacing: 4, padding: 12) {
-        Text("STEP \(s.stepIndex + 1) OF \(s.totalSteps)", style: .meta, color: .secondary)
-        Text(s.stepTitle, style: .body, color: .primary)
-      }
-
-      LensComponents.audioActionRow(
-        isMuted: s.isMuted,
-        onMute: cb.onMuteToggle,
-        onExit: cb.onExit
-      )
-    }
-    .padding(12)
-  }
-
-  // MARK: - 3. Insights expanded
-
-  static func insightsExpandedTree(
-    snapshot s: CoachingLensSnapshot,
-    callbacks cb: CoachingLensCallbacks
-  ) -> FlexBox {
-    FlexBox(
-      direction: MWDATDisplay.Direction.column,
-      spacing: 8,
-      alignment: .start,
-      crossAlignment: .stretch
-    ) {
-      togglePill(icon: .x, label: "Hide insights", onTap: cb.onCollapse)
-
-      LensComponents.cardPanel(spacing: 8, padding: 14) {
-        Text("INSIGHTS", style: .meta, color: .secondary)
-        if s.insights.isEmpty {
-          Icon(name: .exclamationTriangle, style: .outline)
-          Text("No insights", style: .heading, color: .primary)
-          Text("Just follow the step instructions.", style: .body, color: .secondary)
-        } else {
-          for item in s.insights {
-            FlexBox(
-              direction: MWDATDisplay.Direction.row,
-              spacing: 6,
-              alignment: .start,
-              crossAlignment: .start
-            ) {
-              Text("•", style: .body, color: .primary)
-              Text("\(item.category): \(item.text)", style: .body, color: .primary)
+          if insightsOpen {
+            // Insights pill FIRST → default focus on "Hide insights".
+            // rowReverse renders it on the right; Reference falls to the left.
+            togglePill(icon: .x, label: "Hide insights", onTap: cb.onToggleInsights)
+            growSpacer()
+            if s.hasReference {
+              togglePill(
+                icon: s.referenceIsVideo ? .videoCamera : .eye,
+                label: "Reference",
+                onTap: cb.onToggleReference
+              )
+            }
+          } else {
+            // Normal order: Reference first (→ default focus), Insights right.
+            if s.hasReference {
+              togglePill(
+                // Closed: video → camera glyph, image → eye glyph. Open: dismiss.
+                icon: referenceOpen ? .x : (s.referenceIsVideo ? .videoCamera : .eye),
+                label: referenceOpen ? "Hide ref" : "Reference",
+                onTap: cb.onToggleReference
+              )
+            }
+            growSpacer()
+            if !s.insights.isEmpty {
+              togglePill(icon: .exclamationTriangle, label: "Insights", onTap: cb.onToggleInsights)
             }
           }
         }
       }
 
-      LensComponents.cardPanel(spacing: 4, padding: 12) {
-        Text("STEP \(s.stepIndex + 1) OF \(s.totalSteps)", style: .meta, color: .secondary)
-        Text(s.stepTitle, style: .body, color: .primary)
+      // Content slot (directly under the top band). Mutually exclusive:
+      // the open panel REPLACES the step card in this same position — the
+      // card is removed entirely, not truncated or pushed down.
+      if referenceOpen {
+        // Reference panel: a load error, a playable video clip, or a
+        // static image — whichever the step has.
+        if let errorMsg = s.clipErrorMessage {
+          // Visible failure instead of a silent no-op. "Try again" re-renders
+          // the playable poster so the user can retap (LensSession logs why).
+          LensComponents.cardPanel(spacing: 8, padding: 14) {
+            Icon(name: .exclamationTriangle, style: .outline)
+            Text(errorMsg, style: .heading, color: .primary)
+            togglePill(icon: .twoArrowsClockwise, label: "Try again", onTap: cb.onRetryClip)
+          }
+        } else if s.referenceIsVideo {
+          // Playable clip — tap hands off to the full-screen VideoPlayer.
+          LensComponents.cardPanel(spacing: 8, padding: 12) {
+            if let posterURI = s.referencePosterURL {
+              Image(uri: posterURI, sizePreset: .fill, cornerRadius: .medium)
+            } else {
+              // Poster route unreachable (e.g. LAN http) — text fallback.
+              Text("Reference clip", style: .heading, color: .primary)
+            }
+            Text("Tap to play full-screen", style: .meta, color: .secondary)
+          }
+          .onTap(cb.onReferenceClipTap)
+        } else {
+          // Static reference image (manual page) — show, don't play.
+          // The step card is gone while this panel is open, so the caption
+          // carries the step title to re-anchor the user (was a redundant
+          // "Reference image" label).
+          LensComponents.cardPanel(spacing: 8, padding: 12) {
+            if let imageURI = s.referencePosterURL {
+              Image(uri: imageURI, sizePreset: .fill, cornerRadius: .medium)
+            } else {
+              Text(s.stepTitle, style: .heading, color: .primary)
+            }
+            Text(s.stepTitle, style: .body, color: .primary)
+          }
+        }
+      } else if insightsOpen {
+        // Insights panel replaces the step card.
+        LensComponents.cardPanel(spacing: 8, padding: 14) {
+          Text("INSIGHTS", style: .meta, color: .secondary)
+          if s.insights.isEmpty {
+            Icon(name: .exclamationTriangle, style: .outline)
+            Text("No insights", style: .heading, color: .primary)
+            Text("Just follow the step instructions.", style: .body, color: .secondary)
+          } else {
+            for item in s.insights {
+              FlexBox(
+                direction: MWDATDisplay.Direction.row,
+                spacing: 6,
+                alignment: .start,
+                crossAlignment: .start
+              ) {
+                Text("•", style: .body, color: .primary)
+                Text("\(item.category): \(item.text)", style: .body, color: .primary)
+              }
+            }
+          }
+        }
+      } else {
+        // Collapsed: the full step card (tap → .stepExpanded).
+        LensComponents.cardPanel(spacing: 8, padding: 14) {
+          Text("STEP \(s.stepIndex + 1) OF \(s.totalSteps)", style: .meta, color: .secondary)
+          Text(s.stepTitle, style: .heading, color: .primary)
+          Text(LensComponents.truncate(s.stepDescription, max: 180), style: .body, color: .primary)
+        }
+        .onTap(cb.onExpandStep)
       }
 
       LensComponents.audioActionRow(
@@ -224,7 +242,7 @@ enum CoachingLensTrees {
     .padding(12)
   }
 
-  // MARK: - 4. Step expanded (paginated)
+  // MARK: - 2. Step expanded (paginated)
 
   static func stepExpandedTree(
     snapshot s: CoachingLensSnapshot,
@@ -373,28 +391,61 @@ enum CoachingLensTrees {
         crossAlignment: .stretch,
         padding: 18
       ) {
-        Text("Are you sure you want to exit?", style: .heading, color: .primary)
+        // Centered heading (DSL Text has no alignment; a centered row does it).
+        FlexBox(
+          direction: MWDATDisplay.Direction.row,
+          spacing: 0,
+          alignment: .center,
+          crossAlignment: .center
+        ) {
+          Text("Are you sure you want to exit?", style: .heading, color: .primary)
+        }
 
+        // Custom FlexBox pills (not DSL `Button`) so the label is CENTERED and
+        // there's no built-in collapse/expand button animation.
         // Default focus: Cancel (first tappable child — safe option).
-        Button(
-          label: "Cancel",
-          style: .secondary,
-          iconName: .arrowLeft,
-          onClick: { @Sendable in cb.onExitConfirmCancel() }
-        )
-
-        Button(
-          label: "Confirm exit",
-          style: .outline,
-          iconName: .x,
-          onClick: { @Sendable in cb.onExitConfirmConfirm() }
-        )
+        centerButton(icon: .arrowLeft, label: "Cancel", onTap: cb.onExitConfirmCancel)
+        centerButton(icon: .x, label: "Confirm exit", onTap: cb.onExitConfirmConfirm)
       }
     }
     .padding(12)
   }
 
   // MARK: - Helpers
+
+  /// Empty grow-spacer that pushes flanking row children to opposite ends
+  /// (the `Alignment` enum has no `spaceBetween`; `flexGrow` is the lever).
+  private static func growSpacer() -> FlexBox {
+    FlexBox(
+      direction: MWDATDisplay.Direction.row,
+      spacing: 0,
+      alignment: .center,
+      crossAlignment: .center
+    ) {}
+    .flexGrow(1)
+  }
+
+  /// Full-width `.card` button with its icon+label CENTERED (vs the DSL
+  /// `Button`, which left-aligns and carries a built-in press animation).
+  /// Used for the exit-confirmation overlay actions.
+  private static func centerButton(
+    icon: IconName,
+    label: String,
+    onTap: @escaping () -> Void
+  ) -> FlexBox {
+    FlexBox(
+      direction: MWDATDisplay.Direction.row,
+      spacing: 6,
+      alignment: .center,
+      crossAlignment: .center
+    ) {
+      Icon(name: icon, style: .outline)
+      Text(label, style: .body, color: .primary)
+    }
+    .padding(8)
+    .background(.card)
+    .onTap(onTap)
+  }
 
   /// Small icon+label pill in a `.card` background, tappable. Used for
   /// the Reference / Insights toggles and the "Hide …" dismissers.

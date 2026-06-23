@@ -51,18 +51,6 @@ struct DebugSettingsSection: View {
   /// existing SwiftUI emulator is the only visible HUD. Flip on when
   /// iterating on native lens output during development.
   @AppStorage("lensOutputEnabled") private var lensOutputEnabled: Bool = false
-  /// Migration flag. When true, consumers (LensDisplayCoordinator,
-  /// GeminiLiveSessionBase, StreamSessionViewModel, WearablesViewModel)
-  /// route their DAT DeviceSession lifecycle through the shared
-  /// `DeviceSessionManager` instead of each creating their own session.
-  /// Default ON as of 2026-06-14 — the inline-fallback path missed the
-  /// non-display-glasses `.any` selector fix, so toggling it OFF would
-  /// break Coaching on Oakley Meta Vanguard / regular Ray-Ban Meta.
-  /// `CameraAccessApp.init` also calls `UserDefaults.register(defaults:)`
-  /// with `true` so existing installs that never touched this toggle pick
-  /// up the new default; only users who explicitly toggled OFF keep that
-  /// preference.
-  @AppStorage("deviceSessionManagerEnabled") private var deviceSessionManagerEnabled: Bool = true
 
   @EnvironmentObject private var lensSession: LensSession
   @State private var smokeTestResult: String?
@@ -145,22 +133,6 @@ struct DebugSettingsSection: View {
             .font(.retraceCallout)
             .foregroundColor(.textPrimary)
           Text("Mirrors every page to the actual Meta Ray-Ban Display lens via the DAT SDK display capability. The phone-side SwiftUI emulator keeps running either way; this is purely additive. Off by default while the native lens layer is under development.")
-            .font(.retraceCaption1)
-            .foregroundColor(.textTertiary)
-            .fixedSize(horizontal: false, vertical: true)
-        }
-      }
-      .tint(.appPrimary)
-      .padding(14)
-      .background(Color.surfaceRaised)
-      .cornerRadius(Radius.md)
-
-      Toggle(isOn: $deviceSessionManagerEnabled) {
-        VStack(alignment: .leading, spacing: 2) {
-          Text("DeviceSessionManager (migration)")
-            .font(.retraceCallout)
-            .foregroundColor(.textPrimary)
-          Text("Routes DAT DeviceSession lifecycle through the shared DeviceSessionManager so camera + display can coexist on the same session. Off until consumer migrations land in subsequent phases. Leave OFF unless explicitly testing migration phases.")
             .font(.retraceCaption1)
             .foregroundColor(.textTertiary)
             .fixedSize(horizontal: false, vertical: true)
@@ -366,12 +338,12 @@ struct GlassesSettingsSection: View {
 
   private var statusColor: Color {
     if wearablesVM.registrationState == .registering { return .yellow }
-    return wearablesVM.hasActiveDevice ? .green : .textTertiary
+    return wearablesVM.isConnected ? .green : .textTertiary
   }
 
   private var statusLabel: String {
     if wearablesVM.registrationState == .registering { return "Connecting…" }
-    return wearablesVM.hasActiveDevice ? "Connected" : "Not connected"
+    return wearablesVM.isConnected ? "Connected" : "Not connected"
   }
 }
 

@@ -128,7 +128,7 @@ class DiagnosticSessionViewModel: GeminiLiveSessionBase {
     wearables: WearablesInterface,
     serverBaseURL: String,
     transport: CaptureTransport,
-    sessionManager: DeviceSessionManager? = nil
+    sessionManager: DeviceSessionManager
   ) {
     self.diagnosticTransport = transport
     super.init(wearables: wearables, serverBaseURL: serverBaseURL, sessionManager: sessionManager)
@@ -296,7 +296,11 @@ class DiagnosticSessionViewModel: GeminiLiveSessionBase {
   /// Called when the user confirms a matched/generated procedure.
   /// Returns the learner session payload so the view can transition into
   /// CoachingSessionView via fullScreenCover.
-  func executeHandoff(procedureId: String, autoAdvance: Bool) async -> LearnerSessionStartResponse? {
+  func executeHandoff(
+    procedureId: String,
+    autoAdvance: Bool,
+    activeMonitoring: Bool
+  ) async -> LearnerSessionStartResponse? {
     guard let sid = sessionId else { return nil }
     handoffInFlight = true
     handoffError = nil
@@ -307,6 +311,7 @@ class DiagnosticSessionViewModel: GeminiLiveSessionBase {
         sessionId: sid,
         procedureId: procedureId,
         autoAdvance: autoAdvance,
+        activeMonitoring: activeMonitoring,
         voice: voice
       )
       // Learner VM will open its own fresh socket; tear down ours.

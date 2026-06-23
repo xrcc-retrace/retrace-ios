@@ -26,10 +26,10 @@ struct IPhoneRecordingView: View {
   let onAcknowledgeProcedure: () -> Void
   let onRecordingComplete: (URL, TimeInterval) -> Void
 
-  /// Optional shared `DeviceSessionManager`. Glasses transport forwards it
-  /// to `StreamSessionViewModel`; iPhone transport ignores it (no DAT SDK
+  /// Shared `DeviceSessionManager`. Glasses transport forwards it to
+  /// `StreamSessionViewModel`; iPhone transport ignores it (no DAT SDK
   /// session involved).
-  let sessionManager: DeviceSessionManager?
+  let sessionManager: DeviceSessionManager
 
   init(
     transport: CaptureTransport,
@@ -37,7 +37,7 @@ struct IPhoneRecordingView: View {
     uploadService: UploadService,
     onAcknowledgeProcedure: @escaping () -> Void,
     onRecordingComplete: @escaping (URL, TimeInterval) -> Void,
-    sessionManager: DeviceSessionManager? = nil
+    sessionManager: DeviceSessionManager
   ) {
     self.transport = transport
     self.wearables = wearables
@@ -213,7 +213,7 @@ private struct GlassesRecordingEngine: View {
     uploadService: UploadService,
     onAcknowledgeProcedure: @escaping () -> Void,
     onRecordingComplete: @escaping (URL, TimeInterval) -> Void,
-    sessionManager: DeviceSessionManager? = nil
+    sessionManager: DeviceSessionManager
   ) {
     self.onAcknowledgeProcedure = onAcknowledgeProcedure
     self.onRecordingComplete = onRecordingComplete

@@ -53,14 +53,11 @@ final class LensDisplayCoordinator: ObservableObject {
   private(set) var display: Display?
 
   private let wearables: WearablesInterface
-  /// Phase 2: optional shared `DeviceSessionManager`. When the
-  /// `deviceSessionManagerEnabled` toggle is ON, all session lifecycle
-  /// routes through this manager so camera + display can coexist on
-  /// one `DeviceSession` per the SDK's capability-composition model.
-  /// When OFF (default during migration) the coordinator falls back to
-  /// its own `wearables.createSession` path — preserved so we have a
-  /// sub-second on-device rollback.
-  private let sessionManager: DeviceSessionManager?
+  /// Shared `DeviceSessionManager` — the single owner of every DAT
+  /// `DeviceSession`. All session lifecycle routes through this manager so
+  /// camera + display can coexist on one `DeviceSession` per the SDK's
+  /// capability-composition model.
+  private let sessionManager: DeviceSessionManager
   private var deviceSelector: AutoDeviceSelector
   private var deviceSession: DeviceSession?
   private var stateListenerToken: AnyListenerToken?
@@ -89,21 +86,13 @@ final class LensDisplayCoordinator: ObservableObject {
   /// produce a different outcome (a Display device just paired, or the
   /// active non-display device disconnected).
   ///
-  /// NOT set for `datAppOnTheGlassesUpdateRequired` (own recovery UI),
-  /// generic catch-all errors (those flip `didFailToStartSession`), or
-  /// the inline path's typed `DeviceSessionError` cases — the same
-  /// "permanent for the current registration" rationale doesn't apply
+  /// NOT set for `datAppOnTheGlassesUpdateRequired` (own recovery UI) or
+  /// generic catch-all errors (those flip `didFailToStartSession`) — the
+  /// same "permanent for the current registration" rationale doesn't apply
   /// uniformly to those.
   private var attachUnavailableForCurrentRegistration: Bool = false
 
-  /// Reads the live debug toggle. Re-read on each `attachToDisplay()`
-  /// so a flip in Settings takes effect on the next attach (no app
-  /// relaunch required).
-  private var deviceSessionManagerEnabled: Bool {
-    UserDefaults.standard.bool(forKey: "deviceSessionManagerEnabled") && sessionManager != nil
-  }
-
-  init(wearables: WearablesInterface, sessionManager: DeviceSessionManager? = nil) {
+  init(wearables: WearablesInterface, sessionManager: DeviceSessionManager) {
     self.wearables = wearables
     self.sessionManager = sessionManager
     self.deviceSelector = AutoDeviceSelector(
@@ -208,18 +197,14 @@ final class LensDisplayCoordinator: ObservableObject {
 
     didFailToStartSession = false
 
-    if deviceSessionManagerEnabled, let manager = sessionManager {
-      await attachViaManager(manager)
-    } else {
-      await attachInline()
-    }
+    await attachViaManager(sessionManager)
   }
 
-  /// Phase 2 path. Get a ready DeviceSession from the shared manager
-  /// (which has already raced stateStream/errorStream and resolved
-  /// to `.started` or thrown), then add the Display capability on it.
-  /// The manager fans `DeviceSessionError`s out via `sessionErrors`
-  /// so we don't need our own per-consumer errorStream observer.
+  /// Get a ready DeviceSession from the shared manager (which has already
+  /// raced stateStream/errorStream and resolved to `.started` or thrown),
+  /// then add the Display capability on it. The manager fans
+  /// `DeviceSessionError`s out via `sessionErrors` so we don't need our
+  /// own per-consumer errorStream observer.
   private func attachViaManager(_ manager: DeviceSessionManager) async {
     // Subscribe to the manager's session-error fan-out so we still react
     // to `datAppOnTheGlassesUpdateRequired` etc. The cancellable is held
@@ -282,63 +267,6 @@ final class LensDisplayCoordinator: ObservableObject {
       requiresDATAppUpdate = false
       didFailToStartSession = true
       errorMessage = "Failed to acquire session [\(error)]: \(error.localizedDescription)"
-    }
-  }
-
-  /// Pre-manager inline path. Preserved unchanged so flipping the
-  /// `deviceSessionManagerEnabled` toggle OFF reverts behavior to
-  /// exactly what it was before the manager landed.
-  private func attachInline() async {
-    do {
-      let devSession = try wearables.createSession(deviceSelector: deviceSelector)
-      deviceSession = devSession
-
-      let deviceId = devSession.deviceId
-      if let device = wearables.deviceForIdentifier(deviceId) {
-        print("[LensDisplayCoordinator] selected device: name=\(device.nameOrId()) type=\(device.deviceType().rawValue) supportsDisplay=\(device.supportsDisplay()) compatibility=\(device.compatibility())")
-      } else {
-        print("[LensDisplayCoordinator] selected device: <not resolvable> id=\(deviceId)")
-      }
-
-      let stateStream = devSession.stateStream()
-      let errorStream = devSession.errorStream()
-      coreStateTask = Task { [weak self] in
-        for await sessionState in stateStream {
-          guard let self, !Task.isCancelled else { return }
-          print("[LensDisplayCoordinator] DeviceSession.state → \(sessionState)")
-          switch sessionState {
-          case .started:
-            self.requiresDATAppUpdate = false
-            self.didFailToStartSession = false
-            await self.setupDisplay(on: devSession)
-          case .stopping, .stopped:
-            self.isConnected = false
-            self.display = nil
-          case .starting, .idle, .paused:
-            break
-          @unknown default:
-            break
-          }
-        }
-      }
-      sessionErrorTask = Task { [weak self] in
-        for await error in errorStream {
-          guard let self, !Task.isCancelled else { return }
-          self.handleSessionError(error)
-        }
-      }
-
-      try devSession.start()
-    } catch DeviceSessionError.datAppOnTheGlassesUpdateRequired {
-      print("[LensDisplayCoordinator] createSession/start threw → datAppOnTheGlassesUpdateRequired")
-      requiresDATAppUpdate = true
-      didFailToStartSession = true
-      errorMessage = DeviceSessionError.datAppOnTheGlassesUpdateRequired.localizedDescription
-    } catch {
-      print("[LensDisplayCoordinator] createSession/start threw → \(error)")
-      requiresDATAppUpdate = false
-      didFailToStartSession = true
-      errorMessage = "Failed to create session [\(error)]: \(error.localizedDescription)"
     }
   }
 
@@ -407,31 +335,16 @@ final class LensDisplayCoordinator: ObservableObject {
     await display?.stop()
     display = nil
 
-    // Inline-path observers (only populated when toggle was OFF). Cancel
-    // unconditionally — they're nil when the manager path was active.
-    coreStateTask?.cancel()
-    coreStateTask = nil
-    sessionErrorTask?.cancel()
-    sessionErrorTask = nil
-
-    // Manager-path subscription, equivalent purpose to sessionErrorTask
-    // above but driven by the manager's PassthroughSubject. Same nil-safe
-    // semantics — only populated when toggle is ON.
+    // The manager's session-error fan-out subscription for this attach.
     managerSessionErrorsCancellable?.cancel()
     managerSessionErrorsCancellable = nil
 
-    // Release the DeviceSession. The manager owns it under the new path;
-    // we own it under the inline path. Branch on whichever produced it.
-    if deviceSessionManagerEnabled, let manager = sessionManager {
-      // Drop our local ref BEFORE telling the manager — if the manager
-      // decides to stop the session (last consumer releasing), the stop
-      // happens against the underlying SDK object, not us.
-      deviceSession = nil
-      await manager.release(consumerLabel: "lens")
-    } else {
-      deviceSession?.stop()
-      deviceSession = nil
-    }
+    // Release the DeviceSession. The manager owns it, so drop our local
+    // ref BEFORE telling the manager — if the manager decides to stop the
+    // session (last consumer releasing), the stop happens against the
+    // underlying SDK object, not us.
+    deviceSession = nil
+    await sessionManager.release(consumerLabel: "lens")
 
     isConnected = false
     pendingAction = nil

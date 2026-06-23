@@ -37,7 +37,30 @@ class StreamSessionViewModel: ObservableObject {
   /// `.sessionAlreadyExists`. Stashing the in-flight teardown here
   /// (`prepare()` awaits it before its first SDK call) closes the
   /// race without forcing teardown to be synchronous.
+  ///
+  /// This Task ALSO carries the BT HFP audio teardown (`audioSessionManager
+  /// .deactivate()` + a route-settle), so `prepare()` awaiting it likewise
+  /// guarantees the prior recording's HFP route is fully released before the
+  /// next `prewarm()` re-grabs it. Without that ordering the second record's
+  /// HFP activation raced the first's async release and iOS surfaced a system
+  /// call/telephony UI.
   nonisolated(unsafe) private static var teardownInFlight: Task<Void, Never>?
+
+  /// Once-per-process gate for the silent writer warmup. The `-11861`
+  /// (`AVErrorUnsupportedOutputSettings`) hazard `runSilentWarmupCycle`
+  /// guards against is the FIRST `AVAssetWriter` of the process — once any
+  /// writer (the throwaway warmup OR a real recording) has succeeded, the
+  /// hazard is gone for the rest of the process.
+  ///
+  /// Crucially, skipping the warmup on re-record also avoids starting the
+  /// audio engine during `prepare()`: the warmup's `startRecording` opens
+  /// the glasses' BT HFP SCO link, which makes the glasses show a system
+  /// call/telephony UI. On the first record the warmup is usually skipped
+  /// (frames arrive too slowly), so SCO only opens when the user actually
+  /// records; on a warm re-record the warmup runs and the call UI pops up
+  /// during the "getting ready" phase. Gating the warmup to once-per-process
+  /// makes re-record behave like the first record.
+  nonisolated(unsafe) private static var didProveWriterThisProcess: Bool = false
 
   @Published var currentVideoFrame: UIImage?
   @Published var hasReceivedFirstFrame: Bool = false
@@ -305,23 +328,13 @@ class StreamSessionViewModel: ObservableObject {
   private let wearables: WearablesInterface
   private let deviceSelector: AutoDeviceSelector
   private var deviceMonitorTask: Task<Void, Never>?
-  /// Phase 6: optional shared `DeviceSessionManager`. When the
-  /// `deviceSessionManagerEnabled` toggle is ON, Expert recording's
-  /// `DeviceSession` lifecycle routes through the manager so the camera
-  /// `Stream` can coexist with `Display` on the same physical device —
-  /// the SDK's capability-composition model requires both capabilities
-  /// to attach to one shared session. When OFF, the inline createSession
-  /// + 5s-watchdog path is used — preserved for sub-second on-device
-  /// rollback during migration.
-  private let sessionManager: DeviceSessionManager?
+  /// Shared `DeviceSessionManager` — the single owner of every DAT
+  /// `DeviceSession`. Expert recording's `DeviceSession` lifecycle routes
+  /// through the manager so the camera `Stream` can coexist with `Display`
+  /// on the same physical device, per the SDK's capability-composition model.
+  private let sessionManager: DeviceSessionManager
 
-  /// Reads the live debug toggle. Re-read on each `startSession`
-  /// so a flip in Settings takes effect on the next session.
-  private var deviceSessionManagerEnabled: Bool {
-    UserDefaults.standard.bool(forKey: "deviceSessionManagerEnabled") && sessionManager != nil
-  }
-
-  init(wearables: WearablesInterface, uploadService: UploadService, sessionManager: DeviceSessionManager? = nil) {
+  init(wearables: WearablesInterface, uploadService: UploadService, sessionManager: DeviceSessionManager) {
     self.wearables = wearables
     self.uploadService = uploadService
     self.sessionManager = sessionManager
@@ -413,6 +426,12 @@ class StreamSessionViewModel: ObservableObject {
     print("[Glasses] prepare() → handleStartStreaming")
     await handleStartStreaming()
     print("[Glasses] prepare() → audioSessionManager.prewarm")
+    // Hand the audio layer the paired-glasses names so `.recording`'s prewarm
+    // pins the glasses' BT HFP input over any other connected HFP device
+    // (e.g. AirPods). The DAT stream is up by now, so `wearables.devices` is
+    // populated. Set before prewarm — that's where the off-main configure
+    // (and its setPreferredInput) runs.
+    audioSessionManager.preferredGlassesNames = DeviceSessionManager.pairedDeviceNames(from: wearables)
     await audioSessionManager.prewarm()
 
     // Run the silent warmup recording cycle. The first AVAssetWriter
@@ -421,8 +440,16 @@ class StreamSessionViewModel: ObservableObject {
     // always works. We sacrifice a throwaway recording here so the
     // user's first tap is iOS's "rec 2." Start button stays disabled
     // (via `isReadyToRecord`) until this completes.
-    print("[Glasses] prepare() → runSilentWarmupCycle")
-    await runSilentWarmupCycle()
+    // Only run the writer warmup once per process. After the first proven
+    // writer the `-11861` hazard is gone, and skipping it here keeps the
+    // audio engine (and the glasses' BT HFP SCO "call" link) from starting
+    // during a re-record's prepare phase. See `didProveWriterThisProcess`.
+    if Self.didProveWriterThisProcess {
+      print("[Glasses] prepare() → skipping warmup (writer already proven this process)")
+    } else {
+      print("[Glasses] prepare() → runSilentWarmupCycle")
+      await runSilentWarmupCycle()
+    }
     isReadyToRecord = true
     print("[Glasses] prepare() → isReadyToRecord = true")
   }
@@ -502,7 +529,11 @@ class StreamSessionViewModel: ObservableObject {
     if let url = url {
       try? FileManager.default.removeItem(at: url)
     }
-    print("[Glasses] warmup → complete")
+    // The throwaway writer has cycled — the once-per-process `-11861`
+    // hazard is consumed, so subsequent prepares skip the warmup (and thus
+    // don't re-open the HFP SCO link during the ready phase).
+    Self.didProveWriterThisProcess = true
+    print("[Glasses] warmup → complete (writer proven for this process)")
   }
 
   /// Mirror of `IPhoneExpertRecordingViewModel.startRecording(landscape:)` so
@@ -591,6 +622,16 @@ class StreamSessionViewModel: ObservableObject {
     _ = await recordingManager.stopRecording()
     let resultURL = recordingManager.recordingURL
 
+    // A real recording succeeded → the first-writer `-11861` hazard is
+    // consumed for this process, so future prepares can skip the silent
+    // warmup. This also covers the common case where the first record's
+    // warmup was skipped (frames arrived too slowly) but the real recording
+    // still worked — without this, the warm re-record would run the warmup
+    // and open the HFP "call" link during its prepare phase.
+    if resultURL != nil {
+      Self.didProveWriterThisProcess = true
+    }
+
     // Re-prepare a fresh writer for any subsequent recording in this
     // same view session. Done eagerly here (vs. waiting for the next
     // frame to drive it) so the writer is ready immediately whenever
@@ -667,7 +708,17 @@ class StreamSessionViewModel: ObservableObject {
     handLandmarkerService?.stop()
     handLandmarkerService = nil
     hudViewModel.resetHandTracking()
-    audioSessionManager.deactivate()
+    // NOTE: audio deactivation is deliberately NOT done here synchronously.
+    // It now runs inside the awaited `teardownInFlight` Task below, after the
+    // DAT stream/session is torn down. `.record` + `[.allowBluetoothHFP]`
+    // claims the glasses' BT HFP (telephony) channel; `setActive(false)`
+    // releases it, but iOS releases the HFP route asynchronously. The next
+    // recording's `prepare()` awaits `teardownInFlight` before its
+    // `audioSessionManager.prewarm()` re-grabs HFP — so folding deactivate
+    // into that awaited Task (plus a settle) guarantees the route is fully
+    // released before the next activation. Doing it synchronously here let
+    // the next `setActive(true)` race the in-flight HFP release, which made
+    // iOS surface a system call/telephony UI on the second record.
 
     // If a writer was pre-prepared but the user never tapped Start,
     // cancel it and remove the orphan temp mp4. `discardPreparedWriter`
@@ -703,34 +754,32 @@ class StreamSessionViewModel: ObservableObject {
 
     // Stash the stopSession Task in the cross-instance gate so the
     // next view's `prepare()` can await it (see Self.teardownInFlight).
-    // Without this, `.onDisappear` returns immediately and SwiftUI
-    // mounts the next recording view; that view's `prepare()` then
-    // races our async stopSession and the SDK throws
-    // `.sessionAlreadyExists` on the next createSession.
-    //
-    // Phase 6: when the manager path is active, the manager's internal
-    // `lifecycleTask` provides the same serialization (the next acquire
-    // for "expert" awaits this release). We still stash a Task into
-    // `teardownInFlight` so the inline-path semantics are unchanged on
-    // toggle-OFF. Both paths converge on identical observable behavior.
-    let usedManager = deviceSessionManagerEnabled
+    // The manager's internal `lifecycleTask` already serializes the next
+    // acquire for "expert" against this release; stashing the Task here
+    // additionally lets a freshly-mounted recording view await teardown
+    // before it kicks its own start.
     let manager = sessionManager
+    let audio = audioSessionManager
     Self.teardownInFlight = Task { [self, streamToStop, sessionToStop] in
-      _ = self  // strong capture — keeps awaitDeviceSessionStopped reachable
-      print("[Glasses] teardown → stopping streamSession (manager=\(usedManager))")
+      _ = self  // strong capture — keeps the VM alive through teardown
+      _ = sessionToStop  // retained until release completes
+      print("[Glasses] teardown → stopping streamSession")
       await streamToStop?.stop()
-      if usedManager, let manager = manager {
-        // Manager owns DeviceSession lifecycle; just release our lease.
-        // If another consumer (lens) holds the session, the manager
-        // keeps it alive. If we were last, the manager calls .stop()
-        // and waits for .stopped internally.
-        await manager.release(consumerLabel: "expert")
-        print("[Glasses] teardown → manager.release('expert') complete")
-      } else if let session = sessionToStop {
-        session.stop()
-        await self.awaitDeviceSessionStopped(session, timeout: 3.0)
-        print("[Glasses] teardown → DeviceSession reached \(session.state)")
-      }
+      // Manager owns DeviceSession lifecycle; just release our lease.
+      // If another consumer (lens) holds the session, the manager keeps
+      // it alive. If we were last, the manager calls .stop() and waits
+      // for .stopped internally.
+      await manager.release(consumerLabel: "expert")
+      print("[Glasses] teardown → manager.release('expert') complete")
+      // Release the BT HFP audio route LAST, after the DAT stream/session
+      // is down (mirrors prepare()'s "DAT up, then audio up" ordering), then
+      // let iOS finish dropping the HFP route before this Task completes.
+      // Because the next recording's `prepare()` awaits this Task, its
+      // `prewarm()` HFP grab can't race the release — which is what
+      // triggered the system call UI on the second record.
+      audio.deactivate()
+      try? await Task.sleep(nanoseconds: 200_000_000)  // 200 ms HFP route settle
+      print("[Glasses] teardown → audio deactivated + HFP settled")
       print("[Glasses] teardown complete")
     }
   }
@@ -818,8 +867,7 @@ class StreamSessionViewModel: ObservableObject {
       }
 
       // Lock to `.medium` (504×896) instead of `.high` (720×1280) — see
-      // long-form rationale just below the inline path. Same config
-      // shared by both manager and inline paths.
+      // long-form rationale just below.
       let streamConfig = StreamConfiguration(
         videoCodec: .raw,
         resolution: .medium,
@@ -828,11 +876,12 @@ class StreamSessionViewModel: ObservableObject {
       let session: DeviceSession
       let stream: MWDATCamera.Stream
 
-      if deviceSessionManagerEnabled, let manager = sessionManager {
-        // Phase 6 manager path: ask the manager for a ready DeviceSession.
-        // It races stateStream/errorStream and serializes against any
-        // in-flight release, so `.sessionAlreadyExists` and the 5s
+      do {
+        // Ask the manager for a ready DeviceSession. It races
+        // stateStream/errorStream and serializes against any in-flight
+        // release, so `.sessionAlreadyExists` and the 5s
         // datAppOnTheGlassesUpdateRequired masking bug both go away.
+        let manager = sessionManager
         do {
           // Intent-aware acquire (mirrors `GeminiLiveSessionBase`): when
           // the user has lens output enabled AND a Display-capable
@@ -870,73 +919,9 @@ class StreamSessionViewModel: ObservableObject {
           streamSession = nil
           return
         }
-      } else {
-        // Inline path: pre-Phase-6 behavior, preserved exactly so the
-        // `deviceSessionManagerEnabled = false` rollback is bit-perfect.
-        // Order of operations matches Meta's canonical 0.6 sample:
-        //   1. createSession
-        //   2. session.start()                ← MUST come before addStream
-        //   3. session.addStream(config:)
-        //   4. stream.start() (below)
-        do {
-          print("[Glasses] startSession() → wearables.createSession(deviceSelector:)")
-          let inlineSession = try wearables.createSession(deviceSelector: deviceSelector)
-          print("[Glasses] createSession ✓ (state=\(inlineSession.state))")
-
-          // Start the device session FIRST. Without this, the next
-          // addStream call sees a `.idle` session and returns nil.
-          do {
-            print("[Glasses] session.start() → …")
-            try inlineSession.start()
-            print("[Glasses] session.start() ✓ (state=\(inlineSession.state))")
-          } catch {
-            print("[Glasses] session.start() ✗ \(error)")
-            showError("Failed to start device session: \(error.localizedDescription)")
-            return
-          }
-
-          // CRITICAL: `session.start()` is sync and only transitions the
-          // session to `.starting`. The transition to `.started` is
-          // asynchronous (BT/WiFi handshake). Subscribe + await before
-          // calling addStream.
-          do {
-            try await awaitDeviceSessionStarted(inlineSession, timeout: 5.0)
-            print("[Glasses] device session ready (state=\(inlineSession.state))")
-          } catch {
-            print("[Glasses] device session never reached .started: \(error.localizedDescription)")
-            inlineSession.stop()
-            showError("Glasses didn't finish starting up. Try again.")
-            return
-          }
-
-          print("[Glasses] addStream(config: codec=raw, resolution=.medium, fps=30) → …")
-          guard let s = try inlineSession.addStream(config: streamConfig) else {
-            // Session started but addStream declined — tear the orphan
-            // session back down so the next attempt is clean.
-            print("[Glasses] addStream ✗ returned nil (deviceState=\(inlineSession.state)) — stopping orphan session")
-            inlineSession.stop()
-            showError("Could not attach streaming capability — the glasses dropped before the stream could open. Try again.")
-            return
-          }
-          print("[Glasses] addStream ✓ (streamState=\(s.state))")
-          session = inlineSession
-          stream = s
-        } catch let error as DeviceSessionError {
-          print("[Glasses] DeviceSessionError in startSession: \(error)")
-          showError("Failed to start device session: \(error.localizedDescription)")
-          deviceSession = nil
-          streamSession = nil
-          return
-        } catch {
-          print("[Glasses] Unknown error in startSession: \(error)")
-          showError("Failed to start device session: \(error.localizedDescription)")
-          deviceSession = nil
-          streamSession = nil
-          return
-        }
       }
 
-      // Rationale for `.medium` resolution (applies to BOTH paths):
+      // Rationale for `.medium` resolution:
       //
       // Background: the BT/WiFi link to the glasses can sustain `.high`
       // ONLY while audio isn't competing for bandwidth (i.e. preview-
@@ -962,68 +947,7 @@ class StreamSessionViewModel: ObservableObject {
     print("[Glasses] streamSession.start() ✓")
   }
 
-  /// Wait for the DAT `DeviceSession` to transition from `.starting`
-  /// to `.started` before attempting `addStream(config:)`.
-  ///
-  /// Background: `DeviceSession.start()` is a sync throws function. It
-  /// flips the state machine from `.idle` to `.starting` and returns
-  /// immediately — but the BT/WiFi handshake with the glasses takes
-  /// hundreds of milliseconds to actually reach `.started`. Calling
-  /// `addStream` during that window returns nil. The SDK exposes
-  /// `statePublisher` (an `Announcer<DeviceSessionState>`) so we can
-  /// subscribe to the transition. Bridging into an `AsyncStream` lets
-  /// us await it cleanly with a timeout watchdog.
-  ///
-  /// Throws on timeout or if the session lands on `.stopped` before
-  /// `.started`.
-  private func awaitDeviceSessionStarted(
-    _ session: DeviceSession,
-    timeout: TimeInterval
-  ) async throws {
-    if session.state == .started { return }
-
-    let (stream, continuation) = AsyncStream<DeviceSessionState>.makeStream()
-    let listenerToken = session.statePublisher.listen { state in
-      print("[Glasses] DeviceSession.state → \(state)")
-      continuation.yield(state)
-    }
-    defer { _ = listenerToken }  // keep listener alive for the duration
-
-    // Re-check after subscribing to catch a transition that landed
-    // between the entry-state check and the listener install.
-    if session.state == .started {
-      continuation.finish()
-      return
-    }
-
-    let outcome: Bool = await withTaskGroup(of: Bool.self, returning: Bool.self) { group in
-      group.addTask {
-        for await state in stream {
-          if state == .started { return true }
-          if state == .stopped { return false }
-          // .idle / .starting / .paused / .stopping → keep waiting.
-        }
-        return false
-      }
-      group.addTask {
-        try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-        return false
-      }
-      let first = await group.next() ?? false
-      group.cancelAll()
-      continuation.finish()
-      return first
-    }
-
-    if !outcome {
-      struct DeviceSessionNotReady: LocalizedError {
-        var errorDescription: String? { "Device session never reached .started" }
-      }
-      throw DeviceSessionNotReady()
-    }
-  }
-
-  /// Mirror of `awaitDeviceSessionStarted` for the stop path.
+  /// Wait for a DAT `DeviceSession` to reach `.stopped` after `stop()`.
   /// `DeviceSession.stop()` is sync void but the transition to `.stopped`
   /// is async — calling `wearables.createSession(...)` for a fresh
   /// recording before the SDK has actually released the prior session
@@ -1183,7 +1107,8 @@ class StreamSessionViewModel: ObservableObject {
         //     → MainActor visibility on the gate (very rare)
         //   • lines with recording=true, forwarded > 0 → working
         let now = Date()
-        if now.timeIntervalSince(self.lastFrameStatLogAt) >= 2.0 {
+        if UserDefaults.standard.bool(forKey: "debugMode"),
+           now.timeIntervalSince(self.lastFrameStatLogAt) >= 2.0 {
           self.lastFrameStatLogAt = now
           let dims = videoFrame.sampleBuffer.formatDescription.map { fmt -> String in
             let d = CMVideoFormatDescriptionGetDimensions(fmt)
