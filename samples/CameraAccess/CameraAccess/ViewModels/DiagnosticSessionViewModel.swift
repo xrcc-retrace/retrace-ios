@@ -32,6 +32,14 @@ class DiagnosticSessionViewModel: GeminiLiveSessionBase {
   /// the bridge. Cleared on `.onDisappear`.
   var onLensStartHandoff: ((String) -> Void)?
 
+  /// Lens-side "Confirm exit" bridge (Step 8 parity with coaching). The
+  /// on-lens end-diagnostic overlay calls this when the user confirms exit;
+  /// the SwiftUI view installs it in `.onAppear` to run the same terminal
+  /// teardown its phone overlay runs (`endSession()` + `onExit(nil)`). The
+  /// renderer can't reach the view's navigation, so this is the bridge.
+  /// Cleared on `.onDisappear`.
+  var onExitConfirmed: (() -> Void)?
+
   /// True after `identify_product` returns and before the user has
   /// confirmed (or rejected) it. Drives the lens confirmation overlay.
   /// Cleared when `confirm_identification` returns or when the user
@@ -55,7 +63,33 @@ class DiagnosticSessionViewModel: GeminiLiveSessionBase {
   /// held for 3 seconds even if `web_search_for_fix` fires (or returns)
   /// instantly. Deliberate pacing — gives the user a beat to register
   /// the library miss before being whisked into the next phase.
-  @Published private(set) var searchNarration: SearchNarration? = nil
+  @Published private(set) var searchNarration: SearchNarration? = nil {
+    didSet { syncLobbyMusic() }
+  }
+
+  /// True while lobby music is wanted (we're in the online-search window).
+  /// Guards the idempotent `syncLobbyMusic()` so it only starts/stops on edges.
+  private var lobbyMusicWanted = false
+
+  /// Start/stop the ducked lobby music to match the online-search window.
+  /// Bound to `searchNarration` via `didSet`, so EVERY transition re-evaluates
+  /// it: music starts (from the top) on entering `.searchingWeb`/`.synthesizing`
+  /// and stops on any exit — results in, a different tool call, going back to
+  /// diagnose / rediagnose, or session end. Idempotent.
+  private func syncLobbyMusic() {
+    let waiting: Bool
+    switch searchNarration {
+    case .searchingWeb, .synthesizing: waiting = true
+    default:                           waiting = false
+    }
+    if waiting && !lobbyMusicWanted {
+      lobbyMusicWanted = true
+      audioManager?.startLobbyMusic()   // always restarts from frame 0
+    } else if !waiting && lobbyMusicWanted {
+      lobbyMusicWanted = false
+      audioManager?.stopLobbyMusic()
+    }
+  }
 
   enum SearchNarration: Equatable {
     case searchingLibrary

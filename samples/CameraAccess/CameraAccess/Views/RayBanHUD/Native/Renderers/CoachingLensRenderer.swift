@@ -212,15 +212,72 @@ final class CoachingLensRenderer: LensRenderer {
     }
   }
 
+  // MARK: - Reference video playback
+
+  /// Hand the step's reference clip off to the full-screen `VideoPlayer`.
+  /// Invoked directly when the user taps the Reference pill on a VIDEO step
+  /// (one tap — there is no intermediate inline poster panel). Only a genuine
+  /// `.video` resolves here; manual page images show inline. Uses the REAL
+  /// server clip URL (never a reconstructed `.mp4`, which 404s for manual).
+  private func playReferenceVideo() {
+    guard case .video(let url) = resolveReferenceMedia() else { return }
+    clipErrorMessage = nil
+
+    Task { [weak self] in
+      await self?.lensSession?.presentReferenceClip(
+        uri: url.absoluteString,
+        onStarted: { [weak self] in
+          // Clip is committed to the lens — pause the Gemini loop
+          // (mic/voice/frames) so the clip's audio isn't fed back, the
+          // model doesn't talk over it, and frames can't trip advance.
+          self?.viewModel.setReferenceClipPlaying(true)
+        },
+        onEnded: { [weak self] in
+          // Resume the Gemini loop and return to the DEFAULT (collapsed) step
+          // screen — not the reference panel — per the requested UX.
+          guard let self else { return }
+          self.viewModel.setReferenceClipPlaying(false)
+          self.expansion = .collapsed
+          self.scheduleSend()
+        },
+        onError: { [weak self] _ in
+          // Resume the loop (the clip never actually played) and surface a
+          // visible error card inline instead of failing silently.
+          // (The concrete reason is logged in LensSession.)
+          guard let self else { return }
+          self.viewModel.setReferenceClipPlaying(false)
+          self.clipErrorMessage = "Couldn't load clip"
+          self.expansion = .referenceInline
+          self.scheduleSend()
+        }
+      )
+    }
+  }
+
   // MARK: - Callbacks (lens-side intents)
 
   private func makeCallbacks() -> CoachingLensCallbacks {
     CoachingLensCallbacks(
       onToggleReference: { [weak self] in
         guard let self else { return }
-        // Toggle the inline reference panel. Tapping it while Insights is
-        // open swaps panels (current != .referenceInline → opens it).
-        self.expansion = (self.expansion == .referenceInline) ? .collapsed : .referenceInline
+        // If an inline reference panel is already open (image panel OR a video
+        // error card), tapping the pill closes it — "Hide ref". This is also
+        // what dismisses a video error card.
+        if self.expansion == .referenceInline {
+          self.expansion = .collapsed
+          self.descPage = 0
+          self.clipErrorMessage = nil
+          self.scheduleSend()
+          return
+        }
+        // Opening. A VIDEO reference plays full-screen immediately (one tap —
+        // no intermediate poster panel). An IMAGE reference opens inline as
+        // before. `.none` can't reach here (pill is hidden).
+        if case .video = self.resolveReferenceMedia() {
+          self.playReferenceVideo()
+          return
+        }
+        self.expansion = .referenceInline
         self.descPage = 0
         self.clipErrorMessage = nil  // fresh open — drop any stale error
         self.scheduleSend()
@@ -270,48 +327,14 @@ final class CoachingLensRenderer: LensRenderer {
           self.scheduleSend()
         }
       },
-      onReferenceClipTap: { [weak self] in
-        guard let self else { return }
-        // Only a genuine VIDEO clip is playable. Manual page images resolve
-        // to `.image` and are shown inline (no full-screen takeover); `.none`
-        // can't reach here because the pill is hidden. Use the REAL clip URL
-        // from the server (never a reconstructed .mp4 — that 404s for manual).
-        guard case .video(let url) = self.resolveReferenceMedia() else { return }
-        self.clipErrorMessage = nil
-
-        Task { [weak self] in
-          await self?.lensSession?.presentReferenceClip(
-            uri: url.absoluteString,
-            onStarted: { [weak self] in
-              // Clip is committed to the lens — pause the Gemini loop
-              // (mic/voice/frames) so the clip's audio isn't fed back, the
-              // model doesn't talk over it, and frames can't trip advance.
-              self?.viewModel.setReferenceClipPlaying(true)
-            },
-            onEnded: { [weak self] in
-              // Resume the Gemini loop, then return to the active snapshot
-              // tree. Re-collapsing here is optional UX — keeping
-              // `.referenceInline` so the user can replay without
-              // re-expanding feels natural.
-              self?.viewModel.setReferenceClipPlaying(false)
-              self?.scheduleSend()
-            },
-            onError: { [weak self] _ in
-              // Resume the loop (the clip never actually played) and surface
-              // a visible error card instead of failing silently.
-              // (The concrete reason is logged in LensSession.)
-              guard let self else { return }
-              self.viewModel.setReferenceClipPlaying(false)
-              self.clipErrorMessage = "Couldn't load clip"
-              self.scheduleSend()
-            }
-          )
-        }
-      },
       onRetryClip: { [weak self] in
         guard let self else { return }
+        // "Try again" from the video error card → re-attempt full-screen
+        // playback. Drop the error + the inline panel first; a repeat failure
+        // re-opens the error card via `playReferenceVideo`'s onError.
         self.clipErrorMessage = nil
-        self.scheduleSend()
+        self.expansion = .collapsed
+        self.playReferenceVideo()
       },
       onCompletionExit: { [weak viewModel] in
         Task { @MainActor in

@@ -35,6 +35,11 @@ struct CoachingSessionView: View {
   // Active lens page inside the Ray-Ban emulator. Mutated by the emulator's
   // gesture pipeline (finger swipe today, MediaPipe pinch-drag tomorrow).
   @State private var coachingPageIndex: Int = 0
+  // Glasses transport only: the phone shows the lens over an app-themed
+  // background by default; the raw glasses camera feed is hidden until the
+  // user taps the "Show camera" pill. Plain @State so it resets to hidden
+  // every session (no persistence).
+  @State private var showCameraFeed = false
 
   init(
     procedure: ProcedureResponse,
@@ -81,7 +86,16 @@ struct CoachingSessionView: View {
               Color.black
             }
           case .glasses:
-            GlassesCameraPreview(image: viewModel.glassesPreviewFrame)
+            // Hide the raw glasses feed by default — show the lens over an
+            // app-themed background. The "Show camera" pill reveals the feed.
+            Group {
+              if showCameraFeed {
+                GlassesCameraPreview(image: viewModel.glassesPreviewFrame)
+              } else {
+                GlassesThemedBackground()
+              }
+            }
+            .animation(.easeInOut(duration: 0.25), value: showCameraFeed)
           }
         },
         hud: {
@@ -129,6 +143,17 @@ struct CoachingSessionView: View {
         }
       ) {
         stackedBody
+      }
+
+      // Glasses-session phone chrome — "running on glasses" banner + camera
+      // feed toggle. Glasses transport only; iPhone keeps its full-bleed
+      // camera with no chrome.
+      if transport == .glasses {
+        GlassesSessionChrome(
+          deviceName: glassesDeviceName,
+          status: glassesSessionStatus,
+          showCameraFeed: $showCameraFeed
+        )
       }
 
       // Hand-tracking dev overlay — landmark dots, pinch-drag cross, event
@@ -600,6 +625,25 @@ struct CoachingSessionView: View {
       return .red
     case .disconnected:
       return .gray
+    }
+  }
+
+  // MARK: - Glasses session chrome
+
+  private var glassesDeviceName: String {
+    wearablesVM.devices.first.map { wearablesVM.displayName(for: $0) } ?? "Glasses"
+  }
+
+  private var glassesSessionStatus: GlassesSessionStatus {
+    switch viewModel.geminiConnectionState {
+    case .connected:
+      return GlassesSessionStatus(label: "LIVE", dotColor: .green, pulsing: false)
+    case .connecting:
+      return GlassesSessionStatus(label: "CONNECTING", dotColor: .yellow, pulsing: true)
+    case .error:
+      return GlassesSessionStatus(label: "RECONNECTING", dotColor: .yellow, pulsing: true)
+    case .disconnected:
+      return GlassesSessionStatus(label: "STANDBY", dotColor: .gray, pulsing: false)
     }
   }
 

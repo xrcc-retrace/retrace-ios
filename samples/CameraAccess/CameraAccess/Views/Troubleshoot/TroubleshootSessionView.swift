@@ -33,6 +33,10 @@ struct TroubleshootSessionView: View {
   // Active lens page inside the Ray-Ban emulator. Troubleshoot ships with
   // zero pages today; the designer fills them in incrementally.
   @State private var troubleshootPageIndex: Int = 0
+  // Glasses transport only: lens over an app-themed background by default;
+  // the raw glasses feed is hidden until the user taps "Show camera". Plain
+  // @State so it resets to hidden every session.
+  @State private var showCameraFeed = false
   // Portrait is the app default; the real value is overwritten in
   // `.onAppear` from `resolveInterfaceOrientation()` so the session
   // preserves whatever orientation the phone is already in. Mirrors
@@ -93,7 +97,16 @@ struct TroubleshootSessionView: View {
               Color.black
             }
           case .glasses:
-            GlassesCameraPreview(image: viewModel.glassesPreviewFrame)
+            // Hide the raw glasses feed by default — show the lens over an
+            // app-themed background. The "Show camera" pill reveals the feed.
+            Group {
+              if showCameraFeed {
+                GlassesCameraPreview(image: viewModel.glassesPreviewFrame)
+              } else {
+                GlassesThemedBackground()
+              }
+            }
+            .animation(.easeInOut(duration: 0.25), value: showCameraFeed)
           }
         },
         hud: {
@@ -169,6 +182,17 @@ struct TroubleshootSessionView: View {
         stackedBody
       }
 
+      // Glasses-session phone chrome — "running on glasses" banner + camera
+      // feed toggle. Glasses transport only; iPhone keeps its full-bleed
+      // camera with no chrome.
+      if transport == .glasses {
+        GlassesSessionChrome(
+          deviceName: glassesDeviceName,
+          status: glassesSessionStatus,
+          showCameraFeed: $showCameraFeed
+        )
+      }
+
       // Hand-tracking dev overlay — landmark dots, pinch-drag cross, event
       // log. Sits above everything but allows hit-testing through. Reads
       // from the single shared `HandGestureService` regardless of mode.
@@ -188,6 +212,11 @@ struct TroubleshootSessionView: View {
       // `onExit(payload)` cover dismissal) stays on the view layer.
       viewModel.onLensStartHandoff = { procedureId in
         Task { await startHandoff(procedureId: procedureId) }
+      }
+      // Lens-side "Confirm exit" (on-lens end-diagnostic overlay) runs the
+      // same terminal teardown as the phone overlay's confirm path.
+      viewModel.onExitConfirmed = {
+        confirmDiagnosticExit()
       }
       // Activate the troubleshoot lens renderer. Output is gated by
       // `lensOutputEnabled` inside `LensSession.send`, so this is safe
@@ -237,6 +266,7 @@ struct TroubleshootSessionView: View {
       // scoped via `LensDisplayCoordinator`).
       lensSession.deactivate()
       viewModel.onLensStartHandoff = nil
+      viewModel.onExitConfirmed = nil
       viewModel.endSession()
       if transport == .iPhone {
         UIDevice.current.endGeneratingDeviceOrientationNotifications()
@@ -552,6 +582,27 @@ struct TroubleshootSessionView: View {
     case .connecting: return .semanticInfo
     case .error: return .appPrimary
     case .disconnected: return .textTertiary
+    }
+  }
+
+  // MARK: - Glasses session chrome
+
+  private var glassesDeviceName: String {
+    wearablesVM.devices.first.map { wearablesVM.displayName(for: $0) } ?? "Glasses"
+  }
+
+  private var glassesSessionStatus: GlassesSessionStatus {
+    // When connected, surface the diagnostic phase (DIAGNOSING / RESOLUTION /
+    // LIVE); otherwise reflect the connection state like coaching does.
+    switch viewModel.geminiConnectionState {
+    case .connected:
+      return GlassesSessionStatus(label: topBarLabel, dotColor: .green, pulsing: false)
+    case .connecting:
+      return GlassesSessionStatus(label: "CONNECTING", dotColor: .yellow, pulsing: true)
+    case .error:
+      return GlassesSessionStatus(label: "RECONNECTING", dotColor: .yellow, pulsing: true)
+    case .disconnected:
+      return GlassesSessionStatus(label: "STANDBY", dotColor: .gray, pulsing: false)
     }
   }
 

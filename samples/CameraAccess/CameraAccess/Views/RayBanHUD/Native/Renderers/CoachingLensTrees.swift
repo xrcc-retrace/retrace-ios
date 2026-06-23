@@ -15,8 +15,10 @@
 //
 // Surfaces handled here (per the original plan inventory):
 //   1. Step page — .collapsed / .referenceInline / .insightsInline
-//      (one tree; the clip / insights panel expands INLINE beneath a
-//       truncated step card — there is no separate reference/insights page)
+//      (one tree; the image / insights panel REPLACES the step card inline —
+//       there is no separate reference/insights page. A VIDEO reference is not
+//       an inline panel: tapping the Reference pill plays it full-screen
+//       directly, so .referenceInline for a video carries only an error card.)
 //   2. Step page — .stepExpanded (paginated description)
 //   3. Step completion celebration (1.5s window)
 //   4. Completion page
@@ -44,7 +46,6 @@ struct CoachingLensCallbacks {
   let onDescPageNext: () -> Void
   let onMuteToggle: @Sendable () -> Void
   let onExit: @Sendable () -> Void
-  let onReferenceClipTap: () -> Void
   let onRetryClip: () -> Void
   let onCompletionExit: @Sendable () -> Void
   let onExitConfirmCancel: () -> Void
@@ -90,8 +91,12 @@ enum CoachingLensTrees {
   /// single content slot directly under the top band:
   ///
   ///   • `.collapsed`        — top band + step card + audio row
-  ///   • `.referenceInline`  — the clip/image panel REPLACES the step card
-  ///                           (card removed entirely; Reference pill → "Hide ref")
+  ///   • `.referenceInline`  — IMAGE references only: the manual-page image
+  ///                           panel REPLACES the step card (card removed;
+  ///                           Reference pill → "Hide ref"). VIDEO references
+  ///                           never enter this state on the happy path — the
+  ///                           pill plays the clip full-screen directly; this
+  ///                           state only carries a video load-error card.
   ///   • `.insightsInline`   — the insights panel REPLACES the step card
   ///                           (card removed entirely; Insights pill → "Hide insights")
   ///
@@ -165,28 +170,19 @@ enum CoachingLensTrees {
       // the open panel REPLACES the step card in this same position — the
       // card is removed entirely, not truncated or pushed down.
       if referenceOpen {
-        // Reference panel: a load error, a playable video clip, or a
-        // static image — whichever the step has.
+        // Reference panel: only a VIDEO load error or a static IMAGE reaches
+        // here. A video reference plays full-screen DIRECTLY from the pill tap
+        // (see CoachingLensRenderer.playReferenceVideo) — there is no inline
+        // poster step — so `.referenceInline` for a video only ever shows the
+        // error card below.
         if let errorMsg = s.clipErrorMessage {
-          // Visible failure instead of a silent no-op. "Try again" re-renders
-          // the playable poster so the user can retap (LensSession logs why).
+          // Visible failure instead of a silent no-op. "Try again" re-attempts
+          // full-screen playback (LensSession logs the concrete reason).
           LensComponents.cardPanel(spacing: 8, padding: 14) {
-            Icon(name: .exclamationTriangle, style: .outline)
+            LensComponents.iconRow(.exclamationTriangle)
             Text(errorMsg, style: .heading, color: .primary)
             togglePill(icon: .twoArrowsClockwise, label: "Try again", onTap: cb.onRetryClip)
           }
-        } else if s.referenceIsVideo {
-          // Playable clip — tap hands off to the full-screen VideoPlayer.
-          LensComponents.cardPanel(spacing: 8, padding: 12) {
-            if let posterURI = s.referencePosterURL {
-              Image(uri: posterURI, sizePreset: .fill, cornerRadius: .medium)
-            } else {
-              // Poster route unreachable (e.g. LAN http) — text fallback.
-              Text("Reference clip", style: .heading, color: .primary)
-            }
-            Text("Tap to play full-screen", style: .meta, color: .secondary)
-          }
-          .onTap(cb.onReferenceClipTap)
         } else {
           // Static reference image (manual page) — show, don't play.
           // The step card is gone while this panel is open, so the caption
@@ -206,7 +202,7 @@ enum CoachingLensTrees {
         LensComponents.cardPanel(spacing: 8, padding: 14) {
           Text("INSIGHTS", style: .meta, color: .secondary)
           if s.insights.isEmpty {
-            Icon(name: .exclamationTriangle, style: .outline)
+            LensComponents.iconRow(.exclamationTriangle)
             Text("No insights", style: .heading, color: .primary)
             Text("Just follow the step instructions.", style: .body, color: .secondary)
           } else {
@@ -328,7 +324,7 @@ enum CoachingLensTrees {
         crossAlignment: .center,
         padding: 24
       ) {
-        Icon(name: .checkmark, style: .filled)
+        LensComponents.iconRow(.checkmark, style: .filled)
         Text("Step completed", style: .heading, color: .primary)
         Text("Step \(completedStep) of \(s.totalSteps)", style: .meta, color: .secondary)
       }
@@ -354,7 +350,7 @@ enum CoachingLensTrees {
         crossAlignment: .center,
         padding: 20
       ) {
-        Icon(name: .checkmark, style: .filled)
+        LensComponents.iconRow(.checkmark, style: .filled)
         Text(s.procedureTitle ?? "Procedure complete", style: .heading, color: .primary)
         if let duration = s.formattedSessionDuration {
           Text("\(s.totalSteps) steps · \(duration)", style: .body, color: .secondary)

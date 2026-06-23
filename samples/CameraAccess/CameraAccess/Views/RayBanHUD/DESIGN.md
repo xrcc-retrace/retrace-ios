@@ -366,6 +366,19 @@ This is a hard rule. The Expert + Coaching exit overlays are already on the Core
 
 `RetraceAudioMeter` is the reference. Single peak input drives a rolling buffer + per-bar phase wobble. The wobble is multiplied by smoothed loudness so silence resolves cleanly to flat — never an ambient idle pulse. Any future audio-reactive component should follow the same "amplitude scales motion, silence scales it to zero" rule.
 
+### Native lens (MWDATDisplay) — frame-loop animation
+
+The two animation rules above are for the **on-phone SwiftUI emulator**. The **real glasses lens** has no animation primitive — the DSL has no transforms, no opacity grades, and `Image(uri:)` does not animate GIFs. The only way to animate on-glasses is to **send a new `FlexBox` tree per frame** from the renderer.
+
+Pattern (reference: `ExpertLensRenderer.beginStopCountdown` countdown, and `TroubleshootLensRenderer`'s paper-airplane search animation):
+
+- The renderer owns a `Task<Void, Never>?` frame loop: `while !Task.isCancelled { try await Task.sleep(~120ms /* ~8fps */); frame += 1; scheduleSend() }`.
+- A monotonic `frame: Int` flows into the `Equatable` snapshot, so each frame is a distinct (non-duplicate) send. Keep cadence ≤ ~8fps — the lens streams over the BT Display link.
+- Start/stop the loop on **state edges** (e.g. only while `searchNarration ∈ {searchingWeb, synthesizing}`); cancel + reset `frame = 0` in the renderer's `cancel()` so `LensSession.deactivate()` tears it down cleanly. Wrap the loop body in `do/catch` to swallow `CancellationError`.
+- **Horizontal motion** is done with `flexGrow`, not position: place the moving glyph between two empty spacer `FlexBox`es and interpolate their `flexGrow(Float)` ratio per frame (the `Alignment` enum has no positioning). The paper-airplane "send to the web and back" track (`LensComponents.airplaneTrack(frame:)`) ping-pongs a `.paperAirplane` between a `.smartGlasses` anchor and a `.globeWesternHemisphere` anchor this way.
+
+Keep these animations purposeful and short — they exist to make a genuine wait (a network round-trip) feel alive, not as ambient idle motion.
+
 ---
 
 ## Worked Examples

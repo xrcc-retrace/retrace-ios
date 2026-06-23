@@ -89,6 +89,18 @@ class AudioSessionManager: ObservableObject {
   /// Tracks scheduled buffers so we know when AI stops speaking.
   private var scheduledBufferCount = 0
 
+  // MARK: - Lobby music (overlaps Gemini, ducked)
+
+  /// Second player node mixed into the same engine as `playerNode`, used for
+  /// looping "lobby" music during the troubleshoot online-search wait. It plays
+  /// UNDERNEATH Gemini (ducked via `volume`) rather than pausing it — both nodes
+  /// fan into `mainMixerNode` and out the glasses/phone speaker.
+  private let musicNode = AVAudioPlayerNode()
+  /// Ducked low so Gemini stays intelligible if it speaks over the music.
+  private let musicVolume: Float = 0.18
+  /// True while a lobby loop is scheduled/playing. Guards idempotent start/stop.
+  private var musicPlaying = false
+
   // MARK: - Observability
 
   private var captureBuffersSinceLastFlush = 0
@@ -174,6 +186,13 @@ class AudioSessionManager: ObservableObject {
     if mode == .coaching || mode == .coachingPhoneOnly {
       engine.attach(playerNode)
       engine.connect(playerNode, to: engine.mainMixerNode, format: playbackFormat)
+      // Lobby-music node shares the same mixer/output, ducked low. Connected
+      // with a nil format so the mixer adopts the scheduled buffer's format
+      // (the music file may be 44.1k stereo) and sample-rate-converts to the
+      // hardware route.
+      engine.attach(musicNode)
+      engine.connect(musicNode, to: engine.mainMixerNode, format: nil)
+      musicNode.volume = musicVolume
     }
 
     NotificationCenter.default.addObserver(
@@ -881,13 +900,28 @@ class AudioSessionManager: ObservableObject {
   }
 
   func stopCapture() {
-    guard isCapturing else { return }
+    // Tear down even if capture never started. `configureSessionOnly()`
+    // activates the shared `AVAudioSession` (`setActive(true)`) as a SEPARATE
+    // step from `startCapture()`, and `isCapturing` only flips true once
+    // `engine.start()` succeeds. So there's a real window — still connecting,
+    // or a silent `engine.start()` failure on the BT/HFP path — where the
+    // session is ACTIVE but `isCapturing == false`. If we early-returned on
+    // `isCapturing` there, exiting would leave the session active; the next
+    // flow (e.g. glasses recording) then stacks its `.record`+HFP activation
+    // ON TOP of the still-active session, which makes the glasses show their
+    // native "on a call" UI. `didConfigureSession` is true exactly when the
+    // session was activated, so gate on either. The engine/tap teardown below
+    // is a safe no-op when nothing was started.
+    guard isCapturing || didConfigureSession else { return }
     inputNode.removeTap(onBus: 0)
     // Flush pending playback buffers FIRST so the player-node stop can't be
     // racing with a scheduled buffer callback (only applies to coaching modes).
     if mode == .coaching || mode == .coachingPhoneOnly {
       playerNode.stop()
       scheduledBufferCount = 0
+      // Lobby music can never outlive the session.
+      musicNode.stop()
+      musicPlaying = false
     }
     engine.stop()
     isCapturing = false
@@ -1157,6 +1191,68 @@ class AudioSessionManager: ObservableObject {
     if engine.isRunning {
       playerNode.play()
     }
+  }
+
+  // MARK: - Lobby music
+
+  /// Start (or restart) looping lobby music UNDERNEATH Gemini. Always seeds
+  /// from the top of the track — calling this while already playing re-starts
+  /// it from frame 0. No-op unless we're in a coaching playback mode with a
+  /// running engine, and a no-op (logged once) if no bundled track is present
+  /// so the rest of the feature works before the asset lands.
+  func startLobbyMusic() {
+    guard mode == .coaching || mode == .coachingPhoneOnly else { return }
+    guard engine.isRunning else {
+      print("[AudioSession] startLobbyMusic skipped — engine not running")
+      return
+    }
+    guard let url = Self.lobbyMusicURL() else {
+      print("[AudioSession] startLobbyMusic — no bundled lobby track found (add Resources/lobby_music.*)")
+      return
+    }
+
+    // Always restart from the beginning.
+    musicNode.stop()
+    musicPlaying = false
+
+    do {
+      let file = try AVAudioFile(forReading: url)
+      let format = file.processingFormat
+      let frames = AVAudioFrameCount(file.length)
+      guard frames > 0,
+            let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else {
+        print("[AudioSession] startLobbyMusic — empty/invalid track")
+        return
+      }
+      try file.read(into: buffer)
+      musicNode.volume = musicVolume
+      // `.loops` re-plays the buffer seamlessly until `stop()`.
+      musicNode.scheduleBuffer(buffer, at: nil, options: .loops, completionHandler: nil)
+      musicNode.play()
+      musicPlaying = true
+      print("[AudioSession] lobby music started (looping, vol \(musicVolume))")
+    } catch {
+      print("[AudioSession] startLobbyMusic failed: \(error)")
+    }
+  }
+
+  /// Stop lobby music. Safe to call when not playing.
+  func stopLobbyMusic() {
+    guard musicPlaying else { return }
+    musicNode.stop()
+    musicPlaying = false
+    print("[AudioSession] lobby music stopped")
+  }
+
+  /// Locate a bundled lobby-music track. Accepts a few common containers so a
+  /// designer can drop in whatever they have.
+  private static func lobbyMusicURL() -> URL? {
+    for ext in ["m4a", "mp3", "caf", "wav"] {
+      if let url = Bundle.main.url(forResource: "lobby_music", withExtension: ext) {
+        return url
+      }
+    }
+    return nil
   }
 
   // MARK: - Format Conversion (mic → PCM16 16kHz mono for Gemini)

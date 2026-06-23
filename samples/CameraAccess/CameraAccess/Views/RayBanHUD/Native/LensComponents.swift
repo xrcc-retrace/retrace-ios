@@ -56,11 +56,14 @@ enum LensComponents {
     .background(.card)
   }
 
-  /// Small uppercase chip in a `.card` background. Used for phase
-  /// indicators ("IDENTIFY", "DIAGNOSE", "FIND FIX") and product chips
-  /// (uppercased product name on the diagnose page).
+  /// Small uppercase chip in a `.card` background. Used for product /
+  /// category chips (uppercased product name on the diagnose page, "DEVICE"
+  /// on the confirm overlay). Label is CENTERED so that when the chip is
+  /// stretched full-width under a `.stretch` parent the text sits in the
+  /// middle of the pill (not left-aligned). When the chip is sized to its
+  /// content (e.g. via `.alignSelf(.center)`), centering is a no-op.
   static func phaseChip(_ label: String, color: TextColor = .secondary) -> FlexBox {
-    FlexBox(direction: .row, spacing: 0, alignment: .start, crossAlignment: .center) {
+    FlexBox(direction: .row, spacing: 0, alignment: .center, crossAlignment: .center) {
       Text(label.uppercased(), style: .meta, color: color)
     }
     .padding(6)
@@ -138,6 +141,129 @@ enum LensComponents {
     }
     .padding(24)
     .background(.card)
+  }
+
+  /// A single icon wrapped in a start-aligned row so it renders at its
+  /// natural, small inline size at the TOP-LEFT of a card — and does not
+  /// stretch. A lone `Icon` placed directly as a column child renders
+  /// oversized on the lens (it fills the card and the text overlaps it);
+  /// nesting it in a row is the fix. Mirrors the phone stage-header card's
+  /// small leading icon.
+  static func iconRow(_ name: IconName, style: IconStyle = .outline) -> FlexBox {
+    FlexBox(
+      direction: MWDATDisplay.Direction.row,
+      spacing: 0,
+      alignment: .start,
+      crossAlignment: .center
+    ) {
+      Icon(name: name, style: style)
+    }
+  }
+
+  /// Full-width static action pill with a CENTERED icon+label in a `.card`
+  /// background. This is the lens-native replacement for the DSL `Button`
+  /// (which left-aligns its label and carries a built-in collapse/expand
+  /// press animation the user dislikes). `icon` is optional — pass `nil` for
+  /// a text-only pill when no mapped glyph fits (e.g. "Upload a manual").
+  ///
+  /// Used by the troubleshoot resolved / no-solution / confirm / exit
+  /// surfaces; mirrors coaching's centered pills.
+  static func actionPill(
+    icon: IconName? = nil,
+    label: String,
+    onTap: @escaping () -> Void
+  ) -> FlexBox {
+    FlexBox(
+      direction: MWDATDisplay.Direction.row,
+      spacing: 6,
+      alignment: .center,
+      crossAlignment: .center
+    ) {
+      if let icon {
+        Icon(name: icon, style: .outline)
+      }
+      Text(label, style: .body, color: .primary)
+    }
+    .padding(8)
+    .background(.card)
+    .onTap(onTap)
+  }
+
+  /// Slim 3-segment diagnostic phase indicator, the lens companion to the
+  /// phone's `DiagnosticPhaseLensBar`. `activeIndex`: 0 = Identify,
+  /// 1 = Diagnose, 2 = Find a fix.
+  ///
+  /// Bright-vs-faint, not filled-vs-invisible: the lens `Background` enum is
+  /// only `.none`/`.card` with no opacity, so a future segment can't be a
+  /// "dim fill". The one lever with two visible levels is `TextColor`
+  /// (`.primary`/`.secondary`), so future segments render a `.secondary`
+  /// dash — a faint but visible track — while past+current segments are a
+  /// solid `.card` bar. (Closest we can get to the phone bar's 0.95/0.18.)
+  static func phaseSegments(activeIndex: Int) -> FlexBox {
+    FlexBox(
+      direction: MWDATDisplay.Direction.row,
+      spacing: 6,
+      alignment: .start,
+      crossAlignment: .center
+    ) {
+      for i in 0..<3 {
+        if i <= activeIndex {
+          // Done / current — solid filled bar (a space gives it height).
+          FlexBox(direction: MWDATDisplay.Direction.row, spacing: 0, alignment: .center, crossAlignment: .center) {
+            Text(" ", style: .meta, color: .primary)
+          }
+          .flexGrow(1)
+          .padding(2)
+          .background(.card)
+        } else {
+          // Upcoming — faint dash, no fill, still holding its flexGrow width.
+          FlexBox(direction: MWDATDisplay.Direction.row, spacing: 0, alignment: .center, crossAlignment: .center) {
+            Text("—", style: .meta, color: .secondary)
+          }
+          .flexGrow(1)
+          .padding(2)
+        }
+      }
+    }
+  }
+
+  /// Paper-airplane "sending to the web and back" animation track. A glasses
+  /// icon anchors the left (you), a globe anchors the right (the web), and a
+  /// paper airplane shuttles between them. Horizontal motion is achieved with
+  /// two empty `flexGrow` spacers whose ratio is interpolated by `frame` (the
+  /// `Alignment` enum has no positioning, but `FlexBox.flexGrow(Float)` does).
+  ///
+  /// `frame` is the renderer's monotonic frame counter; the airplane ping-pongs
+  /// with a fixed period, so "send" and "return" read as one continuous loop.
+  /// Driven by `TroubleshootLensRenderer`'s ~8fps frame loop during the
+  /// online-search window.
+  static func airplaneTrack(frame: Int) -> FlexBox {
+    let period = 24
+    let half = period / 2
+    let phase = ((frame % period) + period) % period
+    // Triangle wave 0 → 1 → 0 across the period (out to the web, then back).
+    let pos: Double = phase <= half
+      ? Double(phase) / Double(half)
+      : Double(period - phase) / Double(half)
+    // Bias away from 0 so neither spacer fully collapses (keeps the anchors
+    // pinned to the edges and the plane off the icons).
+    let pLeft = Float(max(0.04, pos))
+    let pRight = Float(max(0.04, 1.0 - pos))
+
+    return FlexBox(
+      direction: MWDATDisplay.Direction.row,
+      spacing: 6,
+      alignment: .start,
+      crossAlignment: .center
+    ) {
+      Icon(name: .smartGlasses, style: .outline)
+      FlexBox(direction: MWDATDisplay.Direction.row, spacing: 0, alignment: .center, crossAlignment: .center) {}
+        .flexGrow(pLeft)
+      Icon(name: .paperAirplane, style: .filled)
+      FlexBox(direction: MWDATDisplay.Direction.row, spacing: 0, alignment: .center, crossAlignment: .center) {}
+        .flexGrow(pRight)
+      Icon(name: .globeWesternHemisphere, style: .outline)
+    }
   }
 
   // MARK: - Helpers

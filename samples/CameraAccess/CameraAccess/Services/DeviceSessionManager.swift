@@ -130,12 +130,17 @@ final class DeviceSessionManager: ObservableObject {
   private let wearables: WearablesInterface
 
   /// Filterless selector — drives `hasAnyActiveDevice` and is used for
-  /// `.any` acquires.
-  private let anyDeviceSelector: AutoDeviceSelector
+  /// `.any` acquires. `var`, not `let`: an `AutoDeviceSelector` created before
+  /// any device is available (app launched pre-permission) can stay latched at
+  /// "no device" and never recover when permission is later granted mid-session
+  /// — so `restartDeviceMonitoring()` recreates it on the permission→granted
+  /// transition, replicating what a cold app launch does.
+  private var anyDeviceSelector: AutoDeviceSelector
 
   /// Display-capable filter selector — drives `hasDisplayCapableDevice`
-  /// and is used for `.requiresDisplay` acquires.
-  private let displayDeviceSelector: AutoDeviceSelector
+  /// and is used for `.requiresDisplay` acquires. `var` for the same
+  /// post-permission-recovery reason as `anyDeviceSelector`.
+  private var displayDeviceSelector: AutoDeviceSelector
 
   /// The one active DeviceSession (if any). At most one session per
   /// physical device at a time; consumers share it.
@@ -152,11 +157,30 @@ final class DeviceSessionManager: ObservableObject {
   /// `Self.teardownInFlight` gate.
   private var lifecycleTask: Task<Void, Never>?
 
+  /// Set true whenever a session was torn down this cycle (via
+  /// `teardownActiveSession`). `acquire()` consumes it to insert a brief settle
+  /// before a fresh `createSession`: the SDK reports `DeviceSession.stopped`
+  /// *before* its WARP transport threads actually exit, so recreating too fast
+  /// stands up a second WARP stack alongside the one still draining — the
+  /// `DCTEvent` use-after-free crash (deref of a freed `datax_list` in
+  /// `tryOpenChannel`). Heuristic mitigation for an SDK-internal lifecycle gap.
+  private var recentlyToreDown: Bool = false
+
   /// Per-device `LinkState` cache + listener tokens, keyed by `DeviceIdentifier`.
   /// Refreshed whenever `devicesStream()` emits and whenever a device's
   /// `addLinkStateListener` fires. Derives `hasConnectedDevice`.
   private var deviceLinkState: [DeviceIdentifier: LinkState] = [:]
   private var linkStateTokens: [DeviceIdentifier: AnyListenerToken] = [:]
+
+  /// Raw, un-derived signals straight from the two `AutoDeviceSelector`s. The
+  /// published `hasAnyActiveDevice` / `hasDisplayCapableDevice` are *derived*
+  /// from these OR-ed with "a connected, compatible device exists" — because
+  /// the filterless `AutoDeviceSelector` can refuse to latch when more than one
+  /// device is paired and one reports `Compatibility.undefined` (observed with
+  /// a Ray-Ban Display + Oakley Vanguard paired simultaneously). See
+  /// `recomputeConnectivity()` and `connectedCompatibleDeviceId(_:)`.
+  private var selectorHasAnyActive: Bool = false
+  private var selectorHasDisplayActive: Bool = false
 
   /// Background observation tasks.
   private var anyDeviceMonitorTask: Task<Void, Never>?
@@ -208,11 +232,26 @@ final class DeviceSessionManager: ObservableObject {
   func cameraPermissionStatus() async throws -> PermissionStatus {
     do {
       let status = try await wearables.checkPermissionStatus(.camera)
-      cameraPermission = status
+      updateCameraPermission(status)
       return status
     } catch {
       log("cameraPermissionStatus threw: \(error)")
       throw AcquireError.permissionCheckFailed(error.localizedDescription)
+    }
+  }
+
+  /// Single writer for `cameraPermission`. Detects the no→yes transition and,
+  /// on grant, restarts device monitoring with fresh selectors. This is the
+  /// fix for "grant permission mid-session → stays Not Connected until restart":
+  /// the DAT contract only surfaces devices *after* a permission is granted, so
+  /// the selectors/streams created at launch (pre-permission) never see the
+  /// device. Recreating them on the grant edge mirrors a cold launch.
+  private func updateCameraPermission(_ status: PermissionStatus) {
+    let was = cameraPermission
+    cameraPermission = status
+    if status == .granted, was != .granted {
+      log("cameraPermission \(was.map { String(describing: $0) } ?? "nil") → granted; restarting device monitoring")
+      restartDeviceMonitoring()
     }
   }
 
@@ -237,7 +276,7 @@ final class DeviceSessionManager: ObservableObject {
     log("ensureCameraPermissionGranted: not granted (\(current)) — prompting via Meta AI")
     do {
       let after = try await wearables.requestPermission(.camera)
-      cameraPermission = after
+      updateCameraPermission(after)
       log("ensureCameraPermissionGranted: post-prompt status = \(after)")
       log("ensureCameraPermissionGranted: post-prompt devices=\(wearables.devices.count) hasAnyActive=\(hasAnyActiveDevice) hasDisplay=\(hasDisplayCapableDevice)")
       return after
@@ -266,6 +305,46 @@ final class DeviceSessionManager: ObservableObject {
   @discardableResult
   func ensureAllGlassesPermissionsGranted() async throws -> Bool {
     return try await ensureCameraPermissionGranted() == .granted
+  }
+
+  /// Result of a non-prompting camera-permission probe that distinguishes
+  /// "no device connected yet" from a genuine denial. The plain
+  /// `cameraPermissionStatus()` throws `PermissionError.noDevice` whenever no
+  /// device has an established DAT connection at the moment of the call — which
+  /// is *not* a permission problem and must not surface an "Allow camera" CTA.
+  enum CameraPermissionProbe: Equatable, Sendable {
+    /// Camera permission is granted.
+    case granted
+    /// Camera permission is explicitly denied — surface the request CTA.
+    case denied
+    /// No device has an active DAT connection yet (`.noDevice` family). Caller
+    /// should wait and re-probe once a device connects — NOT prompt.
+    case noConnectedDevice
+    /// Meta AI missing / SDK internal error / request already in flight —
+    /// needs user action other than waiting.
+    case unavailable(String)
+  }
+
+  /// Non-prompting probe that maps the SDK's typed `PermissionError` into the
+  /// tri-state above so callers can tell "glasses aren't connected yet" apart
+  /// from "user denied camera access". Refreshes `cameraPermission` on success.
+  func probeCameraPermission() async -> CameraPermissionProbe {
+    // `checkPermissionStatus` is typed-throws `PermissionError`, so the single
+    // `catch` binds `error` as `PermissionError` — no `as?` cast needed.
+    do {
+      let status = try await wearables.checkPermissionStatus(.camera)
+      updateCameraPermission(status)
+      return status == .granted ? .granted : .denied
+    } catch {
+      switch error {
+      case .noDevice, .noDeviceWithConnection, .connectionError, .requestTimeout:
+        return .noConnectedDevice
+      case .metaAINotInstalled, .requestInProgress, .internalError:
+        return .unavailable(error.description)
+      @unknown default:
+        return .unavailable(error.description)
+      }
+    }
   }
 
   // MARK: - Public API — sessions
@@ -381,7 +460,22 @@ final class DeviceSessionManager: ObservableObject {
     // `has*ActiveDevice` to flip true.
     await awaitMatchingDevice(requirements: requirements, timeout: 3.0)
 
-    let selector = (requirements == .requiresDisplay) ? displayDeviceSelector : anyDeviceSelector
+    // Prefer an explicit selector for a known connected+compatible device.
+    // The filterless `AutoDeviceSelector` can stall at `nil` when a second
+    // paired device reports `Compatibility.undefined` (e.g. an Oakley Vanguard
+    // alongside the Ray-Ban Display), throwing `noEligibleDevice` even though a
+    // perfectly usable Display is connected. Targeting the device by id with a
+    // `SpecificDeviceSelector` sidesteps the auto-pick ambiguity. Fall back to
+    // the auto-selector when no connected+compatible device is resolvable.
+    let requiresDisplay = (requirements == .requiresDisplay)
+    let selector: any DeviceSelector
+    if let targetId = connectedCompatibleDeviceId(requiresDisplay: requiresDisplay) {
+      selector = SpecificDeviceSelector(device: targetId)
+      log("acquire(\(consumerLabel)) → SpecificDeviceSelector(\(wearables.deviceForIdentifier(targetId)?.nameOrId() ?? targetId))")
+    } else {
+      selector = requiresDisplay ? displayDeviceSelector : anyDeviceSelector
+      log("acquire(\(consumerLabel)) → falling back to AutoDeviceSelector (no connected+compatible device resolved)")
+    }
     do {
       let paired = wearables.devices
       let pairedDescriptions = paired.map { id -> String in
@@ -392,8 +486,20 @@ final class DeviceSessionManager: ObservableObject {
         }
       }.joined(separator: ", ")
       log("acquire(\(consumerLabel)) pre-createSession: req=\(requirements) devices=\(paired.count) [\(pairedDescriptions)]")
+
+      // SDK reports `DeviceSession.stopped` before its WARP transport threads
+      // exit. If a session was just torn down this cycle, settle briefly so a
+      // fresh createSession doesn't stand up a second WARP stack alongside the
+      // one still draining (the `DCTEvent` use-after-free). Heuristic — there's
+      // no SDK signal for "WARP fully drained" beyond `.stopped`.
+      if recentlyToreDown {
+        recentlyToreDown = false
+        log("acquire(\(consumerLabel)) → settle 300ms after recent teardown (WARP drain)")
+        try? await Task.sleep(nanoseconds: 300_000_000)
+      }
+
       log("acquire(\(consumerLabel), req=\(requirements)) → createSession + start")
-      let session = try wearables.createSession(deviceSelector: selector)
+      let session = try await createSessionWithDrainRetry(selector: selector, consumerLabel: consumerLabel)
       deviceSession = session
       startSessionObservers(for: session)
 
@@ -468,6 +574,54 @@ final class DeviceSessionManager: ObservableObject {
     }
     lifecycleTask = task
     await task.value
+  }
+
+  /// Serialized teardown of the active session, used by the registration-
+  /// `.unavailable` and stateStream-`.stopped` observers (which fire
+  /// asynchronously, outside any `acquire`/`release` call). Mirrors `release()`:
+  /// chains onto `lifecycleTask` → `stop()` → `await waitForSessionStopped` →
+  /// nil. Because `acquire()` awaits `lifecycleTask` at its top, a concurrent
+  /// re-acquire cannot stand up a replacement session until this one reaches
+  /// terminal `.stopped` — closing the window that produced two live WARP
+  /// stacks. Fire-and-forget (the observers can't await): the serialization
+  /// guarantee comes from `acquire()` awaiting `lifecycleTask`, not from here.
+  private func teardownActiveSession(reason: String) {
+    guard let session = deviceSession else { return }
+    log("teardownActiveSession(\(reason))")
+    recentlyToreDown = true
+    let prior = lifecycleTask
+    let task = Task { [weak self] in
+      await prior?.value
+      session.stop()
+      await self?.waitForSessionStopped(session)
+      await MainActor.run { [weak self] in
+        guard let self else { return }
+        if self.deviceSession === session {
+          self.deviceSession = nil
+        }
+        self.stopSessionObservers()
+      }
+    }
+    lifecycleTask = task
+  }
+
+  /// `wearables.createSession`, tolerant of a prior session whose WARP transport
+  /// is still draining. The SDK can clear its session bookkeeping (so a fresh
+  /// createSession is allowed) before the old transport threads exit; if it's
+  /// still mid-teardown it instead throws `.sessionAlreadyExists`. In that case
+  /// back off once and retry rather than failing the acquire. Heuristic for the
+  /// same stopped-vs-WARP-drain gap as the settle in `acquire()`.
+  private func createSessionWithDrainRetry(
+    selector: any DeviceSelector,
+    consumerLabel: String
+  ) async throws -> DeviceSession {
+    do {
+      return try wearables.createSession(deviceSelector: selector)
+    } catch DeviceSessionError.sessionAlreadyExists {
+      log("acquire(\(consumerLabel)) → createSession threw .sessionAlreadyExists; backing off 300ms and retrying once")
+      try? await Task.sleep(nanoseconds: 300_000_000)
+      return try wearables.createSession(deviceSelector: selector)
+    }
   }
 
   // MARK: - Private — requirements
@@ -607,8 +761,13 @@ final class DeviceSessionManager: ObservableObject {
         guard let self else { return }
         self.log("DeviceSession.state → \(state)")
         if state == .stopped {
+          // Route through the serialized teardown (not a bare nil) so an
+          // in-flight re-acquire serializes behind the cleanup and the
+          // post-teardown settle, rather than racing a fresh createSession
+          // against the still-draining WARP stack. waitForSessionStopped
+          // early-returns since we're already `.stopped`.
           if self.deviceSession === session {
-            self.deviceSession = nil
+            self.teardownActiveSession(reason: "stateStream .stopped")
           }
           return
         }
@@ -641,16 +800,52 @@ final class DeviceSessionManager: ObservableObject {
       guard let strong = self else { return }
       for await deviceId in strong.anyDeviceSelector.activeDeviceStream() {
         guard let strong = self else { return }
-        strong.hasAnyActiveDevice = deviceId != nil
+        strong.selectorHasAnyActive = deviceId != nil
+        strong.recomputeConnectivity()
       }
     }
     displayDeviceMonitorTask = Task { [weak self] in
       guard let strong = self else { return }
       for await deviceId in strong.displayDeviceSelector.activeDeviceStream() {
         guard let strong = self else { return }
-        strong.hasDisplayCapableDevice = deviceId != nil
+        strong.selectorHasDisplayActive = deviceId != nil
+        strong.recomputeConnectivity()
       }
     }
+  }
+
+  /// Recreate the device selectors and re-subscribe every device-monitoring
+  /// stream. Called on the camera-permission→granted edge.
+  ///
+  /// Why recreate rather than just re-derive: a long-lived `AutoDeviceSelector`
+  /// instantiated before any device was available (the app launched with no
+  /// permission, so `devicesStream` was empty) does not recover when the device
+  /// later appears post-grant — `activeDeviceStream()` stays at `nil`. A cold
+  /// launch works only because the selectors are built *after* permission
+  /// already exists. This reproduces that: fresh selectors + a fresh
+  /// `devicesStream` subscription that re-seeds link listeners and recomputes.
+  private func restartDeviceMonitoring() {
+    log("restartDeviceMonitoring: recreating selectors + re-subscribing streams")
+    anyDeviceMonitorTask?.cancel()
+    displayDeviceMonitorTask?.cancel()
+    deviceLinkMonitorTask?.cancel()
+    for token in linkStateTokens.values { Task { await token.cancel() } }
+    linkStateTokens.removeAll()
+    selectorHasAnyActive = false
+    selectorHasDisplayActive = false
+
+    anyDeviceSelector = AutoDeviceSelector(wearables: wearables)
+    displayDeviceSelector = AutoDeviceSelector(
+      wearables: wearables,
+      filter: { $0.supportsDisplay() }
+    )
+
+    startDeviceMonitoring()
+    startLinkStateMonitoring()
+    // Seed synchronously from the current device set so eligibility updates
+    // immediately on grant rather than waiting for the next stream tick
+    // (idempotent with the async seed inside startLinkStateMonitoring).
+    refreshLinkListeners(for: wearables.devices)
   }
 
   // MARK: - Private — link-state (connection) monitoring
@@ -709,16 +904,46 @@ final class DeviceSessionManager: ObservableObject {
     recomputeConnectivity()
   }
 
-  /// Recompute `hasConnectedDevice` from the per-device link cache. Idempotent.
+  /// Identifier of a paired device that is link-connected AND compatible,
+  /// optionally requiring display support. This is the device we can actually
+  /// start a session on right now — used both to derive the published
+  /// eligibility flags and to build a `SpecificDeviceSelector` for
+  /// `createSession`, sidestepping the filterless `AutoDeviceSelector`'s
+  /// refusal to auto-pick among multiple devices when one is
+  /// `Compatibility.undefined`. Returns the first match in `wearables.devices`
+  /// order.
+  func connectedCompatibleDeviceId(requiresDisplay: Bool) -> DeviceIdentifier? {
+    for id in wearables.devices {
+      guard let device = wearables.deviceForIdentifier(id) else { continue }
+      guard device.linkState == .connected else { continue }
+      guard device.compatibility() == .compatible else { continue }
+      if requiresDisplay && !device.supportsDisplay() { continue }
+      return id
+    }
+    return nil
+  }
+
+  /// Recompute the published connectivity flags. Idempotent.
+  ///
+  /// - `hasConnectedDevice` — any device link-connected (raw transport truth).
+  /// - `hasAnyActiveDevice` / `hasDisplayCapableDevice` — the auto-selector
+  ///   signal OR a connected+compatible device exists. The OR is the fix for
+  ///   the auto-selector stalling at `nil` while a compatible Display is
+  ///   plainly connected; `acquire` then targets that device explicitly.
   private func recomputeConnectivity() {
     let connected = deviceLinkState.values.contains(.connected)
-    if connected != hasConnectedDevice {
-      hasConnectedDevice = connected
-    }
+    if connected != hasConnectedDevice { hasConnectedDevice = connected }
+
+    let anyEligible = selectorHasAnyActive || connectedCompatibleDeviceId(requiresDisplay: false) != nil
+    if anyEligible != hasAnyActiveDevice { hasAnyActiveDevice = anyEligible }
+
+    let displayEligible = selectorHasDisplayActive || connectedCompatibleDeviceId(requiresDisplay: true) != nil
+    if displayEligible != hasDisplayCapableDevice { hasDisplayCapableDevice = displayEligible }
+
     let snapshot = deviceLinkState
       .map { "\(wearables.deviceForIdentifier($0.key)?.nameOrId() ?? $0.key)=\($0.value)" }
       .joined(separator: ", ")
-    log("connectivity: hasConnectedDevice=\(hasConnectedDevice) hasAnyActive=\(hasAnyActiveDevice) links=[\(snapshot)]")
+    log("connectivity: connected=\(hasConnectedDevice) anyActive=\(hasAnyActiveDevice) (selector=\(selectorHasAnyActive)) displayCapable=\(hasDisplayCapableDevice) (selector=\(selectorHasDisplayActive)) links=[\(snapshot)]")
   }
 
   // MARK: - Private — registration observation
@@ -730,15 +955,17 @@ final class DeviceSessionManager: ObservableObject {
         guard let self else { return }
         self.log("registrationState → \(state)")
         if state == .unavailable {
-          // The device is no longer paired — invalidate any session
-          // we're holding. Lease holders will discover this via their
-          // own state observers and re-acquire on the next attempt.
-          if let session = self.deviceSession {
-            session.stop()
-            self.deviceSession = nil
-            self.leases.removeAll()
-            self.stopSessionObservers()
-          }
+          // The device is no longer paired — invalidate any session we're
+          // holding. Lease holders discover this via their own state observers
+          // and re-acquire on the next attempt. Previously this stopped the
+          // session and nil'd the reference synchronously, bypassing
+          // `lifecycleTask` and never awaiting `.stopped` — letting a re-acquire
+          // create a replacement while the old WARP transport was still draining
+          // (two live stacks → the `DCTEvent` use-after-free). Route through the
+          // serialized teardown so the next `acquire()` waits for terminal
+          // `.stopped` + settle before recreating.
+          self.leases.removeAll()
+          self.teardownActiveSession(reason: "registration .unavailable")
         }
       }
     }

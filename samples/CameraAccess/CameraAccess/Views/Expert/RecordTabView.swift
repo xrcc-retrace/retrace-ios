@@ -52,6 +52,7 @@ struct RecordTabView: View {
       IPhoneRecordingView(
         transport: transport,
         wearables: wearables,
+        glassesDeviceName: wearablesVM.devices.first.map { wearablesVM.displayName(for: $0) } ?? "Glasses",
         uploadService: uploadService,
         onAcknowledgeProcedure: handleProcedureAcknowledged,
         onRecordingComplete: handleRecordingComplete,

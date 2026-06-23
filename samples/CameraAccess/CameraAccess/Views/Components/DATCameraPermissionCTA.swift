@@ -117,6 +117,15 @@ struct DATCameraPermissionCTA: View {
         Task { await checkAfterRegistration() }
       }
     }
+    .onChange(of: sessionManager.hasConnectedDevice) { _, connected in
+      // The first probe can land before the glasses finish connecting and
+      // resolve to `.noConnectedDevice` (phase stays `.checking`). Re-probe the
+      // moment a device link comes up so we settle on the real granted/denied
+      // state instead of spinning forever.
+      if connected, registrationState == .registered, phase == .checking {
+        Task { await checkAfterRegistration() }
+      }
+    }
   }
 
   // MARK: - Style: button (onboarding + HomeScreen)
@@ -255,36 +264,31 @@ struct DATCameraPermissionCTA: View {
   /// `AudioSessionManager.requestMicrophonePermission()`.
   private func checkAfterRegistration() async {
     phase = .checking
-    let granted: Bool? = await Self.runWithTimeout(
+    // `probeCameraPermission()` distinguishes "no device connected yet"
+    // (`.noConnectedDevice` — the SDK throws `PermissionError.noDevice` when no
+    // device has an active DAT connection at call time) from a genuine denial.
+    // The old path collapsed both into "surface the Allow CTA", which fired a
+    // false prompt whenever the check ran before the glasses finished
+    // connecting. A real denial still returns `.denied` and surfaces the CTA.
+    let probe: DeviceSessionManager.CameraPermissionProbe? = await Self.runWithTimeout(
       seconds: Self.statusCheckTimeout
     ) { [sessionManager] in
-      // Inline do/catch so we surface the underlying error before the
-      // runWithTimeout race resolves — the original `try?` swallowed it
-      // and the outer "timed out" message was misleading (it fired
-      // immediately on a thrown error rather than after the actual
-      // 5s budget). Logging the real error tells us whether the SDK
-      // is returning .denied (action: prompt) vs throwing a
-      // PermissionError (action: investigate Dev Mode / DAT helper).
-      do {
-        let value = try await sessionManager.allGlassesPermissionsGranted()
-        print("[CTA] allGlassesPermissionsGranted returned: \(value)")
-        return value
-      } catch {
-        print("[CTA] allGlassesPermissionsGranted threw — type=\(String(describing: type(of: error))) value=\(error)")
-        return nil
-      }
+      await sessionManager.probeCameraPermission()
     }
-    if granted == nil {
-      // Either a real 5s timeout OR the inner closure logged a throw
-      // immediately and we got here via that path. The [CTA] log above
-      // is the source of truth.
-      print("[DATCameraPermissionCTA] allGlassesPermissionsGranted timed out after \(Self.statusCheckTimeout)s — surfacing CTA")
-    }
-    if granted == true {
+    print("[CTA] probeCameraPermission → \(probe.map { String(describing: $0) } ?? "timeout")")
+    switch probe {
+    case .granted:
       phase = .granted
       onGranted?()
-    } else {
+    case .denied, .unavailable:
       phase = .needsRequest
+    case .noConnectedDevice, nil:
+      // Not a permission problem — the glasses just aren't connected yet (or
+      // the probe timed out). Stay in the "checking" state and re-probe when a
+      // device connects (see `.onChange(of: sessionManager.hasConnectedDevice)`).
+      // Do NOT surface the Allow CTA here, or we'd nag for permission the user
+      // has likely already granted.
+      phase = .checking
     }
   }
 

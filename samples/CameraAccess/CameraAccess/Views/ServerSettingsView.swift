@@ -51,6 +51,11 @@ struct DebugSettingsSection: View {
   /// existing SwiftUI emulator is the only visible HUD. Flip on when
   /// iterating on native lens output during development.
   @AppStorage("lensOutputEnabled") private var lensOutputEnabled: Bool = false
+  /// Experiment: when true, the glasses camera Stream is stopped while a
+  /// reference clip plays on the lens (and restarted when it ends), to free the
+  /// Bluetooth link for the clip. Default off = current behavior. Pair with the
+  /// `[LensClip] first frame after Xms` log to A/B whether it helps playback.
+  @AppStorage("pauseCameraDuringClip") private var pauseCameraDuringClip: Bool = false
 
   @EnvironmentObject private var lensSession: LensSession
   @State private var smokeTestResult: String?
@@ -101,6 +106,22 @@ struct DebugSettingsSection: View {
             .font(.retraceCallout)
             .foregroundColor(.textPrimary)
           Text("Silences the MediaPipe pinch-drag and micro-gesture pipeline across Expert, Coaching, and Troubleshoot. Touch swipes and taps still work. Useful when running without good lighting or when you'd rather drive the HUD purely from touch.")
+            .font(.retraceCaption1)
+            .foregroundColor(.textTertiary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+      }
+      .tint(.appPrimary)
+      .padding(14)
+      .background(Color.surfaceRaised)
+      .cornerRadius(Radius.md)
+
+      Toggle(isOn: $pauseCameraDuringClip) {
+        VStack(alignment: .leading, spacing: 2) {
+          Text("Pause camera during clip (experiment)")
+            .font(.retraceCallout)
+            .foregroundColor(.textPrimary)
+          Text("While a reference clip plays on the glasses lens, stop the glasses camera stream so its frames stop competing for the Bluetooth link, then restart it when the clip ends. Glasses only. Watch the “[LensClip] first frame after Xms” log with this off vs on to see if it helps.")
             .font(.retraceCaption1)
             .foregroundColor(.textTertiary)
             .fixedSize(horizontal: false, vertical: true)

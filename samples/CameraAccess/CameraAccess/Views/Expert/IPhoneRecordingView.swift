@@ -22,6 +22,9 @@ import SwiftUI
 struct IPhoneRecordingView: View {
   let transport: CaptureTransport
   let wearables: WearablesInterface
+  /// Resolved name of the connected glasses, shown in the glasses-session
+  /// banner. Ignored on the iPhone transport.
+  let glassesDeviceName: String
   let uploadService: UploadService
   let onAcknowledgeProcedure: () -> Void
   let onRecordingComplete: (URL, TimeInterval) -> Void
@@ -34,6 +37,7 @@ struct IPhoneRecordingView: View {
   init(
     transport: CaptureTransport,
     wearables: WearablesInterface,
+    glassesDeviceName: String = "Glasses",
     uploadService: UploadService,
     onAcknowledgeProcedure: @escaping () -> Void,
     onRecordingComplete: @escaping (URL, TimeInterval) -> Void,
@@ -41,6 +45,7 @@ struct IPhoneRecordingView: View {
   ) {
     self.transport = transport
     self.wearables = wearables
+    self.glassesDeviceName = glassesDeviceName
     self.uploadService = uploadService
     self.onAcknowledgeProcedure = onAcknowledgeProcedure
     self.onRecordingComplete = onRecordingComplete
@@ -58,6 +63,7 @@ struct IPhoneRecordingView: View {
     case .glasses:
       GlassesRecordingEngine(
         wearables: wearables,
+        glassesDeviceName: glassesDeviceName,
         uploadService: uploadService,
         onAcknowledgeProcedure: onAcknowledgeProcedure,
         onRecordingComplete: onRecordingComplete,
@@ -197,6 +203,7 @@ private struct IPhoneRecordingEngine: View {
 /// engine 1-for-1 — the only difference is the camera preview view and the
 /// fact that there's no AVCaptureSession orientation to forward.
 private struct GlassesRecordingEngine: View {
+  let glassesDeviceName: String
   let onAcknowledgeProcedure: () -> Void
   let onRecordingComplete: (URL, TimeInterval) -> Void
 
@@ -207,14 +214,20 @@ private struct GlassesRecordingEngine: View {
   @AppStorage("debugMode") private var debugMode: Bool = false
   @AppStorage("hudAdditiveBlend") private var hudAdditiveBlend: Bool = false
   @State private var expertPageIndex: Int = 0
+  // Lens over an app-themed background by default; the raw glasses feed is
+  // hidden until the user taps "Show camera" (handy for framing a shot).
+  // Plain @State so it resets to hidden every session.
+  @State private var showCameraFeed = false
 
   init(
     wearables: WearablesInterface,
+    glassesDeviceName: String,
     uploadService: UploadService,
     onAcknowledgeProcedure: @escaping () -> Void,
     onRecordingComplete: @escaping (URL, TimeInterval) -> Void,
     sessionManager: DeviceSessionManager
   ) {
+    self.glassesDeviceName = glassesDeviceName
     self.onAcknowledgeProcedure = onAcknowledgeProcedure
     self.onRecordingComplete = onRecordingComplete
     self._viewModel = StateObject(
@@ -222,9 +235,26 @@ private struct GlassesRecordingEngine: View {
     )
   }
 
+  private var expertGlassesStatus: GlassesSessionStatus {
+    viewModel.recordingManager.isRecording
+      ? GlassesSessionStatus(
+          label: "REC",
+          dotColor: Color(red: 0.96, green: 0.26, blue: 0.21),
+          pulsing: true
+        )
+      : GlassesSessionStatus(label: "READY", dotColor: .textTertiary, pulsing: false)
+  }
+
   var body: some View {
     ExpertRecordingLayout {
-      GlassesCameraPreview(image: viewModel.currentVideoFrame)
+      Group {
+        if showCameraFeed {
+          GlassesCameraPreview(image: viewModel.currentVideoFrame)
+        } else {
+          GlassesThemedBackground()
+        }
+      }
+      .animation(.easeInOut(duration: 0.25), value: showCameraFeed)
     } hud: {
       expertRecordingHUD(
         recordingManager: viewModel.recordingManager,
@@ -246,19 +276,30 @@ private struct GlassesRecordingEngine: View {
         }
       )
     } chrome: {
-      // Glasses-only: gate the Start CTA on `isReadyToRecord` (set
-      // true after the silent warmup cycle in `prepare()`) AND
-      // `isPreviewLive`. The chrome param is named `isPreviewLive`
-      // for shape-parity with the iPhone engine, but we feed both
-      // signals into it so the disabled state covers warmup too.
-      expertRecordingChrome(
-        recordingManager: viewModel.recordingManager,
-        hudViewModel: viewModel.hudViewModel,
-        isPreviewLive: viewModel.isPreviewLive && viewModel.isReadyToRecord,
-        debugMode: debugMode,
-        onClose: { dismiss() },
-        onStart: { viewModel.startRecording(landscape: false) }
-      )
+      ZStack {
+        // Glasses-session phone chrome — banner (top) + camera feed toggle
+        // (below lens). Rendered beneath the recording controls so the
+        // close button and Start CTA always stay on top and tappable.
+        GlassesSessionChrome(
+          deviceName: glassesDeviceName,
+          status: expertGlassesStatus,
+          showCameraFeed: $showCameraFeed
+        )
+
+        // Glasses-only: gate the Start CTA on `isReadyToRecord` (set
+        // true after the silent warmup cycle in `prepare()`) AND
+        // `isPreviewLive`. The chrome param is named `isPreviewLive`
+        // for shape-parity with the iPhone engine, but we feed both
+        // signals into it so the disabled state covers warmup too.
+        expertRecordingChrome(
+          recordingManager: viewModel.recordingManager,
+          hudViewModel: viewModel.hudViewModel,
+          isPreviewLive: viewModel.isPreviewLive && viewModel.isReadyToRecord,
+          debugMode: debugMode,
+          onClose: { dismiss() },
+          onStart: { viewModel.startRecording(landscape: false) }
+        )
+      }
     }
     .animation(.easeInOut(duration: 0.18), value: viewModel.recordingManager.isHUDActive)
     .task {

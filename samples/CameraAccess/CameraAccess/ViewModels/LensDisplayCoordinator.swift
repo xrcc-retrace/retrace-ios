@@ -308,8 +308,16 @@ final class LensDisplayCoordinator: ObservableObject {
             self.display = nil
             self.coreStateTask?.cancel()
             self.coreStateTask = nil
-            self.deviceSession?.stop()
+            // Release our lease and let the manager decide whether to actually
+            // stop the shared DeviceSession — it stays alive if another consumer
+            // (e.g. "gemini-live") still holds it. Calling `deviceSession?.stop()`
+            // here bypassed the manager's refcount, killing a session other
+            // consumers depend on AND desyncing the manager (it still thought the
+            // session was live), which could trigger a recreate-before-drain →
+            // the doubled WARP stack / `DCTEvent` use-after-free. `release` is
+            // idempotent, so this stays safe if `detachFromDisplay` already ran.
             self.deviceSession = nil
+            await self.sessionManager.release(consumerLabel: "lens")
           @unknown default:
             break
           }

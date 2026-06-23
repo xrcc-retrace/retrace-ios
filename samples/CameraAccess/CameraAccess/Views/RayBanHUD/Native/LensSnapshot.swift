@@ -119,6 +119,11 @@ struct TroubleshootLensSnapshot: Equatable {
   // Exit overlay
   let showDismissConfirmation: Bool
 
+  // Paper-airplane animation frame counter — ticked by the renderer's frame
+  // loop while in the online-search window (searchingWeb / synthesizing).
+  // Drives the airplane's horizontal position; 0 when idle.
+  let searchAnimFrame: Int
+
   /// Mirrors `DiagnosticPhase` in `Models/DiagnosticModels.swift`.
   enum LensDiagnosticPhase: Equatable {
     case discovering

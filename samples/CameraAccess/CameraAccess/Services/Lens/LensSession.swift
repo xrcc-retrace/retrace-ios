@@ -172,12 +172,25 @@ final class LensSession: ObservableObject {
       return
     }
 
+    // Latency instrumentation (always on, independent of any experiment toggle):
+    // the `.started` event is the real "video began playing" signal, so the gap
+    // from our `coordinator.send` below is the on-glasses load latency we're
+    // tuning. `clipSendAt` is captured by reference and set just before the send.
+    var clipSendAt: Date?
     display.onPlaybackEvent = { [weak self] event in
-      if event.type == .ended || event.type == .stopped {
+      switch event.type {
+      case .started:
+        if let sentAt = clipSendAt {
+          let ms = Int(Date().timeIntervalSince(sentAt) * 1000)
+          print("[LensClip] first frame after \(ms)ms")
+        }
+      case .ended, .stopped:
         Task { @MainActor [weak self] in
           self?.coordinator.display?.onPlaybackEvent = nil
           onEnded()
         }
+      default:
+        break
       }
     }
 
@@ -194,6 +207,7 @@ final class LensSession: ObservableObject {
     // `VideoPlayer` from AVKit can collide with the DSL one. Same rule
     // applies in any renderer file that mixes SwiftUI + MWDATDisplay
     // (per the plan's Constraint #8).
+    clipSendAt = Date()  // start the send → .started latency clock
     await coordinator.send(
       MWDATDisplay.VideoPlayer(
         provider: .uri(uri),

@@ -11,12 +11,13 @@
 //   11. TroubleshootResolvedPage          (phase=.resolved, resolution=.matched/.generated)
 //   12. TroubleshootNoSolutionPage        (phase=.resolved, resolution=.noMatch)
 //   13. TroubleshootConfirmOverlay        (pendingConfirmation = true)
-//   14. End-diagnostic exit overlay        — owned by the SwiftUI view; lens follows
+//   14. End-diagnostic exit overlay        (showDismissConfirmation = true)
 //
-// The exit-confirmation overlay (surface 14) lives on the phone side
-// (`TroubleshootSessionView.showDismissConfirmation`), not on the VM, so
-// the lens doesn't render it — the user sees the confirmation on the
-// phone while the lens stays on the active phase tree.
+// The exit-confirmation overlay (surface 14) is rendered ON the lens
+// (`exitConfirmationTree`), mirroring the coaching flow: the Exit pill sets
+// a renderer-local flag, and "Confirm exit" runs the VM's `onExitConfirmed`
+// bridge (endSession + dismiss). The phone's own exit overlay stays wired
+// for the iPhone back-gesture path.
 //
 
 import Foundation
@@ -39,6 +40,10 @@ struct TroubleshootLensCallbacks {
   let onStartProcedure: @Sendable () -> Void
   let onRediagnose: @Sendable () -> Void
   let onUploadManual: @Sendable () -> Void
+
+  // On-lens exit confirmation (mirrors coaching)
+  let onExitConfirmCancel: @Sendable () -> Void
+  let onExitConfirmConfirm: @Sendable () -> Void
 }
 
 // MARK: - Top-level dispatch
@@ -51,9 +56,14 @@ enum TroubleshootLensTrees {
     snapshot s: TroubleshootLensSnapshot,
     callbacks cb: TroubleshootLensCallbacks
   ) -> FlexBox {
-    // Highest-priority overlay: phone is showing the PDF picker → handoff
-    // card on lens. Same "Use your phone" pattern as Step 10's phone-only
-    // flows.
+    // Highest-priority overlay: on-lens exit confirmation ("End diagnostic?").
+    // Drives over every phase tree until cancelled/confirmed.
+    if s.showDismissConfirmation {
+      return exitConfirmationTree(callbacks: cb)
+    }
+
+    // Next: phone is showing the PDF picker → handoff card on lens. Same
+    // "Use your phone" pattern as Step 10's phone-only flows.
     if s.showManualUploadSheet {
       return LensComponents.handoffCard(reason: "Upload a PDF manual on iPhone")
     }
@@ -68,7 +78,7 @@ enum TroubleshootLensTrees {
     // `.diagnosing` (initial library search) and `.resolving` (web
     // search + synthesizing).
     if let narration = s.narration {
-      return searchingTree(narration: narration, callbacks: cb, isMuted: s.isMuted)
+      return searchingTree(narration: narration, callbacks: cb, isMuted: s.isMuted, animFrame: s.searchAnimFrame)
     }
 
     switch s.phase {
@@ -80,7 +90,7 @@ enum TroubleshootLensTrees {
       // Phase is between library miss and web search — no narration set
       // yet. Show a generic "Looking for a fix…" placeholder so the
       // lens doesn't blank.
-      return searchingTree(narration: .searchingLibrary, callbacks: cb, isMuted: s.isMuted)
+      return searchingTree(narration: .searchingLibrary, callbacks: cb, isMuted: s.isMuted, animFrame: s.searchAnimFrame)
     case .resolved:
       if case .noMatch = s.resolution {
         return noSolutionTree(callbacks: cb, isMuted: s.isMuted)
@@ -102,10 +112,10 @@ enum TroubleshootLensTrees {
       alignment: .start,
       crossAlignment: .stretch
     ) {
-      LensComponents.phaseChip("IDENTIFY")
+      LensComponents.phaseSegments(activeIndex: 0)
       LensComponents.cardPanel(spacing: 8, padding: 14) {
         Text("Show me what's broken", style: .heading, color: .primary)
-        Text("Hold the product up to the camera.", style: .body, color: .secondary)
+        Text("Or describe it out loud — say or show the device.", style: .body, color: .secondary)
       }
       LensComponents.audioActionRow(
         isMuted: isMuted,
@@ -128,15 +138,18 @@ enum TroubleshootLensTrees {
       alignment: .start,
       crossAlignment: .stretch
     ) {
-      // Product chip on top — uppercased name in a `.card` background.
-      // Renders only when identification has landed.
+      LensComponents.phaseSegments(activeIndex: 1)
+      // Product chip — the identified device carried into diagnose, mirroring
+      // the phone HUD's yellow chip (lens can't fill yellow, so it's a `.card`
+      // chip). `.alignSelf(.center)` makes it a compact centered pill (it would
+      // otherwise stretch full-width under the column's `.stretch`). Renders
+      // only when identification has landed.
       if let product = s.identifiedProductName {
-        LensComponents.phaseChip(product)
+        LensComponents.phaseChip(product).alignSelf(.center)
       }
-      LensComponents.phaseChip("DIAGNOSE")
       LensComponents.cardPanel(spacing: 8, padding: 14) {
         Text("Describe what's wrong", style: .heading, color: .primary)
-        Text("Tell me the symptoms so I can find a fix.", style: .body, color: .secondary)
+        Text("Tell me what you're seeing — strange noises, error lights, parts that don't fit.", style: .body, color: .secondary)
       }
       LensComponents.audioActionRow(
         isMuted: s.isMuted,
@@ -152,20 +165,34 @@ enum TroubleshootLensTrees {
   static func searchingTree(
     narration: TroubleshootLensSnapshot.LensSearchNarration,
     callbacks cb: TroubleshootLensCallbacks,
-    isMuted: Bool
+    isMuted: Bool,
+    animFrame: Int
   ) -> FlexBox {
+    // Icons are limited to DAT's fixed set; pick glyphs that render solidly
+    // (the old `.metaAi` / `.eye` rendered as faint/ambiguous blobs). `.clock`
+    // doubles as the synthesizing "this takes a moment" cue.
     let (iconName, title, detail): (IconName, String, String?) = {
       switch narration {
       case .searchingLibrary:
-        return (.eye, "Searching your library…", nil)
+        return (.nineSquaresGrid, "Searching your library", "Checking your saved procedures.")
       case .libraryMissed:
-        return (.exclamationTriangle, "No procedure found", "Trying the web next.")
+        return (.exclamationCircle, "No procedure found in your library.", "Looking online next.")
       case .searchingWeb:
-        return (.metaAi, "Searching online…", nil)
+        return (.globeWesternHemisphere, "Searching online", "Reddit, iFixit, repair forums.")
       case .synthesizing(let n):
-        return (.metaAi, "Synthesizing answer…", "From \(n) sources")
+        return (.clock, "Synthesizing the procedure", "Found \(n) source\(n == 1 ? "" : "s") on Reddit, iFixit, repair forums.")
       case .foundFix(let n):
-        return (.checkmark, "Found a fix", "Based on \(n) sources")
+        return (.checkmarkCircle, "Solution found", "From \(n) online source\(n == 1 ? "" : "s").")
+      }
+    }()
+
+    // The online-search window (web + synthesizing) shows the animated
+    // paper-airplane "sending to the web and back" track instead of a static
+    // icon. The other (brief) states keep the static stage icon.
+    let animated: Bool = {
+      switch narration {
+      case .searchingWeb, .synthesizing: return true
+      default:                           return false
       }
     }()
 
@@ -175,14 +202,16 @@ enum TroubleshootLensTrees {
       alignment: .start,
       crossAlignment: .stretch
     ) {
-      LensComponents.phaseChip("FIND FIX")
-      LensComponents.cardPanel(
-        spacing: 12,
-        alignment: .center,
-        crossAlignment: .center,
-        padding: 18
-      ) {
-        Icon(name: iconName, style: .outline)
+      LensComponents.phaseSegments(activeIndex: 2)
+      LensComponents.cardPanel(spacing: 8, padding: 14) {
+        // Animated airplane during the online search; static stage icon
+        // otherwise. A lone `Icon` as a direct column child renders huge on the
+        // lens (fills the card, text overlaps it); `iconRow` keeps it inline.
+        if animated {
+          LensComponents.airplaneTrack(frame: animFrame)
+        } else {
+          LensComponents.iconRow(iconName)
+        }
         Text(title, style: .heading, color: .primary)
         if let detail {
           Text(detail, style: .body, color: .secondary)
@@ -206,7 +235,7 @@ enum TroubleshootLensTrees {
     let (procedureTitle, sourceText): (String, String) = {
       switch s.resolution {
       case .matchedProcedure(let title, _):
-        return (title, "From your library.")
+        return (title, "Found in your library.")
       case .generatedSOP(let title, _):
         return (title, "Synthesized from web sources.")
       case .noMatch, .none:
@@ -233,26 +262,17 @@ enum TroubleshootLensTrees {
       alignment: .start,
       crossAlignment: .stretch
     ) {
-      LensComponents.phaseChip("FIND FIX")
+      LensComponents.phaseSegments(activeIndex: 2)
       LensComponents.cardPanel(spacing: 8, padding: 14) {
         Text(procedureTitle, style: .heading, color: .primary)
         if !sourceText.isEmpty {
           Text(sourceText, style: .meta, color: .secondary)
         }
       }
-      // Default focus: Start (placed first among Buttons per the plan).
-      Button(
-        label: startLabel,
-        style: .primary,
-        iconName: startIcon,
-        onClick: cb.onStartProcedure
-      )
-      Button(
-        label: "Rediagnose",
-        style: .secondary,
-        iconName: .twoArrowsClockwise,
-        onClick: cb.onRediagnose
-      )
+      // Default focus: Start (first tappable in tree order). Static centered
+      // pills — not the DSL `Button` (animated, left-aligned).
+      LensComponents.actionPill(icon: startIcon, label: startLabel, onTap: cb.onStartProcedure)
+      LensComponents.actionPill(icon: .twoArrowsClockwise, label: "Rediagnose", onTap: cb.onRediagnose)
       LensComponents.audioActionRow(
         isMuted: s.isMuted,
         onMute: cb.onMuteToggle,
@@ -274,35 +294,22 @@ enum TroubleshootLensTrees {
       alignment: .start,
       crossAlignment: .stretch
     ) {
-      LensComponents.phaseChip("FIND FIX")
-      LensComponents.cardPanel(
-        spacing: 12,
-        alignment: .center,
-        crossAlignment: .center,
-        padding: 18
-      ) {
-        Icon(name: .exclamationTriangle, style: .outline)
+      LensComponents.phaseSegments(activeIndex: 2)
+      LensComponents.cardPanel(spacing: 8, padding: 14) {
+        // Small top-left icon (see `iconRow` — a lone Icon renders huge).
+        LensComponents.iconRow(.exclamationCircle)
         Text("Nothing found", style: .heading, color: .primary)
         Text(
-          "I couldn't find a matching procedure. Upload a manual to keep going.",
+          "Couldn't match a saved procedure or synthesize one from the web. Try uploading a manual.",
           style: .body,
           color: .secondary
         )
       }
-      // Upload-manual: primary; flips the manual-upload sheet on the
-      // phone, which triggers the handoff card on the next snapshot.
-      Button(
-        label: "Upload a manual",
-        style: .primary,
-        iconName: .metaAi,
-        onClick: cb.onUploadManual
-      )
-      Button(
-        label: "Rediagnose",
-        style: .secondary,
-        iconName: .twoArrowsClockwise,
-        onClick: cb.onRediagnose
-      )
+      // Upload-manual: default focus (first tappable). Flips the manual-upload
+      // sheet on the phone, which triggers the handoff card on the next
+      // snapshot. Text-only — no mapped upload glyph in the lens icon set.
+      LensComponents.actionPill(label: "Upload a manual", onTap: cb.onUploadManual)
+      LensComponents.actionPill(icon: .twoArrowsClockwise, label: "Rediagnose", onTap: cb.onRediagnose)
       LensComponents.audioActionRow(
         isMuted: isMuted,
         onMute: cb.onMuteToggle,
@@ -324,34 +331,70 @@ enum TroubleshootLensTrees {
       alignment: .center,
       crossAlignment: .stretch
     ) {
+      // Top: a centered "DEVICE" pill (the category when known, else "Device"),
+      // mirroring the phone confirm overlay's category chip. `.alignSelf(.center)`
+      // keeps it a compact capsule under the column's `.stretch`.
+      LensComponents.phaseChip(s.identifiedCategory ?? "Device")
+        .alignSelf(.center)
+      // Middle: the identified device name + confidence, centered.
       LensComponents.cardPanel(
         spacing: 8,
         alignment: .center,
         crossAlignment: .center,
         padding: 18
       ) {
-        if let category = s.identifiedCategory {
-          LensComponents.phaseChip(category)
-        }
         Text(s.identifiedProductName ?? "Identified product", style: .heading, color: .primary)
         if let confidence = s.identifiedConfidence {
           Text("\(confidence) confidence", style: .meta, color: .secondary)
         }
       }
-      // Default focus: "That's it" (first Button child of the FlexBox).
-      // SDK tree-order traversal lands here on initial render.
-      Button(
-        label: "That's it",
-        style: .primary,
-        iconName: .checkmark,
-        onClick: cb.onConfirmIdentification
-      )
-      Button(
-        label: "Try again",
-        style: .secondary,
-        iconName: .twoArrowsClockwise,
-        onClick: cb.onRequestReIdentify
-      )
+      // EMPIRICAL TEST (confirm overlay only): label-only DSL `Button`s.
+      // The DSL Button renders the SDK focus cursor/highlight (which the
+      // static `actionPill` does NOT), so the default-focused control is
+      // visible without a swipe. We drop `iconName` deliberately: the
+      // collapse-to-icon-on-blur behavior (label hidden until hover) is
+      // icon-driven, so a label-only Button should keep its text visible at
+      // all times. Default focus = "That's it" (first tappable in tree order).
+      // If this reads well on-glass, roll the same pattern out to the
+      // resolved / no-solution / exit buttons.
+      Button(label: "That's it", style: .primary, onClick: cb.onConfirmIdentification)
+      Button(label: "Try again", style: .secondary, onClick: cb.onRequestReIdentify)
+    }
+    .padding(12)
+  }
+
+  // MARK: - 14. On-lens exit confirmation overlay
+
+  /// "End diagnostic?" confirmation rendered ON the glasses (mirrors the
+  /// coaching exit overlay). Cancel is first → default focus on the safe
+  /// option. Static centered pills, no DSL `Button` animation.
+  static func exitConfirmationTree(
+    callbacks cb: TroubleshootLensCallbacks
+  ) -> FlexBox {
+    FlexBox(
+      direction: MWDATDisplay.Direction.column,
+      spacing: 12,
+      alignment: .center,
+      crossAlignment: .stretch
+    ) {
+      LensComponents.cardPanel(
+        spacing: 12,
+        alignment: .center,
+        crossAlignment: .stretch,
+        padding: 18
+      ) {
+        // Centered heading (DSL Text has no alignment; a centered row does it).
+        FlexBox(
+          direction: MWDATDisplay.Direction.row,
+          spacing: 0,
+          alignment: .center,
+          crossAlignment: .center
+        ) {
+          Text("End diagnostic?", style: .heading, color: .primary)
+        }
+        LensComponents.actionPill(icon: .arrowLeft, label: "Cancel", onTap: cb.onExitConfirmCancel)
+        LensComponents.actionPill(icon: .x, label: "Confirm exit", onTap: cb.onExitConfirmConfirm)
+      }
     }
     .padding(12)
   }

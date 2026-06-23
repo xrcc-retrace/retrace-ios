@@ -162,6 +162,11 @@ class GeminiLiveSessionBase: ObservableObject {
   /// `advance_step`. Set via `setReferenceClipPlaying(_:)` from the clip's
   /// start/terminal events; only the native-lens path drives it.
   var isClipPlaying = false
+  /// True while we've intentionally stopped the glasses camera `Stream` to free
+  /// the Bluetooth link during reference-clip playback (gated by the
+  /// `pauseCameraDuringClip` debug toggle). The stream state listener checks
+  /// this so the resulting `.stopped` isn't surfaced as "Glasses stream dropped."
+  var isCameraPausedForClip = false
 
   // MARK: - Transcript coalescing
 
@@ -443,11 +448,21 @@ class GeminiLiveSessionBase: ObservableObject {
   }
 
   /// Re-run `startGeminiLiveSession()` after the user updated the DAT
-  /// helper app on their glasses via Meta AI. Same restart semantics as
-  /// the other two retry methods — clean start, no resume — because the
-  /// gate fired before any session resources were created.
+  /// helper app on their glasses via Meta AI.
+  ///
+  /// Unlike `retryAfterPermissionGrant` / `retryAfterAudioFailure` (which
+  /// abort in the prologue, before audio or Gemini exist, so a bare restart
+  /// is clean), the DAT-helper signal now arrives from the BACKGROUNDED
+  /// camera/lens branch — which can flip `pendingDATHelperUpdate` after audio
+  /// is live and the Gemini socket is already connected. Restarting on top of
+  /// that would stand up a second `AudioSessionManager` + Gemini service, so
+  /// tear the live session (and any in-flight camera lease) down first, then
+  /// restart clean. `stopCameraStream` chains onto `cameraLifecycleTask`, so
+  /// the fresh `setupCameraStream` serializes safely behind this teardown.
   func retryAfterDATHelperUpdate() async {
     pendingDATHelperUpdate = false
+    stopGeminiLiveSession()
+    stopCameraStream()
     await startGeminiLiveSession()
   }
 
@@ -656,44 +671,28 @@ class GeminiLiveSessionBase: ObservableObject {
       return
     }
 
-    // 2. Camera — awaited end-to-end. Returns true once the first frame
-    //    has actually arrived (or false on timeout / acquire failure).
-    voiceStatus = "Starting camera..."
-    let cameraReady: Bool
-    switch transport {
-    case .glasses:
-      cameraReady = await setupCameraStream()
-    case .iPhone:
-      cameraReady = await setupIPhoneCameraStream()
-    }
-    guard cameraReady else {
-      voiceStatus = "Camera failed"
-      // Surface the failure on the connection-state channel the UI
-      // already observes — without this, CoachingSessionView's
-      // status indicator stays on the default "Listening…" /
-      // "Connected" affordance even though no Gemini socket has been
-      // opened. The view's `case .error(let msg)` branch shows the
-      // Retry CTA. Specific failure messages (DAT app update needed,
-      // permissions denied) already drive their own recovery sheets
-      // earlier in the flow, so this generic message only surfaces
-      // when those didn't fire — i.e. acquire/addStream/first-frame
-      // gave up without a recognized typed cause.
-      geminiConnectionState = .error(
-        transport == .glasses
-          ? "Couldn't connect to your glasses. Tap to retry."
-          : "Couldn't access the iPhone camera. Tap to retry."
-      )
-      print("[GeminiLive] Camera did not come up — aborting session start before Gemini connect")
-      audio.stopCapture()
-      audioManager = nil
-      return
-    }
-
-    // Glasses HFP mic + camera stream are now both up and settled. It is now
-    // safe to bring up the native lens Display (the last glasses BT capability
-    // to start) without it disrupting the HFP audio route. Views observing
-    // this flip the native lens on now. See `isReadyForNativeLens`.
-    isReadyForNativeLens = true
+    // 2. Camera / lens — launched in the BACKGROUND so neither the voice
+    //    connection nor the on-glasses lens HUD waits on the 3–15 s DAT
+    //    camera handshake (DeviceSession acquire + Stream attach + first
+    //    frame). This used to run inline before the Gemini connect, putting
+    //    the slowest BT step squarely on the path to "ready to talk".
+    //
+    //    Audio (and therefore the glasses HFP route) is confirmed up by this
+    //    point, so it's now safe to bring up the glasses Stream + Display BT
+    //    capabilities — the documented HFP-before-Display coexistence order
+    //    (see `isReadyForNativeLens`). The Gemini connect below runs
+    //    concurrently with this branch; the lens HUD comes up as soon as the
+    //    shared DeviceSession reaches `.started` (flipped inside
+    //    `setupCameraStream`), NOT when the first video frame arrives — the
+    //    lens renderer draws from coaching state + server URLs, not frames.
+    //    Visual auto-advance comes online later, when frames actually flow.
+    //
+    //    A camera failure here is NON-FATAL: voice coaching keeps running.
+    //    The one actionable case (DAT helper app out of date) still surfaces
+    //    its recovery sheet via `pendingDATHelperUpdate` from inside the
+    //    setup task. Generic acquire/stream failures are logged and leave
+    //    voice-only coaching running rather than killing a live session.
+    launchCameraLensBranch()
 
     // 3. Mint session via subclass.
     voiceStatus = "Starting session..."
@@ -705,6 +704,10 @@ class GeminiLiveSessionBase: ObservableObject {
       print("[GeminiLive] Failed to mint session: \(error)")
       audio.stopCapture()
       audioManager = nil
+      // The background camera/lens branch may already have flipped the lens
+      // gate when its DeviceSession reached `.started`; reset it so the view
+      // doesn't try to activate a lens against the session we're tearing down.
+      isReadyForNativeLens = false
       await teardownCameraOnly()
       return
     }
@@ -844,6 +847,17 @@ class GeminiLiveSessionBase: ObservableObject {
     if playing {
       audioManager?.clearPlaybackBuffer(reason: "reference-clip-start")
     }
+    // Experiment (debug toggle): also stop the glasses camera Stream during the
+    // clip so its frames stop contending for the Bluetooth link. Glasses-only —
+    // the pause/resume methods no-op without a glasses stream. Serialized via
+    // cameraLifecycleTask, so exiting the session mid-clip can't race them.
+    if UserDefaults.standard.bool(forKey: "pauseCameraDuringClip"), glassesStream != nil {
+      if playing {
+        pauseGlassesCameraForClip()
+      } else {
+        resumeGlassesCameraForClip()
+      }
+    }
   }
 
   /// Canonical teardown order — see inline comments. Order matters:
@@ -882,6 +896,35 @@ class GeminiLiveSessionBase: ObservableObject {
   }
 
   // MARK: - Camera Stream (glasses via DAT SDK)
+
+  /// Fire-and-forget the camera/lens pipeline so it can't block the voice
+  /// connection or the lens HUD. Called from `startGeminiLiveSession` once
+  /// audio is confirmed up (the glasses HFP route must settle before the
+  /// Stream/Display BT capabilities start). The heavy lifting still runs
+  /// inside `setupCameraStream` / `setupIPhoneCameraStream` (which serialize
+  /// on `cameraLifecycleTask`, so a rapid dismiss/restart can't race two
+  /// streams, and `stopCameraStream` / `deinit` cancel it cleanly).
+  ///
+  /// Failure is intentionally NON-FATAL — a backgrounded camera that never
+  /// comes up must not tear down a live voice session. The actionable
+  /// DAT-helper-out-of-date case already raised `pendingDATHelperUpdate`
+  /// from inside the setup task; everything else is logged so coaching
+  /// continues voice-only (visual auto-advance + lens HUD simply unavailable).
+  private func launchCameraLensBranch() {
+    Task { [weak self] in
+      guard let self = self else { return }
+      let ok: Bool
+      switch self.transport {
+      case .glasses:
+        ok = await self.setupCameraStream()
+      case .iPhone:
+        ok = await self.setupIPhoneCameraStream()
+      }
+      if !ok {
+        print("[GeminiLive] Camera/lens branch did not come up — continuing voice-only (visual verification + lens HUD unavailable)")
+      }
+    }
+  }
 
   /// Bring up the glasses camera path end-to-end. Returns `true` once a
   /// video frame has actually arrived from the DAT `Stream` capability,
@@ -1002,6 +1045,16 @@ class GeminiLiveSessionBase: ObservableObject {
           }
           session = acquired
           stream = s
+          // Lens HUD readiness: the shared DeviceSession is now `.started`
+          // and the Stream capability is attached — that's all the native
+          // lens needs to `addDisplay()` and render (it draws from coaching
+          // state + server URLs, NOT camera frames). Flip the gate now so
+          // the on-glasses HUD comes up at acquire time instead of waiting
+          // the extra 0.5–10 s for the first video frame. Audio HFP is
+          // already settled (this branch only runs after `awaitAudioReady`),
+          // so this preserves the documented HFP-before-Display order.
+          // Glasses-only: the iPhone path never sets this (no Display).
+          await MainActor.run { self.isReadyForNativeLens = true }
         } catch DeviceSessionManager.AcquireError.sessionStartFailed(.datAppOnTheGlassesUpdateRequired) {
           // The DAT helper app on the glasses is out of date. Don't lump
           // this in with the generic "camera failed" path — the recovery
@@ -1113,6 +1166,10 @@ class GeminiLiveSessionBase: ObservableObject {
           sawStreaming = false  // avoid re-firing on idempotent stops during teardown
           Task { @MainActor [weak self] in
             guard let self = self else { return }
+            // Intentional clip-pause stop (pauseGlassesCameraForClip) — not a
+            // real drop. The flag stays set through the whole stop→start cycle,
+            // so the restart's transient states are covered too.
+            guard !self.isCameraPausedForClip else { return }
             // Don't stomp a more specific error already surfaced by
             // handleCameraSessionError (which fires from the manager's
             // errorStream and has typed context like .datAppUpdateRequired).
@@ -1395,6 +1452,50 @@ class GeminiLiveSessionBase: ObservableObject {
       // different mode).
       HandGestureService.shared.onBackGesture = nil
       HandGestureService.shared.onEvent = nil
+    }
+  }
+
+  // MARK: - Camera pause during clip playback (experiment)
+
+  /// Lightweight pause of the glasses camera `Stream` while a reference clip
+  /// plays on the lens — gated by the `pauseCameraDuringClip` debug toggle.
+  /// Stops the stream so its frames stop contending for the Bluetooth link,
+  /// WITHOUT releasing the DeviceSessionManager lease, niling `glassesStream`,
+  /// or dropping the listener tokens — so `resumeGlassesCameraForClip()` can
+  /// restart the same warm `Stream` (no re-acquire / re-addStream). Chains on
+  /// `cameraLifecycleTask` so it can't race setup/teardown/resume. No-op when
+  /// no glasses stream is attached (iPhone / no-glasses transport).
+  func pauseGlassesCameraForClip() {
+    guard glassesStream != nil else { return }
+    let prior = cameraLifecycleTask
+    cameraLifecycleTask = Task { [weak self] in
+      await prior?.value
+      guard let self = self, let stream = self.glassesStream else { return }
+      // Set BEFORE stop() so the state listener treats the resulting `.stopped`
+      // as intentional rather than a dropped stream.
+      self.isCameraPausedForClip = true
+      print("[ClipCam] pausing glasses camera for clip (state=\(stream.state))")
+      await stream.stop()
+      print("[ClipCam] glasses camera paused (state=\(stream.state))")
+    }
+  }
+
+  /// Restart the glasses camera `Stream` paused by `pauseGlassesCameraForClip()`.
+  /// Reuses the retained stream + listener tokens. Clears the intentional-pause
+  /// flag only AFTER `start()` returns so any transient `.stopped` during the
+  /// restart ramp stays covered.
+  func resumeGlassesCameraForClip() {
+    guard glassesStream != nil else { return }
+    let prior = cameraLifecycleTask
+    cameraLifecycleTask = Task { [weak self] in
+      await prior?.value
+      guard let self = self, let stream = self.glassesStream else { return }
+      let startedAt = Date()
+      print("[ClipCam] resuming glasses camera (state=\(stream.state))")
+      await stream.start()
+      self.isCameraPausedForClip = false
+      let ms = Int(Date().timeIntervalSince(startedAt) * 1000)
+      print("[ClipCam] glasses camera resumed in \(ms)ms (state=\(stream.state))")
     }
   }
 

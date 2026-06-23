@@ -8,9 +8,9 @@
 //
 // Per the plan's subscription pattern: ~120ms throttle collapses the 2-4
 // `@Published` mutations that fire during one phase transition into one
-// BT send. The renderer owns no local UI state (unlike Coaching's
-// `expansion` / `descPage`) — the troubleshoot phase tree is fully
-// driven by VM state.
+// BT send. The phase tree is fully VM-driven; the only lens-local state is
+// `showExitConfirmation` (the on-lens end-diagnostic overlay flag, mirroring
+// coaching).
 //
 
 import Combine
@@ -24,6 +24,28 @@ final class TroubleshootLensRenderer: LensRenderer {
 
   private let viewModel: DiagnosticSessionViewModel
   private weak var lensSession: LensSession?
+
+  // MARK: - Local UI state (lens-side only)
+
+  /// Lens-side exit-confirmation flag. When true, `tree()` renders the
+  /// on-lens "End diagnostic?" overlay over the active phase tree. Toggled by
+  /// the Exit pill and the overlay's Cancel/Confirm — the confirmation lives
+  /// ON the glasses (mirrors coaching), not the phone.
+  private var showExitConfirmation = false
+
+  // MARK: - Search animation (paper airplane)
+
+  /// Frame-loop task driving the paper-airplane animation while we're in the
+  /// online-search window. Nil when not animating. Mirrors the proven loop in
+  /// `ExpertLensRenderer.beginStopCountdown` (no SDK animation primitive — we
+  /// repaint a new tree per frame).
+  private var searchAnimTask: Task<Void, Never>?
+  /// Monotonic frame counter fed into the snapshot; the tree derives the
+  /// airplane's horizontal position from it. Reset to 0 when the loop stops.
+  private var searchAnimFrame = 0
+  /// Frame cadence — ~8 fps. Smooth enough for a gentle slide, cheap on the
+  /// BT Display link.
+  private let searchAnimTickNanos: UInt64 = 120_000_000
 
   // MARK: - Subscriptions
 
@@ -41,6 +63,9 @@ final class TroubleshootLensRenderer: LensRenderer {
 
   func cancel() {
     cancellables.removeAll()
+    searchAnimTask?.cancel()
+    searchAnimTask = nil
+    searchAnimFrame = 0
   }
 
   // MARK: - Subscription wiring
@@ -69,9 +94,45 @@ final class TroubleshootLensRenderer: LensRenderer {
     Publishers.CombineLatest3(phaseAndProduct, resolutionAndHandoff, muteAndConnection)
       .throttle(for: .milliseconds(120), scheduler: DispatchQueue.main, latest: true)
       .sink { [weak self] _ in
+        // Start/stop the airplane loop on state edges first, then repaint.
+        // The loop itself calls `scheduleSend()` directly (not via this sink),
+        // so it can't re-trigger `syncSearchAnimation` and recurse.
+        self?.syncSearchAnimation()
         self?.scheduleSend()
       }
       .store(in: &cancellables)
+  }
+
+  /// Run the paper-airplane frame loop iff we're in the online-search window
+  /// (`searchingWeb` / `synthesizing`). Idempotent: a running loop is left
+  /// alone, and leaving the window cancels it and resets the frame. Driven
+  /// off the state sink, so every narration/phase edge re-evaluates it.
+  private func syncSearchAnimation() {
+    let animating: Bool
+    switch viewModel.searchNarration {
+    case .searchingWeb, .synthesizing: animating = true
+    default:                           animating = false
+    }
+
+    if animating {
+      guard searchAnimTask == nil else { return }
+      searchAnimTask = Task { [weak self] in
+        guard let self else { return }
+        do {
+          while !Task.isCancelled {
+            try await Task.sleep(nanoseconds: self.searchAnimTickNanos)
+            self.searchAnimFrame &+= 1
+            self.scheduleSend()
+          }
+        } catch {
+          // Cancelled (left the window or renderer torn down).
+        }
+      }
+    } else if searchAnimTask != nil {
+      searchAnimTask?.cancel()
+      searchAnimTask = nil
+      searchAnimFrame = 0
+    }
   }
 
   // MARK: - Snapshot projection
@@ -83,14 +144,15 @@ final class TroubleshootLensRenderer: LensRenderer {
       connection: connectionStatus(),
       identifiedProductName: viewModel.identifiedProduct?.productName,
       identifiedCategory: viewModel.identifiedProduct?.category,
-      identifiedConfidence: nil,  // VM doesn't currently expose confidence; future addition
+      identifiedConfidence: viewModel.identifiedProduct?.confidence,
       pendingConfirmation: viewModel.pendingConfirmation,
       narration: mapNarration(viewModel.searchNarration),
       resolution: mapResolution(viewModel.resolution),
       handoffInFlight: viewModel.handoffInFlight,
       handoffError: viewModel.handoffError,
       showManualUploadSheet: viewModel.showManualUploadSheet,
-      showDismissConfirmation: false  // view-owned, lens doesn't mirror per Step 8 scope
+      showDismissConfirmation: showExitConfirmation,
+      searchAnimFrame: searchAnimFrame
     )
   }
 
@@ -159,13 +221,13 @@ final class TroubleshootLensRenderer: LensRenderer {
           viewModel?.toggleMute()
         }
       },
-      onExit: { [weak viewModel] in
+      onExit: { [weak self] in
         Task { @MainActor in
-          // Same back-gesture hook the SwiftUI view installed in
-          // `.onAppear` — surfaces the end-diagnostic confirmation
-          // overlay on the phone. The lens stays on the active phase
-          // tree (Step 8 scope; see file header for rationale).
-          viewModel?.onBackGesture?()
+          // Show the end-diagnostic confirmation ON the lens (was: route to
+          // the phone overlay via viewModel.onBackGesture). Mirrors coaching.
+          guard let self else { return }
+          self.showExitConfirmation = true
+          self.scheduleSend()
         }
       },
       onConfirmIdentification: { [weak viewModel] in
@@ -208,6 +270,21 @@ final class TroubleshootLensRenderer: LensRenderer {
           // sheet flag and the next snapshot routes to the handoff
           // card via the dispatch in `TroubleshootLensTrees.tree`.
           viewModel?.showManualUploadSheet = true
+        }
+      },
+      onExitConfirmCancel: { [weak self] in
+        Task { @MainActor in
+          guard let self else { return }
+          self.showExitConfirmation = false
+          self.scheduleSend()
+        }
+      },
+      onExitConfirmConfirm: { [weak self] in
+        Task { @MainActor in
+          guard let self else { return }
+          self.showExitConfirmation = false
+          // Run the host-installed terminal exit (endSession + dismiss/onExit).
+          self.viewModel.onExitConfirmed?()
         }
       }
     )
