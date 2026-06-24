@@ -23,6 +23,9 @@ struct TroubleshootSessionView: View {
   @StateObject private var viewModel: DiagnosticSessionViewModel
 
   @State private var showDismissConfirmation = false
+  // Demo flag — when on, the confirm overlay gets a third "Talk" option so the
+  // user can answer the identification question by voice (push-to-talk).
+  @AppStorage("debug.routeAudioToMacForDemo") private var routeAudioToMacForDemo = false
   // Drawer state for the camera-first layout. Both transports use the
   // same drawer — the camera feed (iPhone preview layer or glasses video
   // stream) sits behind the lens emulator; pull up the drawer for the
@@ -132,7 +135,11 @@ struct TroubleshootSessionView: View {
                 TroubleshootConfirmOverlay(
                   product: product,
                   onConfirm: { viewModel.confirmIdentification() },
-                  onReject: { viewModel.requestReIdentify() }
+                  onReject: { viewModel.requestReIdentify() },
+                  isPushToTalk: routeAudioToMacForDemo,
+                  isTalkEngaged: viewModel.isTalkEngaged,
+                  onTalkDown: { viewModel.talkPressBegan() },
+                  onTalkUp: { viewModel.talkPressEnded() }
                 )
                 .transition(.scale(scale: 0.88).combined(with: .opacity))
               }

@@ -43,6 +43,8 @@ struct CoachingStepPage: RayBanHUDView {
   let isOverlayActive: Bool
 
   @EnvironmentObject private var hoverCoordinator: HUDHoverCoordinator
+  /// Shows the walkie-talkie Talk button when the DEBUG Mac-route demo is on.
+  @AppStorage("debug.routeAudioToMacForDemo") private var routeAudioToMacForDemo = false
   @State private var expansion: ExpansionState = .collapsed
   /// User's explicit pause toggle for the auto-scrolling description.
   /// Pinch-select on `.stepCard` flips this when the description is
@@ -245,7 +247,11 @@ struct CoachingStepPage: RayBanHUDView {
       muteControl: .toggleMute,
       exitControl: .exitWorkflowButton,
       onToggleMute: { viewModel.toggleMute() },
-      onExit: onShowExitConfirmation
+      onExit: onShowExitConfirmation,
+      isPushToTalk: routeAudioToMacForDemo,
+      isTalkEngaged: viewModel.isTalkEngaged,
+      onTalkDown: { viewModel.talkPressBegan() },
+      onTalkUp: { viewModel.talkPressEnded() }
     )
   }
 
