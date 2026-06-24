@@ -72,8 +72,8 @@ The phone is the orchestrator. **Voice and ~0.5 fps video flow straight from the
 ### Run locally
 
 ```bash
-git clone https://github.com/xrcc-retrace/dat-ios-test.git
-cd dat-ios-test
+git clone https://github.com/xrcc-retrace/retrace-ios.git
+cd retrace-ios
 open samples/CameraAccess/CameraAccess.xcodeproj
 ```
 

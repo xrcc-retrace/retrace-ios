@@ -26,18 +26,25 @@ struct IPhoneRecordingView: View {
   let onAcknowledgeProcedure: () -> Void
   let onRecordingComplete: (URL, TimeInterval) -> Void
 
+  /// Optional shared `DeviceSessionManager`. Glasses transport forwards it
+  /// to `StreamSessionViewModel`; iPhone transport ignores it (no DAT SDK
+  /// session involved).
+  let sessionManager: DeviceSessionManager?
+
   init(
     transport: CaptureTransport,
     wearables: WearablesInterface,
     uploadService: UploadService,
     onAcknowledgeProcedure: @escaping () -> Void,
-    onRecordingComplete: @escaping (URL, TimeInterval) -> Void
+    onRecordingComplete: @escaping (URL, TimeInterval) -> Void,
+    sessionManager: DeviceSessionManager? = nil
   ) {
     self.transport = transport
     self.wearables = wearables
     self.uploadService = uploadService
     self.onAcknowledgeProcedure = onAcknowledgeProcedure
     self.onRecordingComplete = onRecordingComplete
+    self.sessionManager = sessionManager
   }
 
   var body: some View {
@@ -53,7 +60,8 @@ struct IPhoneRecordingView: View {
         wearables: wearables,
         uploadService: uploadService,
         onAcknowledgeProcedure: onAcknowledgeProcedure,
-        onRecordingComplete: onRecordingComplete
+        onRecordingComplete: onRecordingComplete,
+        sessionManager: sessionManager
       )
     }
   }
@@ -183,12 +191,13 @@ private struct GlassesRecordingEngine: View {
     wearables: WearablesInterface,
     uploadService: UploadService,
     onAcknowledgeProcedure: @escaping () -> Void,
-    onRecordingComplete: @escaping (URL, TimeInterval) -> Void
+    onRecordingComplete: @escaping (URL, TimeInterval) -> Void,
+    sessionManager: DeviceSessionManager? = nil
   ) {
     self.onAcknowledgeProcedure = onAcknowledgeProcedure
     self.onRecordingComplete = onRecordingComplete
     self._viewModel = StateObject(
-      wrappedValue: StreamSessionViewModel(wearables: wearables, uploadService: uploadService)
+      wrappedValue: StreamSessionViewModel(wearables: wearables, uploadService: uploadService, sessionManager: sessionManager)
     )
   }
 

@@ -58,6 +58,17 @@ struct HomeScreenView: View {
           ) {
             viewModel.connectGlasses()
           }
+
+          // DAT camera permission is the second prerequisite the DAT 0.7
+          // SDK requires before any device appears in `wearables.devices`.
+          // The shared component self-hides until registration completes;
+          // once registered it surfaces an "Allow camera access" CTA, then
+          // a success row once granted. Same component is mounted in
+          // OnboardingGlassesView and ServerSettingsView's glasses section.
+          DATCameraPermissionCTA(
+            registrationState: viewModel.registrationState,
+            style: .button
+          )
         }
       }
       .padding(.all, Spacing.screenPadding)

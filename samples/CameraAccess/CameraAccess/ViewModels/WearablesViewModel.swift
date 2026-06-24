@@ -14,6 +14,7 @@
 // device stream functionality and handle permission requests.
 //
 
+import Combine
 import MWDATCore
 import SwiftUI
 
@@ -29,10 +30,22 @@ class WearablesViewModel: ObservableObject {
   /// True when there's an actively reachable device (powered on, awake, in
   /// range) — not merely a paired one. Use this for "is the device connected
   /// right now" UI; glasses sitting in their case yield `false`.
+  ///
+  /// Phase 3: when `sessionManager` is injected this is republished from
+  /// `manager.$hasAnyActiveDevice` via Combine `.assign`, so the manager
+  /// becomes the single source of truth for device availability. The local
+  /// `AutoDeviceSelector.activeDeviceStream()` path is kept as a fallback
+  /// for instances constructed without a manager.
   @Published var hasActiveDevice: Bool = false
   @Published var showGettingStartedSheet: Bool = false
   @Published var showError: Bool = false
   @Published var errorMessage: String = ""
+
+  /// True when any paired device has `Compatibility == .deviceUpdateRequired`.
+  /// Drives the Settings "Update firmware" CTA. Mirrors the DAT 0.7 sample
+  /// (`samples/CameraAccess/.../WearablesViewModel.swift`'s
+  /// `requiresFirmwareUpdate` pattern, lines 488-514).
+  @Published private(set) var requiresFirmwareUpdate: Bool = false
 
   private var registrationTask: Task<Void, Never>?
   private var deviceStreamTask: Task<Void, Never>?
@@ -40,8 +53,15 @@ class WearablesViewModel: ObservableObject {
   private var activeDeviceTask: Task<Void, Never>?
   private let wearables: WearablesInterface
   private var compatibilityListenerTokens: [DeviceIdentifier: AnyListenerToken] = [:]
+  /// Per-device compatibility cache, refreshed on each `monitorDeviceCompatibility`
+  /// run and on each `addCompatibilityListener` callback. Derives `requiresFirmwareUpdate`.
+  private var deviceCompatibility: [DeviceIdentifier: Compatibility] = [:]
 
-  init(wearables: WearablesInterface) {
+  /// Combine binding to the manager's `hasAnyActiveDevice` when the manager
+  /// is available. Stored so it lives as long as this VM.
+  private var hasActiveDeviceCancellable: AnyCancellable?
+
+  init(wearables: WearablesInterface, sessionManager: DeviceSessionManager? = nil) {
     self.wearables = wearables
     self.devices = wearables.devices
     self.hasMockDevice = false
@@ -62,15 +82,22 @@ class WearablesViewModel: ObservableObject {
       }
     }
 
-    // Observe active-device availability via the SDK's auto-selector. This
-    // differs from `devices` (paired roster) — it reflects whether a device
-    // is reachable/awake right now, which is what "Connected" should mean.
-    let activeSelector = AutoDeviceSelector(wearables: wearables)
-    activeDeviceTask = Task { [weak self] in
-      for await device in activeSelector.activeDeviceStream() {
-        guard let self else { return }
-        await MainActor.run {
-          self.hasActiveDevice = device != nil
+    // Phase 3: prefer the manager's published `hasAnyActiveDevice`. When the
+    // manager isn't injected (legacy callers / tests), fall back to a local
+    // filterless `AutoDeviceSelector.activeDeviceStream()` — preserved so
+    // behavior doesn't regress for any caller that hasn't been updated.
+    if let manager = sessionManager {
+      hasActiveDeviceCancellable = manager.$hasAnyActiveDevice
+        .receive(on: DispatchQueue.main)
+        .assign(to: \.hasActiveDevice, on: self)
+    } else {
+      let activeSelector = AutoDeviceSelector(wearables: wearables)
+      activeDeviceTask = Task { [weak self] in
+        for await device in activeSelector.activeDeviceStream() {
+          guard let self else { return }
+          await MainActor.run {
+            self.hasActiveDevice = device != nil
+          }
         }
       }
     }
@@ -81,6 +108,7 @@ class WearablesViewModel: ObservableObject {
     deviceStreamTask?.cancel()
     setupDeviceStreamTask?.cancel()
     activeDeviceTask?.cancel()
+    hasActiveDeviceCancellable?.cancel()
   }
 
   private func setupDeviceStream() async {
@@ -101,12 +129,24 @@ class WearablesViewModel: ObservableObject {
   }
 
   private func monitorDeviceCompatibility(devices: [DeviceIdentifier]) {
-    // Remove listeners for devices that are no longer present
+    // Remove listeners for devices that are no longer present, and forget
+    // their cached compatibility so a removed device can't keep the
+    // `requiresFirmwareUpdate` flag stuck on.
     let deviceSet = Set(devices)
     compatibilityListenerTokens = compatibilityListenerTokens.filter { deviceSet.contains($0.key) }
+    deviceCompatibility = deviceCompatibility.filter { deviceSet.contains($0.key) }
+    updateFirmwareUpdateRequired()
 
-    // Add listeners for new devices
+    // Add listeners for new devices. Each listener fires when the SDK
+    // re-evaluates compatibility (e.g. after a firmware update lands).
     for deviceId in devices {
+      // Refresh the cached compatibility for every present device — initial
+      // pass to seed `requiresFirmwareUpdate` even for devices we already
+      // had a listener on.
+      if let device = wearables.deviceForIdentifier(deviceId) {
+        deviceCompatibility[deviceId] = device.compatibility()
+      }
+
       guard compatibilityListenerTokens[deviceId] == nil else { continue }
       guard let device = wearables.deviceForIdentifier(deviceId) else { continue }
 
@@ -114,14 +154,25 @@ class WearablesViewModel: ObservableObject {
       let deviceName = device.nameOrId()
       let token = device.addCompatibilityListener { [weak self] compatibility in
         guard let self else { return }
-        if compatibility == .deviceUpdateRequired {
-          Task { @MainActor in
+        Task { @MainActor [weak self] in
+          guard let self else { return }
+          self.deviceCompatibility[deviceId] = compatibility
+          self.updateFirmwareUpdateRequired()
+          if compatibility == .deviceUpdateRequired {
             self.showError("Device '\(deviceName)' requires an update to work with this app")
           }
         }
       }
       compatibilityListenerTokens[deviceId] = token
     }
+
+    updateFirmwareUpdateRequired()
+  }
+
+  /// Recompute `requiresFirmwareUpdate` from the per-device compatibility
+  /// cache. Idempotent — call after any mutation of `deviceCompatibility`.
+  private func updateFirmwareUpdateRequired() {
+    requiresFirmwareUpdate = deviceCompatibility.values.contains(.deviceUpdateRequired)
   }
 
   /// Human-readable name for a paired device (falls back to the raw identifier
@@ -170,6 +221,32 @@ class WearablesViewModel: ObservableObject {
         try await wearables.startRegistration()
       } catch let error as RegistrationError {
         showError(error.description)
+      } catch {
+        showError(error.localizedDescription)
+      }
+    }
+  }
+
+  /// Deep-link into the Meta AI iOS app's "Update / install DAT helper on
+  /// glasses" flow. Used when a DeviceSession fails with
+  /// `DeviceSessionError.datAppOnTheGlassesUpdateRequired` (or its first
+  /// install — same path).
+  func openDATGlassesAppUpdate() {
+    Task { @MainActor in
+      do {
+        try await wearables.openDATGlassesAppUpdate()
+      } catch {
+        showError(error.localizedDescription)
+      }
+    }
+  }
+
+  /// Deep-link into the Meta AI iOS app's firmware-update flow. Used when
+  /// `Device.compatibility() == .deviceUpdateRequired`.
+  func openFirmwareUpdate() {
+    Task { @MainActor in
+      do {
+        try await wearables.openFirmwareUpdate()
       } catch {
         showError(error.localizedDescription)
       }

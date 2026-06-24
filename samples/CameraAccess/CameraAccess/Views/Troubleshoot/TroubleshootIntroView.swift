@@ -95,6 +95,7 @@ struct TroubleshootIntroView: View {
         subtitle: nil,
         glassesActionLabel: "Diagnose with Glasses",
         iPhoneActionLabel: "Diagnose with iPhone",
+        registrationState: wearablesVM.registrationState,
         onSelect: { transport in
           pendingTransport = transport
         }
@@ -146,8 +147,15 @@ struct TroubleshootIntroView: View {
   }
 
   private func launchGlasses() {
-    // HOTFIX: see RecordTabView.handlePickedTransport.
-    showGlassesInactiveSheet = true
+    // Pre-HOTFIX behavior restored 2026-05-21 — route on real glasses
+    // connectivity now that lens + DeviceSessionManager are wired.
+    if wearablesVM.registrationState != .registered {
+      showRegistrationSheet = true
+    } else if !wearablesVM.hasActiveDevice {
+      showGlassesInactiveSheet = true
+    } else {
+      presentedTransport = .glasses
+    }
   }
 }
 
@@ -183,6 +191,8 @@ private struct TroubleshootSessionContainer: View {
   /// parent's cover (popping the entire container).
   let onExit: () -> Void
 
+  @EnvironmentObject private var deviceSessionManager: DeviceSessionManager
+
   @State private var phase: Phase = .diagnostic
   @State private var pendingHandoff: LearnerSessionStartResponse?
 
@@ -208,7 +218,8 @@ private struct TroubleshootSessionContainer: View {
           progressStore: LocalProgressStore(),
           serverBaseURL: serverBaseURL,
           transport: transport,
-          onExit: handleDiagnosticExit
+          onExit: handleDiagnosticExit,
+          sessionManager: deviceSessionManager
         )
         .transition(.opacity)
 
@@ -224,7 +235,8 @@ private struct TroubleshootSessionContainer: View {
             wearablesVM: wearablesVM,
             progressStore: LocalProgressStore(),
             serverBaseURL: serverBaseURL,
-            transport: transport
+            transport: transport,
+            sessionManager: deviceSessionManager
           )
           .transition(.opacity)
         }

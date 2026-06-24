@@ -4,6 +4,19 @@ import SwiftUI
 
 @MainActor
 class ExpertRecordingManager: ObservableObject {
+  /// Audio encoding for the AVAssetWriter audio track.
+  ///
+  /// - `aac`: MPEG4 AAC at the AVAudioSession hardware sample rate. iPhone
+  ///   recording uses this — the device HW rate (44.1/48 kHz) keeps the AAC
+  ///   encoder happy.
+  /// - `linearPcm16kMono`: uncompressed LinearPCM, 16 kHz, Int16, mono. No
+  ///   encoder is invoked; the writer just muxes raw PCM bytes into the MP4
+  ///   audio track. Required for the glasses path — feeding AAC at the
+  ///   BT-HFP mic rate poisons AVAssetWriter with `OSStatus -12651`
+  ///   ("Cannot encode media"). Caller must pre-convert mic buffers to
+  ///   exactly this format via `AudioSessionManager.convertBufferToPcmRecording`.
+  enum AudioFormat { case aac, linearPcm16kMono }
+
   @Published var isRecording = false
   @Published var recordingDuration: TimeInterval = 0
   @Published var recordingURL: URL?
@@ -33,6 +46,13 @@ class ExpertRecordingManager: ObservableObject {
   private var assetWriter: AVAssetWriter?
   private var videoInput: AVAssetWriterInput?
   private var audioInput: AVAssetWriterInput?
+
+  /// Audio format the live writer was built with. Set by `prepareWriter`
+  /// or `startRecording` (whichever first builds the writer) and read by
+  /// `appendAudioBuffer` to pick the right CMSampleBuffer construction
+  /// path. Resets to `.aac` whenever the writer is discarded so any later
+  /// in-line build inherits today's default behavior.
+  private var configuredAudioFormat: AudioFormat = .aac
 
   /// Dims the most recently prepared writer was built for. Set by
   /// `prepareWriter(width:height:)`, cleared by `discardPreparedWriter()`
@@ -125,6 +145,7 @@ class ExpertRecordingManager: ObservableObject {
   private static func buildWriterOffMain(
     width: Int,
     height: Int,
+    audioFormat: AudioFormat = .aac,
     videoSourceFormatHint: CMFormatDescription? = nil
   ) async -> (writer: AVAssetWriter, video: AVAssetWriterInput, audio: AVAssetWriterInput, url: URL)? {
     let fileName = "expert_\(Int(Date().timeIntervalSince1970)).mp4"
@@ -155,16 +176,37 @@ class ExpertRecordingManager: ObservableObject {
         writer.add(vInput)
       }
 
-      // Audio sample rate — prefer the hardware rate, fall back to 16 kHz
-      // if the session isn't ready yet. Reading this from a nonisolated
-      // context is safe; `AVAudioSession.sharedInstance()` is thread-safe.
-      let hwRate = AVAudioSession.sharedInstance().sampleRate
-      let audioSettings: [String: Any] = [
-        AVFormatIDKey: kAudioFormatMPEG4AAC,
-        AVSampleRateKey: hwRate > 0 ? hwRate : 16000.0,
-        AVNumberOfChannelsKey: 1,
-        AVEncoderBitRateKey: 64000,
-      ]
+      let audioSettings: [String: Any]
+      switch audioFormat {
+      case .aac:
+        // iPhone path — AAC mono at the AVAudioSession HW sample rate.
+        // Reading from a nonisolated context is safe; the singleton is
+        // thread-safe.
+        let hwRate = AVAudioSession.sharedInstance().sampleRate
+        audioSettings = [
+          AVFormatIDKey: kAudioFormatMPEG4AAC,
+          AVSampleRateKey: hwRate > 0 ? hwRate : 16000.0,
+          AVNumberOfChannelsKey: 1,
+          AVEncoderBitRateKey: 64000,
+        ]
+        print("[Recording] audio settings: AAC mono @ \(hwRate > 0 ? hwRate : 16000.0) Hz")
+      case .linearPcm16kMono:
+        // Glasses path — uncompressed LinearPCM 16 kHz Int16 mono. No
+        // encoder is invoked; the writer just packages the PCM bytes
+        // into the MP4 audio track. The caller must feed audio buffers
+        // already in this exact format (see
+        // `AudioSessionManager.convertBufferToPcmRecording`).
+        audioSettings = [
+          AVFormatIDKey: kAudioFormatLinearPCM,
+          AVSampleRateKey: 16_000,
+          AVNumberOfChannelsKey: 1,
+          AVLinearPCMBitDepthKey: 16,
+          AVLinearPCMIsBigEndianKey: false,
+          AVLinearPCMIsFloatKey: false,
+          AVLinearPCMIsNonInterleaved: false,
+        ]
+        print("[Recording] audio settings: LinearPCM 16 kHz Int16 mono (no encoder in path)")
+      }
       let aInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
       aInput.expectsMediaDataInRealTime = true
       if writer.canAdd(aInput) {
@@ -196,23 +238,27 @@ class ExpertRecordingManager: ObservableObject {
   /// iPhone path never calls this — its `startRecording` continues to
   /// build the writer in-line.
   @discardableResult
-  func prepareWriter(width: Int, height: Int) async -> Bool {
+  func prepareWriter(width: Int, height: Int, audioFormat: AudioFormat = .aac) async -> Bool {
     // Don't disturb an in-flight recording.
     guard !isRecording, !isStarting else { return assetWriter != nil }
 
-    // Already prepared with matching dims? No-op.
+    // Already prepared with matching dims + audio format? No-op. A format
+    // mismatch is treated like a dims mismatch — rebuild with the new
+    // settings, since AVAssetWriterInput is locked to its output settings
+    // once added.
     if assetWriter != nil,
        let dims = preparedWriterDims,
-       dims.width == width, dims.height == height {
+       dims.width == width, dims.height == height,
+       configuredAudioFormat == audioFormat {
       return true
     }
 
-    // Different dims (or stale prepared writer): discard first.
+    // Different dims/format (or stale prepared writer): discard first.
     if assetWriter != nil {
       discardPreparedWriter()
     }
 
-    guard let built = await Self.buildWriterOffMain(width: width, height: height) else {
+    guard let built = await Self.buildWriterOffMain(width: width, height: height, audioFormat: audioFormat) else {
       return false
     }
 
@@ -226,8 +272,9 @@ class ExpertRecordingManager: ObservableObject {
     recordingDuration = 0
     recordingURL = built.url
     preparedWriterDims = (width, height)
+    configuredAudioFormat = audioFormat
 
-    print("[Recording] prepareWriter ✓ dims=\(width)x\(height) url=\(built.url.lastPathComponent)")
+    print("[Recording] prepareWriter ✓ dims=\(width)x\(height) audio=\(audioFormat) url=\(built.url.lastPathComponent)")
     return true
   }
 
@@ -258,6 +305,7 @@ class ExpertRecordingManager: ObservableObject {
     audioInput = nil
     recordingURL = nil
     preparedWriterDims = nil
+    configuredAudioFormat = .aac
     hasStartedSession = false
     appendedFrameCount = 0
     droppedFrameCount = 0
@@ -280,6 +328,7 @@ class ExpertRecordingManager: ObservableObject {
   func startRecording(
     width: Int = ExpertRecordingManager.portraitSize.width,
     height: Int = ExpertRecordingManager.portraitSize.height,
+    audioFormat: AudioFormat = .aac,
     postAudioSettleMs: UInt64 = 0
   ) async -> StartRecordingError? {
     guard !isRecording, !isStarting else { return nil }
@@ -294,12 +343,20 @@ class ExpertRecordingManager: ObservableObject {
     //
     // SLOW PATH (iPhone, current behavior): no prepared writer; build
     // it in-line as before.
+    //
+    // If a prepared writer exists but was built for a different audio
+    // format than the caller requested, discard it and rebuild — the
+    // caller's request wins. (Same rebuild rule as a dims mismatch.)
+    if assetWriter != nil, configuredAudioFormat != audioFormat {
+      print("[Recording] startRecording discarding prepared writer (audio format mismatch: prepared=\(configuredAudioFormat) requested=\(audioFormat))")
+      discardPreparedWriter()
+    }
     let outputURL: URL
     if assetWriter != nil, let prepared = recordingURL {
-      print("[Recording] startRecording reusing prepared writer (dims=\(preparedWriterDims?.width ?? -1)x\(preparedWriterDims?.height ?? -1))")
+      print("[Recording] startRecording reusing prepared writer (dims=\(preparedWriterDims?.width ?? -1)x\(preparedWriterDims?.height ?? -1) audio=\(configuredAudioFormat))")
       outputURL = prepared
     } else {
-      guard let built = await Self.buildWriterOffMain(width: width, height: height) else {
+      guard let built = await Self.buildWriterOffMain(width: width, height: height, audioFormat: audioFormat) else {
         return .writerSetupFailed
       }
       assetWriter = built.writer
@@ -307,6 +364,7 @@ class ExpertRecordingManager: ObservableObject {
       audioInput = built.audio
       outputURL = built.url
       recordingURL = built.url
+      configuredAudioFormat = audioFormat
     }
 
     // Reset stats regardless of which path we took (prepared writer
@@ -491,24 +549,45 @@ class ExpertRecordingManager: ObservableObject {
   }
 
   private func appendAudioBuffer(_ buffer: AVAudioPCMBuffer, time: AVAudioTime) {
+    // Snapshot the configured format on the main actor before hopping to
+    // the recording queue. The format never flips mid-recording (it's set
+    // before the first sample lands), but reading it from the nonisolated
+    // closure below would require an `await` we don't want here.
+    let audioFormat = configuredAudioFormat
+
     recordingQueue.async { [weak self] in
       guard let self,
             let writer = self.assetWriter,
             let audioInput = self.audioInput
       else { return }
 
-      guard let sampleBuffer = self.cmSampleBuffer(from: buffer, time: time) else { return }
+      let sampleBuffer: CMSampleBuffer?
+      switch audioFormat {
+      case .aac:
+        // iPhone path — original Float-PCM construction, fed into the
+        // AAC encoder downstream.
+        sampleBuffer = self.cmSampleBuffer(from: buffer, time: time)
+      case .linearPcm16kMono:
+        // Glasses path — pre-convert the mic buffer (whatever HW rate it
+        // arrived at) to PCM16 16 kHz mono, then build the CMSampleBuffer
+        // from Int16 channel data. No encoder downstream.
+        guard let pcm = self.audioSessionManager.convertBufferToPcmRecording(buffer) else {
+          return
+        }
+        sampleBuffer = self.cmSampleBufferInt16(from: pcm, time: time)
+      }
+      guard let sb = sampleBuffer else { return }
 
       // If video hasn't started the session yet (audio arrived first),
       // use this audio sample's PTS to anchor. Host-clock-based for both.
       if !self.hasStartedSession {
-        let firstPTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let firstPTS = CMSampleBufferGetPresentationTimeStamp(sb)
         writer.startSession(atSourceTime: firstPTS)
         self.hasStartedSession = true
       }
 
       guard audioInput.isReadyForMoreMediaData else { return }
-      audioInput.append(sampleBuffer)
+      audioInput.append(sb)
     }
   }
 
@@ -568,6 +647,80 @@ class ExpertRecordingManager: ObservableObject {
     abl.mBuffers.mNumberChannels = asbd.mChannelsPerFrame
     abl.mBuffers.mDataByteSize = pcmBuffer.frameLength * UInt32(asbd.mBytesPerFrame)
     abl.mBuffers.mData = UnsafeMutableRawPointer(pcmBuffer.floatChannelData?[0])
+
+    let setStatus = CMSampleBufferSetDataBufferFromAudioBufferList(
+      sb,
+      blockBufferAllocator: kCFAllocatorDefault,
+      blockBufferMemoryAllocator: kCFAllocatorDefault,
+      flags: 0,
+      bufferList: &abl
+    )
+
+    guard setStatus == noErr else { return nil }
+    return sb
+  }
+
+  /// Int16-PCM sibling of `cmSampleBuffer(from:time:)`. The glasses path
+  /// pre-converts mic buffers to PCM16 16 kHz mono before append (see
+  /// `AudioSessionManager.convertBufferToPcmRecording`); this builds a
+  /// CMSampleBuffer over that Int16 data so the writer can mux it
+  /// directly as LinearPCM with no encoder in the path.
+  ///
+  /// Same host-clock PTS rule as the Float variant — the writer's
+  /// session start (set by whichever sample arrives first) is the single
+  /// anchor, so video + audio land on one timeline without a per-stream
+  /// rebase.
+  private func cmSampleBufferInt16(from pcmBuffer: AVAudioPCMBuffer, time: AVAudioTime) -> CMSampleBuffer? {
+    let format = pcmBuffer.format
+    var asbd = format.streamDescription.pointee
+
+    var formatDesc: CMAudioFormatDescription?
+    let fmtStatus = CMAudioFormatDescriptionCreate(
+      allocator: kCFAllocatorDefault,
+      asbd: &asbd,
+      layoutSize: 0,
+      layout: nil,
+      magicCookieSize: 0,
+      magicCookie: nil,
+      extensions: nil,
+      formatDescriptionOut: &formatDesc
+    )
+    guard fmtStatus == noErr, let desc = formatDesc else { return nil }
+
+    let hostTime = time.hostTime
+    let cmTime = CMClockMakeHostTimeFromSystemUnits(hostTime)
+
+    let frameCount = pcmBuffer.frameLength
+    var timing = CMSampleTimingInfo(
+      duration: CMTimeMake(value: 1, timescale: Int32(asbd.mSampleRate)),
+      presentationTimeStamp: cmTime,
+      decodeTimeStamp: .invalid
+    )
+
+    var sampleBuffer: CMSampleBuffer?
+    let sbStatus = CMSampleBufferCreate(
+      allocator: kCFAllocatorDefault,
+      dataBuffer: nil,
+      dataReady: false,
+      makeDataReadyCallback: nil,
+      refcon: nil,
+      formatDescription: desc,
+      sampleCount: CMItemCount(frameCount),
+      sampleTimingEntryCount: 1,
+      sampleTimingArray: &timing,
+      sampleSizeEntryCount: 0,
+      sampleSizeArray: nil,
+      sampleBufferOut: &sampleBuffer
+    )
+
+    guard sbStatus == noErr, let sb = sampleBuffer else { return nil }
+
+    guard let int16Channels = pcmBuffer.int16ChannelData else { return nil }
+    var abl = AudioBufferList()
+    abl.mNumberBuffers = 1
+    abl.mBuffers.mNumberChannels = asbd.mChannelsPerFrame
+    abl.mBuffers.mDataByteSize = pcmBuffer.frameLength * UInt32(asbd.mBytesPerFrame)
+    abl.mBuffers.mData = UnsafeMutableRawPointer(int16Channels[0])
 
     let setStatus = CMSampleBufferSetDataBufferFromAudioBufferList(
       sb,

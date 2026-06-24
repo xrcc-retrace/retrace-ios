@@ -59,7 +59,8 @@ struct TroubleshootSessionView: View {
     progressStore: LocalProgressStore,
     serverBaseURL: String,
     transport: CaptureTransport,
-    onExit: @escaping (LearnerSessionStartResponse?) -> Void
+    onExit: @escaping (LearnerSessionStartResponse?) -> Void,
+    sessionManager: DeviceSessionManager? = nil
   ) {
     self.wearables = wearables
     self.wearablesVM = wearablesVM
@@ -70,7 +71,8 @@ struct TroubleshootSessionView: View {
     self._viewModel = StateObject(wrappedValue: DiagnosticSessionViewModel(
       wearables: wearables,
       serverBaseURL: serverBaseURL,
-      transport: transport
+      transport: transport,
+      sessionManager: sessionManager
     ))
   }
 
@@ -236,6 +238,33 @@ struct TroubleshootSessionView: View {
         }
       )
       .presentationDetents([.medium, .large])
+    }
+    // Recovery layer of the DAT camera permission gate. Mirrors the
+    // identical pattern on CoachingSessionView — pre-flight in the
+    // transport picker (CaptureTransportPickerSheet) catches the
+    // common case; this sheet catches the residual race where
+    // permission was revoked between picker tap and session start.
+    .sheet(isPresented: $viewModel.pendingGlassesPermissions) {
+      PermissionRequiredSheet(
+        onGranted: {
+          Task { await viewModel.retryAfterPermissionGrant() }
+        },
+        onCancel: {
+          viewModel.pendingGlassesPermissions = false
+        }
+      )
+    }
+    // Audio readiness recovery — mirrors CoachingSessionView. Surfaced
+    // when BT HFP SCO didn't deliver a buffer within the timeout window.
+    .sheet(isPresented: $viewModel.pendingAudioRetry) {
+      AudioRecoverySheet(
+        onRetry: {
+          Task { await viewModel.retryAfterAudioFailure() }
+        },
+        onCancel: {
+          viewModel.pendingAudioRetry = false
+        }
+      )
     }
   }
 

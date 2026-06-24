@@ -288,13 +288,15 @@ class StreamSessionViewModel: ObservableObject {
     return (Int(_latestFrameDimsW), Int(_latestFrameDimsH))
   }
 
-  // The core DAT SDK StreamSession — handles all streaming operations.
-  // In 0.6 StreamSession is a Capability attached to a DeviceSession and has no
-  // public initializer. We create the session lazily in `startSession()` so a
-  // missing eligible device at construction time doesn't kill the VM — instead
-  // we can report it when the user actually taps "Start streaming".
+  // The core DAT SDK Stream capability — handles all streaming operations.
+  // In 0.7 `Stream` is a Capability attached to a DeviceSession and has no
+  // public initializer (renamed from 0.6's `StreamSession`). We create the
+  // session lazily in `startSession()` so a missing eligible device at
+  // construction time doesn't kill the VM — instead we can report it when
+  // the user actually taps "Start streaming". Qualified as MWDATCamera.Stream
+  // to disambiguate from Foundation.Stream which Combine pulls in transitively.
   private var deviceSession: DeviceSession?
-  private var streamSession: StreamSession?
+  private var streamSession: MWDATCamera.Stream?
   // Listener tokens are used to manage DAT SDK event subscriptions
   private var stateListenerToken: AnyListenerToken?
   private var videoFrameListenerToken: AnyListenerToken?
@@ -303,10 +305,24 @@ class StreamSessionViewModel: ObservableObject {
   private let wearables: WearablesInterface
   private let deviceSelector: AutoDeviceSelector
   private var deviceMonitorTask: Task<Void, Never>?
+  /// Phase 6: optional shared `DeviceSessionManager`. When the
+  /// `deviceSessionManagerEnabled` toggle is ON, Expert recording's
+  /// DeviceSession lifecycle routes through the manager so it can
+  /// coexist with lens display on the same physical device (issue #180).
+  /// When OFF, the inline createSession + 5s-watchdog path is used —
+  /// preserved for sub-second on-device rollback during migration.
+  private let sessionManager: DeviceSessionManager?
 
-  init(wearables: WearablesInterface, uploadService: UploadService) {
+  /// Reads the live debug toggle. Re-read on each `startSession`
+  /// so a flip in Settings takes effect on the next session.
+  private var deviceSessionManagerEnabled: Bool {
+    UserDefaults.standard.bool(forKey: "deviceSessionManagerEnabled") && sessionManager != nil
+  }
+
+  init(wearables: WearablesInterface, uploadService: UploadService, sessionManager: DeviceSessionManager? = nil) {
     self.wearables = wearables
     self.uploadService = uploadService
+    self.sessionManager = sessionManager
     // Let the SDK auto-select from available devices
     self.deviceSelector = AutoDeviceSelector(wearables: wearables)
 
@@ -459,6 +475,7 @@ class StreamSessionViewModel: ObservableObject {
     let startErr = await recordingManager.startRecording(
       width: dims.width,
       height: dims.height,
+      audioFormat: .linearPcm16kMono,
       postAudioSettleMs: 100
     )
     if let startErr = startErr {
@@ -555,6 +572,7 @@ class StreamSessionViewModel: ObservableObject {
       if let err = await self.recordingManager.startRecording(
         width: size.width,
         height: size.height,
+        audioFormat: .linearPcm16kMono,
         postAudioSettleMs: 100
       ) {
         self.showError(err.errorDescription ?? "Couldn't start recording.")
@@ -582,7 +600,8 @@ class StreamSessionViewModel: ObservableObject {
         guard let self else { return }
         _ = await self.recordingManager.prepareWriter(
           width: dims.width,
-          height: dims.height
+          height: dims.height,
+          audioFormat: .linearPcm16kMono
         )
       }
     }
@@ -619,7 +638,11 @@ class StreamSessionViewModel: ObservableObject {
     Task { [weak self] in
       guard let self else { return }
       defer { self.isPrepareWriterInFlight = false }
-      let ok = await self.recordingManager.prepareWriter(width: width, height: height)
+      let ok = await self.recordingManager.prepareWriter(
+        width: width,
+        height: height,
+        audioFormat: .linearPcm16kMono
+      )
       if !ok {
         print("[Glasses] prepareWriter ✗ for \(width)x\(height)")
       }
@@ -683,14 +706,25 @@ class StreamSessionViewModel: ObservableObject {
     // races our async stopSession and the SDK throws
     // `.sessionAlreadyExists` on the next createSession.
     //
-    // Once the Task completes, awaiting it from the next prepare is a
-    // no-op — the cached `Void` result returns instantly. So no
-    // cleanup needed; subsequent teardowns just overwrite the slot.
+    // Phase 6: when the manager path is active, the manager's internal
+    // `lifecycleTask` provides the same serialization (the next acquire
+    // for "expert" awaits this release). We still stash a Task into
+    // `teardownInFlight` so the inline-path semantics are unchanged on
+    // toggle-OFF. Both paths converge on identical observable behavior.
+    let usedManager = deviceSessionManagerEnabled
+    let manager = sessionManager
     Self.teardownInFlight = Task { [self, streamToStop, sessionToStop] in
       _ = self  // strong capture — keeps awaitDeviceSessionStopped reachable
-      print("[Glasses] teardown → stopping streamSession + deviceSession")
+      print("[Glasses] teardown → stopping streamSession (manager=\(usedManager))")
       await streamToStop?.stop()
-      if let session = sessionToStop {
+      if usedManager, let manager = manager {
+        // Manager owns DeviceSession lifecycle; just release our lease.
+        // If another consumer (lens) holds the session, the manager
+        // keeps it alive. If we were last, the manager calls .stop()
+        // and waits for .stopped internally.
+        await manager.release(consumerLabel: "expert")
+        print("[Glasses] teardown → manager.release('expert') complete")
+      } else if let session = sessionToStop {
         session.stop()
         await self.awaitDeviceSessionStopped(session, timeout: 3.0)
         print("[Glasses] teardown → DeviceSession reached \(session.state)")
@@ -776,105 +810,133 @@ class StreamSessionViewModel: ObservableObject {
         return
       }
 
-      do {
-        print("[Glasses] startSession() → wearables.createSession(deviceSelector:)")
-        let session = try wearables.createSession(deviceSelector: deviceSelector)
-        print("[Glasses] createSession ✓ (state=\(session.state))")
+      // Lock to `.medium` (504×896) instead of `.high` (720×1280) — see
+      // long-form rationale just below the inline path. Same config
+      // shared by both manager and inline paths.
+      let streamConfig = StreamConfiguration(
+        videoCodec: .raw,
+        resolution: .medium,
+        frameRate: 30)
 
-        // Start the device session FIRST. Without this, the next
-        // addStream call sees a `.idle` session and returns nil.
+      let session: DeviceSession
+      let stream: MWDATCamera.Stream
+
+      if deviceSessionManagerEnabled, let manager = sessionManager {
+        // Phase 6 manager path: ask the manager for a ready DeviceSession.
+        // It races stateStream/errorStream and serializes against any
+        // in-flight release, so `.sessionAlreadyExists` and the 5s
+        // datAppOnTheGlassesUpdateRequired masking bug both go away.
         do {
-          print("[Glasses] session.start() → …")
-          try session.start()
-          print("[Glasses] session.start() ✓ (state=\(session.state))")
+          print("[Glasses] startSession() → manager.acquire('expert')")
+          let acquired = try await manager.acquire(consumerLabel: "expert")
+          print("[Glasses] manager.acquire ✓ (state=\(acquired.state))")
+          print("[Glasses] addStream(config: codec=raw, resolution=.medium, fps=30) → …")
+          guard let s = try acquired.addStream(config: streamConfig) else {
+            print("[Glasses] addStream ✗ returned nil — releasing session and bailing")
+            await manager.release(consumerLabel: "expert")
+            showError("Could not attach streaming capability — the glasses dropped before the stream could open. Try again.")
+            return
+          }
+          print("[Glasses] addStream ✓ (streamState=\(s.state))")
+          session = acquired
+          stream = s
+        } catch let error as DeviceSessionManager.AcquireError {
+          print("[Glasses] manager.acquire threw: \(error)")
+          showError("Failed to start device session: \(error.description)")
+          deviceSession = nil
+          streamSession = nil
+          return
         } catch {
-          // Surface the start failure directly and don't proceed —
-          // calling addStream on a session that failed to start would
-          // throw `.sessionIdle` anyway.
-          print("[Glasses] session.start() ✗ \(error)")
+          print("[Glasses] Unknown error in manager.acquire: \(error)")
           showError("Failed to start device session: \(error.localizedDescription)")
+          deviceSession = nil
+          streamSession = nil
           return
         }
-
-        // CRITICAL: `session.start()` is sync and only transitions the
-        // session to `.starting`. The transition to `.started` is
-        // asynchronous (BT/WiFi handshake with the glasses). If we call
-        // `addStream(config:)` while the session is still `.starting`,
-        // the SDK returns nil — the original "Could not attach
-        // streaming capability" symptom on a real device. Meta's
-        // canonical 0.6 sample verifies `state == .started` first;
-        // their Obj-C bridge even exposes a dedicated
-        // `startAndWaitUntilReady(completionHandler:)` for this
-        // exact wait. Swift only exposes the sync `start()`, so we
-        // subscribe to `statePublisher` and await the transition.
+      } else {
+        // Inline path: pre-Phase-6 behavior, preserved exactly so the
+        // `deviceSessionManagerEnabled = false` rollback is bit-perfect.
+        // Order of operations matches Meta's canonical 0.6 sample:
+        //   1. createSession
+        //   2. session.start()                ← MUST come before addStream
+        //   3. session.addStream(config:)
+        //   4. stream.start() (below)
         do {
-          try await awaitDeviceSessionStarted(session, timeout: 5.0)
-          print("[Glasses] device session ready (state=\(session.state))")
+          print("[Glasses] startSession() → wearables.createSession(deviceSelector:)")
+          let inlineSession = try wearables.createSession(deviceSelector: deviceSelector)
+          print("[Glasses] createSession ✓ (state=\(inlineSession.state))")
+
+          // Start the device session FIRST. Without this, the next
+          // addStream call sees a `.idle` session and returns nil.
+          do {
+            print("[Glasses] session.start() → …")
+            try inlineSession.start()
+            print("[Glasses] session.start() ✓ (state=\(inlineSession.state))")
+          } catch {
+            print("[Glasses] session.start() ✗ \(error)")
+            showError("Failed to start device session: \(error.localizedDescription)")
+            return
+          }
+
+          // CRITICAL: `session.start()` is sync and only transitions the
+          // session to `.starting`. The transition to `.started` is
+          // asynchronous (BT/WiFi handshake). Subscribe + await before
+          // calling addStream.
+          do {
+            try await awaitDeviceSessionStarted(inlineSession, timeout: 5.0)
+            print("[Glasses] device session ready (state=\(inlineSession.state))")
+          } catch {
+            print("[Glasses] device session never reached .started: \(error.localizedDescription)")
+            inlineSession.stop()
+            showError("Glasses didn't finish starting up. Try again.")
+            return
+          }
+
+          print("[Glasses] addStream(config: codec=raw, resolution=.medium, fps=30) → …")
+          guard let s = try inlineSession.addStream(config: streamConfig) else {
+            // Session started but addStream declined — tear the orphan
+            // session back down so the next attempt is clean.
+            print("[Glasses] addStream ✗ returned nil (deviceState=\(inlineSession.state)) — stopping orphan session")
+            inlineSession.stop()
+            showError("Could not attach streaming capability — the glasses dropped before the stream could open. Try again.")
+            return
+          }
+          print("[Glasses] addStream ✓ (streamState=\(s.state))")
+          session = inlineSession
+          stream = s
+        } catch let error as DeviceSessionError {
+          print("[Glasses] DeviceSessionError in startSession: \(error)")
+          showError("Failed to start device session: \(error.localizedDescription)")
+          deviceSession = nil
+          streamSession = nil
+          return
         } catch {
-          print("[Glasses] device session never reached .started: \(error.localizedDescription)")
-          session.stop()
-          showError("Glasses didn't finish starting up. Try again.")
+          print("[Glasses] Unknown error in startSession: \(error)")
+          showError("Failed to start device session: \(error.localizedDescription)")
+          deviceSession = nil
+          streamSession = nil
           return
         }
-
-        // Lock to `.medium` (504×896) instead of `.high` (720×1280).
-        //
-        // Background: the BT/WiFi link to the glasses can sustain `.high`
-        // ONLY while audio isn't competing for bandwidth (i.e. preview-
-        // only). The moment recording starts, audio session activation
-        // grabs HFP, bandwidth halves, and DAT auto-degrades to `.medium`
-        // mid-recording. The AVAssetWriter — already sized at 720×1280
-        // from the preview-time dims — then rejects every degraded
-        // 504×896 frame with "Cannot Encode Media" and the recording
-        // produces 0 video frames.
-        //
-        // Per SDK docs (camera-streaming.md): "The SDK automatically
-        // reduces quality when bandwidth is limited: 1) First lowers
-        // resolution (e.g., High → Medium). 2) Then reduces frame rate
-        // (e.g., 30 → 24), never below 15 FPS." So requesting `.medium`
-        // makes resolution stable from preview through recording — the
-        // SDK can only drop framerate from here, which the writer
-        // tolerates. Writer is now sized 504×896 the whole time, frames
-        // always match, every recording works on the first try.
-        //
-        // We "give up" the brief `.high` preview moment to gain
-        // deterministic recording. The BT pipe wouldn't have delivered
-        // `.high` during the actual recording anyway.
-        let config = StreamSessionConfig(
-          videoCodec: .raw,
-          resolution: .medium,
-          frameRate: 30)
-        print("[Glasses] addStream(config: codec=raw, resolution=.medium, fps=30) → …")
-
-        guard let stream = try session.addStream(config: config) else {
-          // The session started but the SDK declined to attach a stream —
-          // most commonly because the eligible device dropped between
-          // createSession and addStream. Tear the orphan session back
-          // down so the next attempt re-creates from a clean slate.
-          print("[Glasses] addStream ✗ returned nil (deviceState=\(session.state)) — stopping orphan session")
-          session.stop()
-          showError("Could not attach streaming capability — the glasses dropped before the stream could open. Try again.")
-          return
-        }
-        print("[Glasses] addStream ✓ (streamState=\(stream.state))")
-
-        deviceSession = session
-        streamSession = stream
-        attachStreamListeners(stream)
-        updateStatusFromState(stream.state)
-      } catch let error as DeviceSessionError {
-        print("[Glasses] DeviceSessionError in startSession: \(error)")
-        showError("Failed to start device session: \(error.localizedDescription)")
-        deviceSession = nil
-        streamSession = nil
-        return
-      } catch {
-        print("[Glasses] Unknown error in startSession: \(error)")
-        showError("Failed to start device session: \(error.localizedDescription)")
-        deviceSession = nil
-        streamSession = nil
-        return
       }
+
+      // Rationale for `.medium` resolution (applies to BOTH paths):
+      //
+      // Background: the BT/WiFi link to the glasses can sustain `.high`
+      // ONLY while audio isn't competing for bandwidth (i.e. preview-
+      // only). The moment recording starts, audio session activation
+      // grabs HFP, bandwidth halves, and DAT auto-degrades to `.medium`
+      // mid-recording. The AVAssetWriter — already sized at 720×1280
+      // from the preview-time dims — then rejects every degraded
+      // 504×896 frame with "Cannot Encode Media" and the recording
+      // produces 0 video frames. So we request `.medium` up-front; the
+      // writer is sized 504×896 the whole time and frames always match.
+      // We "give up" the brief `.high` preview moment to gain
+      // deterministic recording.
+
+      deviceSession = session
+      streamSession = stream
+      attachStreamListeners(stream)
+      updateStatusFromState(stream.state)
     } else {
       print("[Glasses] startSession() → reusing existing streamSession")
     }
@@ -987,8 +1049,8 @@ class StreamSessionViewModel: ObservableObject {
     }
   }
 
-  /// Wire DAT SDK listeners to the freshly-created StreamSession.
-  private func attachStreamListeners(_ stream: StreamSession) {
+  /// Wire DAT SDK listeners to the freshly-created Stream capability.
+  private func attachStreamListeners(_ stream: MWDATCamera.Stream) {
     // Session state changes tell us when streaming starts, stops, or encounters issues.
     stateListenerToken = stream.statePublisher.listen { [weak self] state in
       // Log every transition. Critical for diagnosing "stuck on
@@ -1231,7 +1293,7 @@ class StreamSessionViewModel: ObservableObject {
     capturedPhoto = nil
   }
 
-  private func updateStatusFromState(_ state: StreamSessionState) {
+  private func updateStatusFromState(_ state: StreamState) {
     switch state {
     case .stopped:
       currentVideoFrame = nil
@@ -1240,10 +1302,16 @@ class StreamSessionViewModel: ObservableObject {
       streamingStatus = .waiting
     case .streaming:
       streamingStatus = .streaming
+    @unknown default:
+      // Future SDK case bump (e.g. 0.8 adds .reconnecting). Treat as
+      // transitional/waiting so the UI doesn't strand on a state we
+      // don't understand. Logged so we know to handle it explicitly.
+      print("[Glasses] StreamState → @unknown(\(state)) — treating as .waiting")
+      streamingStatus = .waiting
     }
   }
 
-  private func formatStreamingError(_ error: StreamSessionError) -> String {
+  private func formatStreamingError(_ error: StreamError) -> String {
     switch error {
     case .internalError:
       return "An internal error occurred. Please try again."
