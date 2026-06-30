@@ -46,6 +46,13 @@ struct DebugSettingsSection: View {
   /// procedure review screen exposes a reference-photo picker and the
   /// Coaching reference panel can show that image alongside the step clip.
   @AppStorage("referenceImageEnabled") private var referenceImageEnabled: Bool = false
+  #if DEBUG
+  /// Mirrors `AudioSessionManager.routeAudioToMacForDemo` (same UserDefaults
+  /// key). When on, iPhone-only coaching stops forcing the built-in speaker so
+  /// the Gemini Live voice can route to a Mac over QuickTime-USB / HDMI for
+  /// demos. DEBUG-only — the audio path that reads it is also `#if DEBUG`.
+  @AppStorage("debug.routeAudioToMacForDemo") private var routeAudioToMacForDemo: Bool = false
+  #endif
   /// When true, every `LensSession.send(_:)` reaches the on-glasses
   /// display. When false (default), all sends silently no-op so the
   /// existing SwiftUI emulator is the only visible HUD. Flip on when
@@ -134,6 +141,24 @@ struct DebugSettingsSection: View {
       .padding(14)
       .background(Color.surfaceRaised)
       .cornerRadius(Radius.md)
+
+      #if DEBUG
+      Toggle(isOn: $routeAudioToMacForDemo) {
+        VStack(alignment: .leading, spacing: 2) {
+          Text("Route AI audio to Mac (demo)")
+            .font(.retraceCallout)
+            .foregroundColor(.textPrimary)
+          Text("iPhone-only coaching stops forcing the phone speaker so Gemini Live's voice can play through a connected Mac (QuickTime screen recording or HDMI). You still talk via the built-in mic. Takes effect on the next coaching session. Note: this disables echo cancellation — keep the phone away from loud Mac speakers or the AI may interrupt itself.")
+            .font(.retraceCaption1)
+            .foregroundColor(.textTertiary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+      }
+      .tint(.appPrimary)
+      .padding(14)
+      .background(Color.surfaceRaised)
+      .cornerRadius(Radius.md)
+      #endif
 
       Toggle(isOn: $lensOutputEnabled) {
         VStack(alignment: .leading, spacing: 2) {
