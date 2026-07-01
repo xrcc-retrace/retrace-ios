@@ -69,6 +69,11 @@ struct HomeScreenView: View {
             registrationState: viewModel.registrationState,
             style: .button
           )
+
+          // Microphone — the audio-side prerequisite, granted here up front
+          // alongside the camera instead of lazily at session start. iOS-native
+          // (not a DAT/Meta AI permission); prompts iOS / deep-links to Settings.
+          MicrophonePermissionCTA(style: .button)
         }
       }
       .padding(.all, Spacing.screenPadding)

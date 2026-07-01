@@ -291,6 +291,7 @@ class DiagnosticSessionViewModel: GeminiLiveSessionBase {
     // Reset mode-specific state. Base fields (isMuted, isGeminiReady, etc.)
     // are reset inside startGeminiLiveSession → stopGeminiLiveSession paths.
     phase = .discovering
+    sessionDidEnd = false
     identifiedProduct = nil
     candidateProcedures = []
     resolution = nil
@@ -362,6 +363,10 @@ class DiagnosticSessionViewModel: GeminiLiveSessionBase {
   }
 
   func endSession() {
+    // Idempotent — see `sessionDidEnd`. Explicit exit + host `.onDisappear`
+    // backstop both call this; run the real teardown once.
+    guard !sessionDidEnd else { return }
+    sessionDidEnd = true
     let sid = sessionId
     if let sid {
       // Best-effort DELETE — same pattern as learner. @MainActor so

@@ -207,7 +207,18 @@ struct TroubleshootSessionView: View {
       if debugMode {
         HandGestureDebugStack(provider: HandGestureService.shared)
       }
+
+      // Non-blocking HFP warning (auto-clears when buffers resume).
+      if viewModel.micStalled {
+        VStack {
+          micStalledBanner
+          Spacer()
+        }
+        .padding(.top, Spacing.section)
+        .transition(.move(edge: .top).combined(with: .opacity))
+      }
     }
+    .animation(.easeInOut(duration: 0.25), value: viewModel.micStalled)
     .preferredColorScheme(.dark)
     .onAppear {
       // Double index-finger pinch ("back" gesture) → end-diagnostic
@@ -474,6 +485,22 @@ struct TroubleshootSessionView: View {
     }
     .padding(Spacing.md)
     .glassPanel(cornerRadius: Radius.md)
+  }
+
+  /// Non-blocking notice that the mic pipeline isn't delivering audio (BT-HFP
+  /// stall / mic route broken). Auto-clears when buffers resume (`micStalled`).
+  private var micStalledBanner: some View {
+    HStack(spacing: Spacing.md) {
+      Image(systemName: "waveform.slash")
+        .foregroundColor(.textPrimary)
+      Text("Mic not streaming — I can't hear you")
+        .font(.retraceCallout)
+        .foregroundColor(.textPrimary)
+      Spacer(minLength: 0)
+    }
+    .padding(Spacing.md)
+    .glassPanel(cornerRadius: Radius.md)
+    .padding(.horizontal, Spacing.xl)
   }
 
   private var phaseSection: some View {

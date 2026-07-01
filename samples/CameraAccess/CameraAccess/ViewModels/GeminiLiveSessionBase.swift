@@ -91,6 +91,15 @@ class GeminiLiveSessionBase: ObservableObject {
   /// Views observe this and defer `LensSession.activate(...)` until it's true.
   @Published private(set) var isReadyForNativeLens = false
 
+  /// Idempotency guard against a DOUBLE teardown. On "Take back on phone" the
+  /// explicit exit calls `shutdown()` → `endSession(...)`, and then setting
+  /// `runtimeMode = .none` unmounts the SwiftUI host, whose `.onDisappear`
+  /// backstop calls `endSession(...)` a second time — producing a second
+  /// `release(gemini-live)` + server DELETE. Subclasses gate `endSession(...)`
+  /// on this; it's reset when a fresh session starts. (Named `sessionDidEnd` to
+  /// avoid colliding with the `didEndSession()` subclass-hook method below.)
+  var sessionDidEnd = false
+
   /// True when a `.glasses` session is running but the connected glasses are
   /// NOT Display-capable — so the (always-on) on-glasses lens can't render and
   /// the session runs camera-only with the phone-side UI. This is the observable
@@ -103,6 +112,12 @@ class GeminiLiveSessionBase: ObservableObject {
   /// Display) flow — that path's readiness gate already requires a Display
   /// device, so this condition can't arise there.
   @Published private(set) var glassesLensUnavailable = false
+
+  /// Mirrors `AudioSessionManager.micStalled` for THIS session's audio manager
+  /// (own or borrowed). Drives a non-blocking "audio pipeline broken" banner in
+  /// the phone coaching/troubleshoot views; auto-clears when buffers resume. The
+  /// glasses-navigator standby uses the coordinator's own signal instead.
+  @Published private(set) var micStalled = false
 
   /// Set true when the pre-session DAT camera-permission gate fails on
   /// a `.glasses` transport session. The session view binds this to a
@@ -2157,6 +2172,13 @@ class GeminiLiveSessionBase: ObservableObject {
       .receive(on: DispatchQueue.main)
       .sink { [weak self] ts in
         self?.lastAudioActivityAt = ts
+      }
+      .store(in: &cancellables)
+
+    audio.$micStalled
+      .receive(on: DispatchQueue.main)
+      .sink { [weak self] stalled in
+        self?.micStalled = stalled
       }
       .store(in: &cancellables)
   }

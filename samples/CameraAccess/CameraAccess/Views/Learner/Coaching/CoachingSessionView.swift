@@ -347,6 +347,10 @@ struct CoachingSessionView: View {
           reconnectBanner
         }
 
+        if viewModel.micStalled {
+          micStalledBanner
+        }
+
         stepInstructionPanel
         stepProgressSection
         controlsBar
@@ -374,6 +378,23 @@ struct CoachingSessionView: View {
           .font(.retraceFace(.semibold, size: 16))
           .foregroundColor(.textPrimary)
       }
+    }
+    .padding(Spacing.md)
+    .glassPanel(cornerRadius: Radius.md)
+    .padding(.horizontal, Spacing.xl)
+    .padding(.bottom, Spacing.sm)
+  }
+
+  /// Non-blocking notice that the mic pipeline isn't delivering audio (BT-HFP
+  /// stall / mic route broken). Auto-clears when buffers resume (`micStalled`).
+  private var micStalledBanner: some View {
+    HStack(spacing: Spacing.md) {
+      Image(systemName: "waveform.slash")
+        .foregroundColor(.textPrimary)
+      Text("Mic not streaming — I can't hear you")
+        .font(.retraceCallout)
+        .foregroundColor(.textPrimary)
+      Spacer()
     }
     .padding(Spacing.md)
     .glassPanel(cornerRadius: Radius.md)

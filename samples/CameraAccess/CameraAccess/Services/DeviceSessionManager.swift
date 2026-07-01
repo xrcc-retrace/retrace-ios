@@ -389,13 +389,46 @@ final class DeviceSessionManager: ObservableObject {
     wearables.devices.compactMap { wearables.deviceForIdentifier($0)?.nameOrId() }
   }
 
+  /// Small main-actor result carrier so `runSerialized` can return a typed value
+  /// (and rethrow) out of the `Task<Void, Never>` lifecycle chain.
+  private final class LifecycleResult<T> { var value: Result<T, Error>? }
+
+  /// Funnel a lifecycle op through the SINGLE-FLIGHT chain shared by
+  /// acquire / release / teardown. Captures the current `lifecycleTask`, runs
+  /// `body` only after it completes, and installs itself as the new chain tail so
+  /// the NEXT op waits on us. This is what makes two concurrent `acquire()` calls
+  /// serialize instead of both reaching `createSession` (the `sessionAlreadyExists`
+  /// double-create race). Everything is `@MainActor`, so `lifecycleTask = task`
+  /// installs synchronously before the first suspension → concurrent callers chain
+  /// FIFO. `body` must NOT call acquire/release/teardown (would await itself).
+  @discardableResult
+  private func runSerialized<T>(_ body: @escaping @MainActor () async throws -> T) async throws -> T {
+    let prior = lifecycleTask
+    let box = LifecycleResult<T>()
+    let task = Task { @MainActor in
+      _ = await prior?.value
+      do { box.value = .success(try await body()) } catch { box.value = .failure(error) }
+    }
+    lifecycleTask = task
+    await task.value
+    return try box.value!.get()
+  }
+
   func acquire(
     consumerLabel: String,
     requirements: DeviceRequirements = .any
   ) async throws -> DeviceSession {
-    // Wait for any release in flight before mutating state.
-    await lifecycleTask?.value
+    // Join the single-flight lifecycle chain so this acquire is serialized against
+    // every other acquire/release/teardown — no two acquires can both createSession.
+    try await runSerialized { [self] in
+      try await performAcquire(consumerLabel: consumerLabel, requirements: requirements)
+    }
+  }
 
+  private func performAcquire(
+    consumerLabel: String,
+    requirements: DeviceRequirements
+  ) async throws -> DeviceSession {
     // Permission gate. DAT 0.7 contract: a device does not appear in
     // `devicesStream` until `Permission.camera` is granted via Meta AI —
     // so without this, `createSession` further down would just throw
@@ -414,6 +447,11 @@ final class DeviceSessionManager: ObservableObject {
     // applies to `.starting` (transient — racing in with a fresh createSession
     // would either be redundant or throw `sessionAlreadyExists`) and
     // `.stopping` (must reach `.stopped` before we can create a replacement).
+    // INVARIANT (H5): the `.started` reuse arm below MUST stay fully synchronous —
+    // no `await` between reading `session.state` and `leases[...] = Date()`. Because
+    // everything here is `@MainActor`, that synchrony is what stops an observer's
+    // `.stopped`/`invalidate` teardown from interleaving between the liveness check
+    // and handing back the session. Do not insert an `await` into this arm.
     if let session = deviceSession {
       switch session.state {
       case .started:
@@ -624,6 +662,32 @@ final class DeviceSessionManager: ObservableObject {
     leases.removeAll()
     teardownActiveSession(reason: "invalidate: \(reason)")
     sessionInvalidated.send(reason)
+  }
+
+  /// Awaitable "clean slate": force-drop any active session REGARDLESS of held
+  /// leases and WAIT for it to fully stop, so the caller can bring up a Bluetooth
+  /// HFP audio session on a free radio. The glasses share ONE BT radio between the
+  /// HFP mic channel and the DAT Display/Stream capabilities, and HFP must be the
+  /// first capability up (see `reference_glasses_bt_audio_display_ordering`); a
+  /// residual lens/camera `DeviceSession` left running would starve the mic. Safe
+  /// no-op when nothing is active. Like `invalidate(reason:)` but awaited, so the
+  /// caller can sequence `armPersistentAudio()` strictly after the radio is free.
+  func resetForFreshSession(reason: String) async {
+    guard deviceSession != nil || !leases.isEmpty else {
+      log("resetForFreshSession(\(reason)) → nothing active; no-op")
+      return
+    }
+    log("resetForFreshSession(\(reason)) → force-clearing \(leases.count) lease(s) + tearing down")
+    if let session = deviceSession {
+      invalidatedSessionID = ObjectIdentifier(session)
+    }
+    leases.removeAll()
+    // Tell any live consumer (lens / camera) to detach + rebuild.
+    sessionInvalidated.send(reason)
+    // Force the serialized stop (arms the 300ms WARP-drain settle), then await it
+    // so HFP arming can't begin until the shared radio is actually released.
+    teardownActiveSession(reason: "resetForFreshSession: \(reason)")
+    await lifecycleTask?.value
   }
 
   /// Serialized teardown of the active session, used by the registration-

@@ -89,6 +89,12 @@ class GeminiLiveService: ObservableObject {
   private var videoFramesSent = 0
   private var firstAudioSentLogged = false
   private var firstAudioReceivedLogged = false
+  // Per-turn diagnostics: prove whether Gemini actually heard the user (input
+  // transcript) and tried to speak (output transcript), logged once per turn so
+  // "no sound" can be pinned to mic-silent vs no-response vs playback.
+  private var loggedInputTranscriptThisTurn = false
+  private var loggedOutputTranscriptThisTurn = false
+  private var audioInBytesAtTurnStart = 0
   private var statsTask: Task<Void, Never>?
 
   /// Last `usageMetadata.totalTokenCount` observed from Gemini. Drops of
@@ -153,6 +159,9 @@ class GeminiLiveService: ObservableObject {
     audioInBytes = 0
     firstAudioSentLogged = false
     firstAudioReceivedLogged = false
+    loggedInputTranscriptThisTurn = false
+    loggedOutputTranscriptThisTurn = false
+    audioInBytesAtTurnStart = 0
     lastTokenCount = nil
     lastLoggedTokenBand = -1
   }
@@ -566,17 +575,36 @@ class GeminiLiveService: ObservableObject {
       // Check for turn complete
       if let turnComplete = serverContent["turnComplete"] as? Bool, turnComplete {
         clearModelGenerating()
+        // Decisive "did the AI actually speak this turn" signal: bytes of audio
+        // Gemini emitted since the turn opened. ~0 → the model produced no
+        // speech (look at the input transcript to see if it even heard you);
+        // large → audio was produced and any silence is a playback problem.
+        let turnAudio = audioInBytes - audioInBytesAtTurnStart
+        print("[GeminiLive] turn complete — AI audio this turn: \(turnAudio) bytes (\(audioInChunks) chunks total)")
+        audioInBytesAtTurnStart = audioInBytes
+        loggedInputTranscriptThisTurn = false
+        loggedOutputTranscriptThisTurn = false
         onTurnComplete?()
       }
 
-      // Transcripts forward to the UI but aren't logged — the activity feed
-      // already renders them, and per-word prints flooded the console.
+      // Transcripts forward to the UI. Log the FIRST fragment of each per turn
+      // (not every token — that floods): the input transcript proves Gemini
+      // heard intelligible mic audio; the output transcript proves it tried to
+      // reply. Silence-diagnosis hinges on these two.
       if let input = serverContent["inputTranscription"] as? [String: Any],
          let text = input["text"] as? String, !text.isEmpty {
+        if !loggedInputTranscriptThisTurn {
+          loggedInputTranscriptThisTurn = true
+          print("[GeminiLive] user heard (input transcript begins): \"\(text)\"")
+        }
         onInputTranscript?(text)
       }
       if let output = serverContent["outputTranscription"] as? [String: Any],
          let text = output["text"] as? String, !text.isEmpty {
+        if !loggedOutputTranscriptThisTurn {
+          loggedOutputTranscriptThisTurn = true
+          print("[GeminiLive] AI replying (output transcript begins): \"\(text)\"")
+        }
         onOutputTranscript?(text)
       }
     }

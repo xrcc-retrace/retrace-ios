@@ -16,6 +16,7 @@
 // reached from the "Launch on Display" entry button on the mode selector.
 //
 
+import AVFoundation
 import Combine
 import Foundation
 import MWDATCore
@@ -53,8 +54,17 @@ final class GlassesNavigationCoordinator: ObservableObject {
     case askAI
   }
 
+  /// Health of the glasses-native audio (HFP) pipeline. `.ok` normally; set to a
+  /// failure case when the persistent HFP session can't deliver mic buffers, so
+  /// the standby can show a warning overlay. Auto-recovers to `.ok` when buffers
+  /// resume (via the `persistentAudio.$micStalled` subscription).
+  enum AudioPipelineStatus: Equatable { case ok, micPermissionDenied, hfpNotFlowing }
+
   @Published private(set) var phase: Phase = .idle
   @Published private(set) var runtimeMode: RuntimeMode = .none
+
+  /// Observable audio-pipeline health for the HFP warning overlay (phone-side).
+  @Published private(set) var audioPipelineStatus: AudioPipelineStatus = .ok
 
   /// The procedure to coach while `runtimeMode == .learnerCoaching`.
   @Published private(set) var coachingProcedure: ProcedureResponse?
@@ -78,6 +88,18 @@ final class GlassesNavigationCoordinator: ObservableObject {
   private weak var lensSession: LensSession?
   private var uploadCancellables: Set<AnyCancellable> = []
   private let wearables: WearablesInterface
+  /// Shared session owner — used to force a clean slate (no lens/DeviceSession
+  /// holding the BT radio) before arming HFP.
+  private let sessionManager: DeviceSessionManager
+
+  /// The in-flight `enterGlassesMode()` arming Task. Held so `exitGlassesMode()`
+  /// can await it first — otherwise an exit during `.preparing` could be overtaken
+  /// by the arming Task, reviving audio + lens + `.active` after the user exited.
+  private var enterTask: Task<Void, Never>?
+
+  /// Combine subscription to `persistentAudio.$micStalled` for mid-session HFP
+  /// loss → drives `audioPipelineStatus` while a glasses session is live.
+  private var audioHealthCancellable: AnyCancellable?
 
   /// Glasses-native persistent audio. Armed ONCE in `enterGlassesMode()` —
   /// before the navigator Display — and kept alive for the whole glasses
@@ -87,9 +109,10 @@ final class GlassesNavigationCoordinator: ObservableObject {
   /// Released in `exitGlassesMode()`. nil only before launch / after exit.
   private(set) var persistentAudio: AudioSessionManager?
 
-  init(lensSession: LensSession, api: ProcedureAPIService, wearables: WearablesInterface) {
+  init(lensSession: LensSession, api: ProcedureAPIService, wearables: WearablesInterface, sessionManager: DeviceSessionManager) {
     self.lensSession = lensSession
     self.wearables = wearables
+    self.sessionManager = sessionManager
     self.navigatorVM = NavigatorViewModel(api: api)
     // Record on the lens delegates here so the coordinator owns the session
     // swap (navigator → expert recording → navigator).
@@ -159,15 +182,67 @@ final class GlassesNavigationCoordinator: ObservableObject {
   /// Display-capable device are confirmed. Activates the lens navigator and
   /// flips the phone to the "Session on glasses" standby.
   func enterGlassesMode() {
+    guard phase == .preparing, !isExiting else { return }
     navigatorVM.reset()
     runtimeMode = .none
-    // Arm HFP FIRST, then bring up the navigator Display
-    // — the documented HFP-before-Display order, now structural rather than a
-    // race. The phone stays on the preparing/readiness state until the mic
-    // pipeline is up (≤~2 s on the SCO warmup ceiling).
-    Task { @MainActor [weak self] in
-      guard let self else { return }
-      await self.armPersistentAudio()
+    // Arm HFP FIRST, then bring up the navigator Display — the documented
+    // HFP-before-Display order. The phone stays on the preparing/readiness state
+    // until the mic pipeline is up (≤~2 s on the SCO warmup ceiling).
+    enterTask = Task { @MainActor [weak self] in
+      guard let self, !self.isExiting, self.phase == .preparing else { return }
+      // CLEAN SLATE before HFP: the glasses share ONE Bluetooth radio between the
+      // HFP mic and the DAT Display/Stream capabilities, and HFP must come up
+      // first — a residual lens or DeviceSession would starve the mic. Tear down
+      // anything still running (safe no-op if nothing is) so HFP negotiates on a
+      // free radio.
+      await self.lensSession?.teardown()
+      await self.sessionManager.resetForFreshSession(reason: "pre-HFP clean slate")
+      guard !self.isExiting, self.phase == .preparing else { return }
+
+      var locked = await self.armPersistentAudio()
+
+      // First-buffer miss: the SCO link never proved it was carrying data within
+      // the budget. Attaching the navigator Display now would perturb the shared
+      // BT radio and tear down the not-yet-flowing HFP link, starving the mic for
+      // the whole session. Retry the arm ONCE on a freshly-freed radio before
+      // falling through to the Display attach. (If an exit overtakes during the
+      // retry, the exit guard right below rolls the arm back.)
+      if !locked, !self.isExiting, self.phase == .preparing {
+        print("[GlassesNav] first mic buffer missed — retrying HFP arm once before Display attach")
+        if let audio = self.persistentAudio {
+          audio.stopCapture()
+          audio.deactivate()
+          self.persistentAudio = nil
+        }
+        self.audioHealthCancellable = nil
+        await self.sessionManager.resetForFreshSession(reason: "pre-HFP retry clean slate")
+        if !self.isExiting, self.phase == .preparing {
+          locked = await self.armPersistentAudio()
+        }
+      }
+
+      // An exit may have overtaken us during the SCO warmup — roll back the
+      // arm and bail rather than reviving the session after the user exited.
+      guard !self.isExiting, self.phase == .preparing else {
+        if let audio = self.persistentAudio {
+          audio.stopCapture()
+          audio.deactivate()
+          self.persistentAudio = nil
+        }
+        self.audioHealthCancellable = nil
+        print("[GlassesNav] enter aborted post-arm (exit overtook); audio rolled back")
+        return
+      }
+
+      // Still not flowing after the retry: proceed into the navigator anyway (the
+      // user explicitly chose the glasses launch), but the `.hfpNotFlowing` status
+      // is already surfaced via `audioPipelineStatus` so the standby UI warns and
+      // the manager's config-change restart can still recover the mic late.
+      if !locked {
+        print("[GlassesNav] HFP still not confirmed after retry — entering navigator with mic warning surfaced")
+      }
+
+      // No `await` between here and `phase = .active` → atomic on the main actor.
       self.lensSession?.activate(.navigator, vm: self.navigatorVM)
       self.phase = .active
     }
@@ -189,18 +264,55 @@ final class GlassesNavigationCoordinator: ObservableObject {
   /// actual buffer here "locks in" HFP so the Display attach can't kill it —
   /// mirrors the runtime path's `awaitAudioReady` gate before its camera/Display
   /// branch.
-  private func armPersistentAudio() async {
+  /// Returns `true` once the mic is confirmed flowing (first buffer landed),
+  /// `false` on the first-buffer timeout or a missing mic permission — the
+  /// caller uses this to decide whether it's safe to attach the Display.
+  @discardableResult
+  private func armPersistentAudio() async -> Bool {
     let audio = AudioSessionManager(mode: .coaching)
     audio.preferredGlassesNames = DeviceSessionManager.pairedDeviceNames(from: wearables)
-    _ = await audio.requestMicrophonePermission()
+    // CHECK the mic permission — do NOT request it here. Granting is a
+    // deliberate, up-front step done in Settings / the home screen via
+    // `MicrophonePermissionCTA`, not a lazy prompt buried in the session flow.
+    // We still verify: arming the engine on a denied/undetermined mic starts
+    // capture on a dead route (buffers never flow — "No mic buffers since
+    // capture started") while the HFP route still looks healthy, so bail with
+    // an actionable log instead of standing up a silent session.
+    guard AVAudioApplication.shared.recordPermission == .granted else {
+      print("[GlassesNav] ⚠ Microphone permission not granted — skipping audio arm so we don't "
+        + "stand up a silent glasses session. Grant it in Settings › Microphone access "
+        + "(or the home screen) before launching.")
+      persistentAudio = nil
+      audioPipelineStatus = .micPermissionDenied
+      return false
+    }
     audio.configureSessionOnly()
-    _ = await audio.awaitHFPRouteReady(timeout: 2.0)
+    // Budgets match the coaching runtime path (`GeminiLiveSessionBase`'s 8 s
+    // `awaitAudioReady`): a cold Display-glasses SCO warmup routinely needs
+    // more than the old 2 s / 3 s, and the engine's post-start configuration
+    // change (restarted inside `AudioSessionManager`) can push the first buffer
+    // out further still.
+    _ = await audio.awaitHFPRouteReady(timeout: 4.0)
     audio.startCapture()
     // Lock in HFP: don't return (and let the caller attach the Display) until the
     // mic is actually delivering buffers, not just route-ready.
-    let locked = await audio.awaitFirstMicBuffer(timeout: 3.0)
+    let locked = await audio.awaitFirstMicBuffer(timeout: 8.0)
     persistentAudio = audio
+    // Drive the HFP warning overlay off the manager's live mic-stall signal:
+    // `micStalled` is true at startup if the first buffer never arrived (set in
+    // `awaitFirstMicBuffer`'s timeout) and mid-session if buffers stop; it
+    // auto-recovers to false when buffers flow, so the overlay clears itself.
+    audioHealthCancellable = audio.$micStalled
+      .receive(on: DispatchQueue.main)
+      .sink { [weak self] stalled in
+        self?.audioPipelineStatus = stalled ? .hfpNotFlowing : .ok
+      }
     print("[GlassesNav] persistent glasses audio armed (HFP \(locked ? "locked in — buffers flowing" : "NOT confirmed — no buffer in 3s"), idle until a runtime attaches)")
+    // On a first-buffer miss, dump the full audio state (permission, route,
+    // VPIO, input format) so a silent mic is diagnosable from one console paste
+    // — the coaching path already does this; the navigator used to fly blind.
+    if !locked { print(audio.dumpAudioDiagnostics()) }
+    return locked
   }
 
   /// Cancel from the gate, or "Take back on phone" from the standby → tear the
@@ -210,13 +322,23 @@ final class GlassesNavigationCoordinator: ObservableObject {
     isExiting = true
     Task { @MainActor [weak self] in
       guard let self else { return }
+      // Let any in-flight enter (arming HFP during `.preparing`) observe
+      // `isExiting` and unwind FIRST, so it can't revive audio/lens after we exit.
+      await self.enterTask?.value
+      self.enterTask = nil
       // Tear the active runtime down FIRST and await it — the camera + Gemini
       // must be provably off and the DeviceSession lease released before we drop
       // the lens and return the phone to normal. (Was the bug: the cover
       // dismissed while a fire-and-forget teardown got abandoned mid-flight.)
       await self.teardownActiveRuntime()
+      // HARD-detach the lens: suppress re-attach + release the "lens" lease,
+      // AWAITED. The old `deactivate()` here only cleared the renderer and fired
+      // an empty `send`, which lazily RE-ACQUIRED the DeviceSession the exit was
+      // releasing (createSession vs WARP-drain race → sessionAlreadyExists).
+      // `teardown()` releases it for real and blocks any trailing send from
+      // reviving the Bluetooth session.
       if self.phase == .active {
-        self.lensSession?.deactivate()
+        await self.lensSession?.teardown()
       }
       // Release the persistent HFP session LAST — after the active runtime is
       // down and the lens Display is released — so the radio is free and the
@@ -227,6 +349,8 @@ final class GlassesNavigationCoordinator: ObservableObject {
         self.persistentAudio = nil
         print("[GlassesNav] persistent glasses audio released")
       }
+      self.audioHealthCancellable = nil
+      self.audioPipelineStatus = .ok
       self.uploadCancellables.removeAll()
       self.runtimeMode = .none
       self.coachingProcedure = nil

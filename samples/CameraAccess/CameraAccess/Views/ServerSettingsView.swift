@@ -336,6 +336,11 @@ struct GlassesSettingsSection: View {
         registrationState: wearablesVM.registrationState,
         style: .card
       )
+
+      // Microphone is the audio-side prerequisite, granted here alongside the
+      // camera rather than lazily mid-session. iOS-native (not a DAT/Meta AI
+      // permission), so it prompts iOS directly / deep-links to iOS Settings.
+      MicrophonePermissionCTA(style: .card)
     }
     .padding(.top, Spacing.xl)
   }

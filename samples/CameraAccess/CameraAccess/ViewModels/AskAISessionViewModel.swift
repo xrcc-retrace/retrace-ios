@@ -40,12 +40,17 @@ class AskAISessionViewModel: GeminiLiveSessionBase {
 
   func startSession() async {
     searchState = .listening
+    sessionDidEnd = false
     candidates = []
     expandedCandidate = nil
     await startGeminiLiveSession()
   }
 
   func endSession() {
+    // Idempotent — see `sessionDidEnd`. Explicit exit + host `.onDisappear`
+    // backstop both call this; run the real teardown once.
+    guard !sessionDidEnd else { return }
+    sessionDidEnd = true
     if let sid = sessionId {
       Task { @MainActor in
         await ProcedureAPIService().endAskAISession(sessionId: sid)

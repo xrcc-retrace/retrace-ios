@@ -272,6 +272,7 @@ class CoachingSessionViewModel: GeminiLiveSessionBase {
     let seededIndex = max(0, (startingStep ?? 1) - 1)
     currentStepIndex = seededIndex
     isCompleted = false
+    sessionDidEnd = false
     frozenSessionDuration = nil
     showPiP = false
     hudStepTransitionState = .idle
@@ -294,6 +295,10 @@ class CoachingSessionViewModel: GeminiLiveSessionBase {
   }
 
   func endSession(progressStore: LocalProgressStore) {
+    // Idempotent: the explicit exit teardown and the host's `.onDisappear`
+    // backstop both call this. Run the real teardown once. See `sessionDidEnd`.
+    guard !sessionDidEnd else { return }
+    sessionDidEnd = true
     guard let recordId = sessionRecordId else { return }
     let status: SessionStatus = isCompleted ? .completed : .abandoned
     progressStore.updateSession(id: recordId, stepsCompleted: currentStepIndex, status: status)

@@ -68,6 +68,25 @@ final class LensDisplayCoordinator: ObservableObject {
   private var displayStateContinuation: AsyncStream<DisplayState>.Continuation?
   private var pendingAction: (() async -> Void)?
 
+  /// When true, `attachToDisplay()` refuses to acquire the shared DeviceSession.
+  /// Set by `suspendAttaching()` at the start of a TERMINAL teardown ("Take back
+  /// on phone"), so a late lazy `send(_:)` from a renderer that hasn't unmounted
+  /// yet can't re-acquire the very Bluetooth session the exit is releasing
+  /// (that race produced `createSession → sessionAlreadyExists`). Cleared by
+  /// `resumeAttaching()`, called whenever a lens flow legitimately activates.
+  private var suspendAttach = false
+
+  /// The in-flight `attachViaManager`/`acquire("lens")` operation, if any. Held so
+  /// `detachFromDisplay()` can DRAIN it before releasing — otherwise an attach that
+  /// already passed the synchronous `!suspendAttach` guard and is suspended inside
+  /// `acquire` would re-add the "lens" lease AFTER the detach released it, reviving
+  /// the DeviceSession. Also lets concurrent lazy sends coalesce onto one attach.
+  private var attachTask: Task<Void, Never>?
+  /// Monotonic id for the current attach, so the post-await cleanup only clears
+  /// `attachTask` when it's still the one this call installed (`Task` has no
+  /// identity to compare with `===`).
+  private var attachGeneration = 0
+
   /// Single-flight send serialization. `capability.send(_:)` MUST NOT be called
   /// concurrently: `send(_:)` is re-entered on the main actor while a prior send
   /// is suspended inside `capability.send`, so awaiting inline would put two
@@ -211,6 +230,14 @@ final class LensDisplayCoordinator: ObservableObject {
     didFailToStartSession = false
   }
 
+  /// Suppress lazy re-attach during a terminal teardown (return-to-phone). See
+  /// `suspendAttach`. Stays in effect until a flow legitimately `activate`s.
+  func suspendAttaching() { suspendAttach = true }
+
+  /// Re-enable attaching — called from `LensSession.activate(_:vm:)` so any real
+  /// activation clears a prior teardown's suppression.
+  func resumeAttaching() { suspendAttach = false }
+
   // MARK: - Session Management
 
   private func doSend(_ view: some DisplayableView, on capability: Display) async {
@@ -229,6 +256,17 @@ final class LensDisplayCoordinator: ObservableObject {
 
   func attachToDisplay() async {
     guard display == nil else { return }
+    // Coalesce concurrent lazy sends onto ONE in-flight attach so two sends can't
+    // both run setupDisplay or both add the "lens" lease.
+    if let inflight = attachTask { await inflight.value; return }
+    // A terminal teardown is in progress — refuse to re-acquire the shared
+    // DeviceSession. A trailing lazy `send(_:)` must not revive the Bluetooth
+    // session the exit just released. Cleared by `resumeAttaching()` on the next
+    // legitimate `LensSession.activate(...)`.
+    guard !suspendAttach else {
+      print("[LensDisplayCoordinator] attach suppressed — terminal teardown in progress")
+      return
+    }
     // Short-circuit if a prior attempt against the current registration
     // state already determined no display device is reachable / claimable.
     // Without this, a renderer pumping ~8 lazy `coordinator.send` calls
@@ -239,7 +277,20 @@ final class LensDisplayCoordinator: ObservableObject {
 
     didFailToStartSession = false
 
-    await attachViaManager(sessionManager)
+    // Run the acquire+setupDisplay as a tracked task so `detachFromDisplay()` can
+    // await it before releasing the lease (closes the acquire-vs-detach window).
+    // `Task` is a value type (no identity), so track a generation counter to only
+    // clear `attachTask` if it's still THIS attach (a detach or newer attach may
+    // have replaced it while we awaited).
+    attachGeneration &+= 1
+    let gen = attachGeneration
+    let task = Task { @MainActor [weak self] in
+      guard let self else { return }
+      await self.attachViaManager(self.sessionManager)
+    }
+    attachTask = task
+    await task.value
+    if attachGeneration == gen { attachTask = nil }
   }
 
   /// Get a ready DeviceSession from the shared manager (which has already
@@ -384,6 +435,14 @@ final class LensDisplayCoordinator: ObservableObject {
   }
 
   func detachFromDisplay() async {
+    // Drain any attach already past the `!suspendAttach` guard and suspended inside
+    // `acquire`/`setupDisplay`, so its trailing lease-add can't outlive the release
+    // below. Awaiting (not cancelling) is safe: `acquire` completes predictably now
+    // that it's serialized in the manager.
+    if let inflight = attachTask {
+      await inflight.value
+      attachTask = nil
+    }
     stateListenerToken = nil
     displayStateContinuation?.finish()
     displayStateContinuation = nil

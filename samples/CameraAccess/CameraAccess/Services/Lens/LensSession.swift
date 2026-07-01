@@ -66,6 +66,9 @@ final class LensSession: ObservableObject {
   /// and expert (Step 9) renderers will land via additional switch arms.
   /// `handoffToPhone` ships in Step 10.
   func activate(_ flow: LensFlow, vm: AnyObject?) {
+    // A legitimate activation re-enables attaching after any prior terminal
+    // teardown (return-to-phone) suppressed it.
+    coordinator.resumeAttaching()
     currentRenderer?.cancel()
     currentRenderer = nil
     currentFlow = flow
@@ -128,9 +131,28 @@ final class LensSession: ObservableObject {
     currentRenderer?.cancel()
     currentRenderer = nil
     currentFlow = .idle
+    // Clear the glasses ONLY if we're still attached. NEVER re-acquire the
+    // Display (and the shared Bluetooth DeviceSession) just to paint an empty
+    // frame: during an exit that would re-acquire the very session the exit is
+    // releasing, racing the manager's WARP drain (→ `sessionAlreadyExists`).
+    guard coordinator.display != nil else { return }
     Task { [weak self] in
       await self?.send(FlexBox(direction: MWDATDisplay.Direction.column) {})
     }
+  }
+
+  /// Terminal teardown for "return to phone". Unlike `deactivate()` — which only
+  /// clears the renderer and repaints, keeping the app-scoped Display attached —
+  /// this HARD-detaches: it suppresses further lazy re-attach and releases the
+  /// `"lens"` DeviceSession lease deterministically and awaited, so the Bluetooth
+  /// session is actually let go and can't be revived by a trailing `send(_:)`.
+  /// Called from `GlassesNavigationCoordinator.exitGlassesMode()`.
+  func teardown() async {
+    currentRenderer?.cancel()
+    currentRenderer = nil
+    currentFlow = .idle
+    coordinator.suspendAttaching()
+    await coordinator.detachFromDisplay()
   }
 
   // MARK: - Reference clip handoff (Step 7)

@@ -24,6 +24,15 @@ class AudioSessionManager: ObservableObject {
   @Published var isCapturing = false
   @Published var isBluetoothConnected = false
   @Published var isAISpeaking = false
+
+  /// True when the mic pipeline is NOT delivering buffers while it should be —
+  /// set at startup if the first buffer never arrives (`awaitFirstMicBuffer`
+  /// timeout) and mid-session by the silent-mic watchdog; reset the moment a
+  /// buffer arrives and on `stopCapture`. This is the observable "HFP broken"
+  /// signal a view/coordinator binds to for the audio-failure warning overlay
+  /// (the detection used to be `print`-only). Glasses (BT-HFP) modes are where
+  /// this matters; phone modes rarely stall but the same watchdog applies.
+  @Published private(set) var micStalled = false
   /// Peak sample amplitude from the most recent mic buffer, in `0...1`.
   /// Fed to the Expert HUD's audio meter. Cheap to compute (one pass over
   /// the buffer in `recordCapturedBuffer`); the HUD smooths it further.
@@ -88,6 +97,11 @@ class AudioSessionManager: ObservableObject {
 
   /// Tracks scheduled buffers so we know when AI stops speaking.
   private var scheduledBufferCount = 0
+
+  /// One-shot: log the playback engine/route health on the first Gemini audio
+  /// chunk of a playback run so "can't hear the AI" is diagnosable. Reset in
+  /// `stopCapture()`.
+  private var playbackHealthLogged = false
 
   // MARK: - Lobby music (overlaps Gemini, ducked)
 
@@ -216,6 +230,18 @@ class AudioSessionManager: ObservableObject {
       selector: #selector(handleRouteChange),
       name: AVAudioSession.routeChangeNotification,
       object: nil
+    )
+
+    // The engine self-stops on a configuration change — most commonly when the
+    // Display glasses' BT-HFP SCO link finishes negotiating to its 16 kHz mono
+    // format right AFTER `engine.start()`. Without this observer the engine
+    // stays stopped (`isRunning=false`) forever, the tap never fires, and no
+    // mic buffers arrive — the "HFP not locked in" failure. Restart on it.
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleEngineConfigurationChange),
+      name: .AVAudioEngineConfigurationChange,
+      object: engine
     )
   }
 
@@ -414,6 +440,7 @@ class AudioSessionManager: ObservableObject {
         try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
         if let pending = self.firstBufferContinuation {
           self.firstBufferContinuation = nil
+          self.micStalled = true   // startup: SCO never carried data — surface it
           print("[AudioSession] ⚠ First mic buffer not seen within \(timeout)s — HFP not locked in")
           pending.resume(returning: false)
         }
@@ -821,11 +848,12 @@ class AudioSessionManager: ObservableObject {
         #else
         let demoRoute = false
         #endif
-        if (capturedMode == .coaching || capturedMode == .coachingPhoneOnly), !demoRoute {
-          try inputNode.setVoiceProcessingEnabled(true)
-        } else {
-          try inputNode.setVoiceProcessingEnabled(false)
-        }
+        // Honor the same BT-HFP VPIO-disable gate as the main path — re-enabling
+        // VPIO on the Display glasses route re-triggers the engine self-stop the
+        // retry is trying to recover from.
+        let isBTHFPInput = AVAudioSession.sharedInstance().currentRoute.inputs.contains { $0.portType == .bluetoothHFP }
+        let shouldUseVPIO = (capturedMode == .coaching || capturedMode == .coachingPhoneOnly) && !demoRoute && !isBTHFPInput
+        try inputNode.setVoiceProcessingEnabled(shouldUseVPIO)
       } catch {
         print("[AudioSession] retry: setVoiceProcessingEnabled failed: \(error)")
       }
@@ -871,10 +899,16 @@ class AudioSessionManager: ObservableObject {
     do {
       switch mode {
       case .coaching:
+        // Match the main-actor `configureAudioSession()` `.coaching` branch:
+        // `.default` + `[.allowBluetoothHFP]` only. `.voiceChat` + A2DP +
+        // `.defaultToSpeaker` silently self-stops `engine.start()` on the
+        // Display glasses' BT-HFP route (engine returns success but `isRunning`
+        // flips false, no buffers) — the exact failure this off-main configure
+        // path must not re-introduce on a retry.
         try session.setCategory(
           .playAndRecord,
-          mode: .voiceChat,
-          options: [.allowBluetoothHFP, .allowBluetoothA2DP, .defaultToSpeaker]
+          mode: .default,
+          options: [.allowBluetoothHFP]
         )
       case .coachingPhoneOnly:
         // Mirror the main-actor demo-route branch (see `configureAudioSession()`).
@@ -960,40 +994,7 @@ class AudioSessionManager: ObservableObject {
     // and the BT HFP mic is in the temple front — physical separation
     // is good enough that audible feedback is rare. Server-side VAD
     // catches whatever residual echo bleeds through.
-    if mode == .coaching || mode == .coachingPhoneOnly {
-      let session = AVAudioSession.sharedInstance()
-      let isBTHFPInput = session.currentRoute.inputs.contains { $0.portType == .bluetoothHFP }
-      #if DEBUG
-      let demoRoute = (mode == .coachingPhoneOnly) && Self.routeAudioToMacForDemo
-      #else
-      let demoRoute = false
-      #endif
-      // VPIO/AEC also disabled for the Mac-route demo: the voice-processing IO unit
-      // pins output to call-audio routing, which won't take the QuickTime-USB route.
-      // Push-to-talk closes the mic while the AI speaks, so we don't need AEC.
-      let shouldUseVPIO = !isBTHFPInput && !demoRoute
-      do {
-        try inputNode.setVoiceProcessingEnabled(shouldUseVPIO)
-        if !shouldUseVPIO {
-          print("[AudioSession] VPIO disabled (BT-HFP input or Mac-route demo) — avoids Display-glasses HFP incompatibility / keeps demo output on the Mac route")
-        }
-      } catch {
-        print("[AudioSession] ⚠ Failed to set voice processing enabled=\(shouldUseVPIO): \(error)")
-      }
-    } else {
-      // Defensive: a prior coaching session in this app launch may have
-      // left the input audio unit in VPIO mode (5-ch multichannel
-      // format). Recording-mode `engine.start()` then fails input
-      // chain validation with -10868 kAudioUnitErr_FormatNotSupported.
-      // Calling false on a non-VPIO node is a no-op; on a leaked-VPIO
-      // node it forces it back to standard RemoteIO so the engine
-      // starts cleanly. Mirror in `startCaptureAsync`.
-      do {
-        try inputNode.setVoiceProcessingEnabled(false)
-      } catch {
-        print("[AudioSession] ⚠ Failed to disable voice processing: \(error)")
-      }
-    }
+    applyVoiceProcessingForCurrentRoute()
 
     installMicTap()
 
@@ -1042,6 +1043,99 @@ class AudioSessionManager: ObservableObject {
     }
   }
 
+  /// Enable hardware voice processing (AEC/NS/AGC) only when it's safe for the
+  /// current input route. VPIO is incompatible with the Display glasses' BT-HFP
+  /// route — `engine.start()` returns success but the input unit fails to
+  /// initialize and the engine self-stops with no buffers — so we disable it
+  /// whenever the active input is `.bluetoothHFP` (and for the Mac-route demo,
+  /// whose voice-processing IO unit won't take the QuickTime-USB route). For
+  /// non-coaching modes VPIO is forced off defensively so a leaked 5-ch VPIO
+  /// format from a prior coaching session can't fail `-10868` input-chain
+  /// validation. Shared by `startCapture()`, the configuration-change restart,
+  /// and (inline-mirrored) `startEngineWithRetry()` so no path re-enables VPIO
+  /// on the glasses route and re-triggers the self-stop.
+  private func applyVoiceProcessingForCurrentRoute() {
+    if mode == .coaching || mode == .coachingPhoneOnly {
+      let session = AVAudioSession.sharedInstance()
+      let isBTHFPInput = session.currentRoute.inputs.contains { $0.portType == .bluetoothHFP }
+      #if DEBUG
+      let demoRoute = (mode == .coachingPhoneOnly) && Self.routeAudioToMacForDemo
+      #else
+      let demoRoute = false
+      #endif
+      let shouldUseVPIO = !isBTHFPInput && !demoRoute
+      do {
+        try inputNode.setVoiceProcessingEnabled(shouldUseVPIO)
+        if !shouldUseVPIO {
+          print("[AudioSession] VPIO disabled (BT-HFP input or Mac-route demo) — avoids Display-glasses HFP incompatibility / keeps demo output on the Mac route")
+        }
+      } catch {
+        print("[AudioSession] ⚠ Failed to set voice processing enabled=\(shouldUseVPIO): \(error)")
+      }
+    } else {
+      do {
+        try inputNode.setVoiceProcessingEnabled(false)
+      } catch {
+        print("[AudioSession] ⚠ Failed to disable voice processing: \(error)")
+      }
+    }
+  }
+
+  @objc private func handleEngineConfigurationChange(notification: Notification) {
+    Task { @MainActor in
+      // Log unconditionally so a recurrence is diagnosable from the console
+      // alone: this proves the notification fired and shows whether the engine
+      // actually self-stopped (`isRunning=false` → we restart) or is still
+      // healthy (`isRunning=true` → no-op). The input format tells us which
+      // route the change settled on (16 kHz mono = the glasses HFP SCO link).
+      let fmt = self.inputNode.inputFormat(forBus: 0)
+      print("[AudioSession] configurationChange observed (isRunning=\(self.engine.isRunning), "
+        + "isCapturing=\(self.isCapturing), input rate=\(fmt.sampleRate), ch=\(fmt.channelCount))")
+      self.restartEngineAfterStopIfNeeded(reason: "configurationChange")
+    }
+  }
+
+  /// Restart the engine after it self-stopped while we're still meant to be
+  /// capturing (the post-`engine.start()` HFP configuration change). No-op if we
+  /// aren't capturing or the engine is already running. Shared by the
+  /// config-change observer and the route-change handler — route-change and
+  /// engine-config-change are distinct notifications and either may be the one
+  /// that fires for a given stop.
+  private func restartEngineAfterStopIfNeeded(reason: String) {
+    guard isCapturing, !engine.isRunning else { return }
+
+    // Never re-enable VPIO on the BT-HFP route — that is what self-stops the
+    // engine in the first place.
+    applyVoiceProcessingForCurrentRoute()
+
+    // Rebuild the tap + converter against the now-settled input format.
+    installMicTap()
+    audioConverter = nil
+    converterInputFormat = nil
+    initializeConverterIfNeeded()
+
+    // Re-arm the first-buffer / stall detection so `recordCapturedBuffer`
+    // resolves `firstBufferContinuation` and clears `micStalled` when real
+    // buffers land on the restarted engine.
+    silentMicWarned = false
+    lastBufferReceivedAt = nil
+
+    engine.prepare()
+    do {
+      try engine.start()
+      if mode == .coaching || mode == .coachingPhoneOnly {
+        playerNode.play()
+      }
+      let fmt = inputNode.inputFormat(forBus: 0)
+      print("[AudioSession] engine restarted after \(reason) (input rate=\(fmt.sampleRate), ch=\(fmt.channelCount)) — awaiting buffers")
+    } catch {
+      // A failed restart is the worst case (mic stays dead); dump the full
+      // route/permission/VPIO/format snapshot so it's diagnosable in one paste.
+      print("[AudioSession] ⚠ engine restart after \(reason) failed: \(error)")
+      print(dumpAudioDiagnostics())
+    }
+  }
+
   func stopCapture() {
     // Tear down even if capture never started. `configureSessionOnly()`
     // activates the shared `AVAudioSession` (`setActive(true)`) as a SEPARATE
@@ -1081,6 +1175,8 @@ class AudioSessionManager: ObservableObject {
     engine.stop()
     isCapturing = false
     isAISpeaking = false
+    micStalled = false   // not capturing → no stall warning
+    playbackHealthLogged = false   // next playback run logs its health afresh
     scheduledBufferCount = 0
     onAudioBuffer = nil  // drop any capture handler so trailing taps can't fire
     onAudioBufferSecondary = nil
@@ -1156,6 +1252,7 @@ class AudioSessionManager: ObservableObject {
       self.lastBufferReceivedAt = Date()
       self.captureBuffersSinceLastFlush += 1
       self.silentMicWarned = false  // buffers are flowing; re-arm watchdog
+      self.micStalled = false       // buffers flowing → clear the HFP warning
       if wasFirstBuffer, let pending = self.firstBufferContinuation {
         // SCO is now carrying data — release any `awaitFirstMicBuffer` waiter.
         self.firstBufferContinuation = nil
@@ -1239,6 +1336,7 @@ class AudioSessionManager: ObservableObject {
     if let last = lastBufferReceivedAt,
        Date().timeIntervalSince(last) > 3.0 {
       silentMicWarned = true
+      micStalled = true   // mid-session: buffers stopped → surface the warning
       print(
         "[AudioSession] ⚠ No mic buffers for 3s — check BT HFP route or "
         + "glasses mic permission"
@@ -1248,6 +1346,7 @@ class AudioSessionManager: ObservableObject {
               captureBuffersSinceLastFlush == 0 {
       // Engine started but no first buffer ever arrived.
       silentMicWarned = true
+      micStalled = true   // startup: engine up but no buffers → surface the warning
       print(
         "[AudioSession] ⚠ No mic buffers since capture started — "
         + "check mic permission / hardware route"
@@ -1317,6 +1416,26 @@ class AudioSessionManager: ObservableObject {
       // smooths via its own rolling buffer.
       let alpha: Float = rawPeak > self.aiOutputPeak ? 0.6 : 0.2
       self.aiOutputPeak += alpha * (rawPeak - self.aiOutputPeak)
+    }
+
+    // Playback health + self-heal. The borrowed persistent-audio engine may
+    // have self-stopped (post-start config change) or the player may not be
+    // transporting — either produces "AI audio arrives but nothing is heard".
+    // Log the state once and recover so the voice actually reaches the speaker.
+    if !playbackHealthLogged {
+      playbackHealthLogged = true
+      let outs = AVAudioSession.sharedInstance().currentRoute.outputs
+        .map { "\($0.portName)(\($0.portType.rawValue))" }
+        .joined(separator: ",")
+      print("[AudioSession] playback first chunk (\(data.count) bytes): "
+        + "engineRunning=\(engine.isRunning), playerPlaying=\(playerNode.isPlaying), out=[\(outs)]")
+    }
+    if !engine.isRunning {
+      // Engine died — schedule a restart on the main actor; this chunk is lost
+      // but subsequent ones play once the engine is back.
+      Task { @MainActor [weak self] in self?.restartEngineAfterStopIfNeeded(reason: "playback") }
+    } else if !playerNode.isPlaying {
+      playerNode.play()
     }
 
     playerNode.scheduleBuffer(buffer) { [weak self] in
@@ -1598,7 +1717,12 @@ class AudioSessionManager: ObservableObject {
   /// rate or channel count and still fall through to the rebuild path.
   private func rebindMicTapIfCapturing(reason: String) {
     guard isCapturing else { return }
-    guard engine.isRunning else { return }
+    // If the engine self-stopped (config change during HFP warmup), restart it
+    // rather than bail — otherwise the mic stays dead for the whole session.
+    guard engine.isRunning else {
+      restartEngineAfterStopIfNeeded(reason: "routeChange:\(reason)")
+      return
+    }
 
     let liveFmt = inputNode.inputFormat(forBus: 0)
 

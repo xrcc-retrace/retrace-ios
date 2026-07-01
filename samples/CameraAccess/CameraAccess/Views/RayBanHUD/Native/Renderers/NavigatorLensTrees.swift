@@ -142,10 +142,28 @@ enum NavigatorLensTrees {
     .padding(12)
   }
 
-  /// Compact icon-only launcher for the hidden game. Last in tree order so
-  /// Neural-Band focus reaches the three modes first.
+  /// Icon-only launcher for the hidden game. Last in tree order so Neural-Band
+  /// focus reaches the three modes first. Deliberately a bigger card than
+  /// `LensComponents.smallIconButton` (padding 24 vs 8, matching the mode rows'
+  /// thickness) so it stands out at the bottom of Home as an easy-to-hit target.
+  /// The glyph itself stays the default size — a lone `MWDATDisplay.Icon` has no
+  /// size parameter and no sibling `.heading` Text to scale against (see
+  /// `LensComponents.phaseHeader`), so we enlarge the surface, not the icon.
+  /// Kept `.alignSelf(.center)` (not full-width) so it stays visually distinct
+  /// from the three mode rows rather than reading as a fourth mode.
   private static func gameLauncher(onTap: @escaping @Sendable () -> Void) -> FlexBox {
-    LensComponents.smallIconButton(icon: .starCircleTriangleAi, onTap: onTap)
+    FlexBox(
+      direction: MWDATDisplay.Direction.row,
+      spacing: 0,
+      alignment: .center,
+      crossAlignment: .center
+    ) {
+      Icon(name: .starCircleTriangleAi, style: .outline)
+    }
+    .padding(24)
+    .background(.card)
+    .alignSelf(.center)
+    .onTap(onTap)
   }
 
   /// A full-width, screen-filling tappable mode row: centered icon + heading in
@@ -723,9 +741,15 @@ enum NavigatorLensTrees {
       LensComponents.phaseChip("EXPERT MODE").alignSelf(.center)
       LensComponents.cardPanel(spacing: 8, alignment: .center, crossAlignment: .center, padding: 14) {
         Text("Processing your procedure…", style: .heading, color: .primary)
-        Text("This takes a minute.", style: .body, color: .secondary)
+        Text("This takes a minute. Leaving won't cancel it.", style: .body, color: .secondary)
       }
-      LensComponents.smallIconButton(icon: .arrowLeft, onTap: cb.onBack)
+      // Not a bare "back" arrow: on this screen `onBack` only dismisses the
+      // lens — the upload + server processing keep running (see
+      // GlassesNavigationCoordinator.confirmUploadPendingRecording). Label it
+      // explicitly so the user doesn't read the arrow as "cancel". Mirrors the
+      // phone's "Keep working in the background" affordance in
+      // ExpertRecordingReviewView.
+      LensComponents.actionPill(icon: .arrowLeft, label: "Keep in background", onTap: cb.onBack)
     }
     .padding(12)
   }

@@ -110,7 +110,8 @@ struct CameraAccessApp: App {
       wrappedValue: GlassesNavigationCoordinator(
         lensSession: lens,
         api: ProcedureAPIService(),
-        wearables: wearables
+        wearables: wearables,
+        sessionManager: manager
       )
     )
   }

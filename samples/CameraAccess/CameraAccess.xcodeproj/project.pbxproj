@@ -195,6 +195,7 @@
 		CAB9A8E7F6D5C4B3D6E5F4A5 /* HandLandmarkDebugOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA98F7E6D5C4B3A2D6E5F4A4 /* HandLandmarkDebugOverlay.swift */; };
 		CCFB4F9A809161BA16F035E3 /* ProcedureDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E0A4467810688AEE1B5FE17 /* ProcedureDetailView.swift */; };
 		CEAB4A41AA7F1A2F16CBF539 /* CoachingLensRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 65A04FFD9D1423BDA575CAF0 /* CoachingLensRenderer.swift */; };
+		CF5541AD892A1C9E7B349359 /* MicrophonePermissionCTA.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0AB04F479F36F39D6C6697D7 /* MicrophonePermissionCTA.swift */; };
 		CFCB4F90A4F4FD917BB0CE75 /* ExpertManualUploadSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 694941128E04DDBAAE271490 /* ExpertManualUploadSheet.swift */; };
 		D1A7BEEF0E0F1A2B3C4D5E6F /* DiamondLogoDither.metal in Sources */ = {isa = PBXBuildFile; fileRef = D1A7BEEF0E0F1A2B3C4D5E70 /* DiamondLogoDither.metal */; };
 		D262421D860596564BBFB112 /* DiagnosticPhaseLensBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9EE3442594A06068D510274A /* DiagnosticPhaseLensBar.swift */; };
@@ -273,6 +274,7 @@
 		0A2A49089EA85DD526AB189F /* CaptureTransportPickerSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = CaptureTransportPickerSheet.swift; path = CameraAccess/Views/Components/CaptureTransportPickerSheet.swift; sourceTree = SOURCE_ROOT; };
 		0A444E4CB59DAEA56FF00E5D /* TroubleshootStageHeaderCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TroubleshootStageHeaderCard.swift; path = CameraAccess/Views/Troubleshoot/Components/TroubleshootStageHeaderCard.swift; sourceTree = SOURCE_ROOT; };
 		0A6C4A9CAA8A6B6DB9FF8505 /* DiagnosticModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = DiagnosticModels.swift; path = CameraAccess/Models/DiagnosticModels.swift; sourceTree = SOURCE_ROOT; };
+		0AB04F479F36F39D6C6697D7 /* MicrophonePermissionCTA.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MicrophonePermissionCTA.swift; path = CameraAccess/Views/Components/MicrophonePermissionCTA.swift; sourceTree = SOURCE_ROOT; };
 		0D1D4260B391140B6EA01007 /* DATCameraPermissionCTA.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = DATCameraPermissionCTA.swift; path = CameraAccess/Views/Components/DATCameraPermissionCTA.swift; sourceTree = SOURCE_ROOT; };
 		0D2D4698A22364A9E5283B14 /* OnboardingGlassesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = OnboardingGlassesView.swift; path = CameraAccess/Views/Onboarding/Screens/OnboardingGlassesView.swift; sourceTree = SOURCE_ROOT; };
 		10C0450A9F6C7DC3F88B0750 /* AudioRecoverySheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AudioRecoverySheet.swift; path = CameraAccess/Views/Components/AudioRecoverySheet.swift; sourceTree = SOURCE_ROOT; };
@@ -719,6 +721,7 @@
 				56C94D0BA0B1062FE20D5072 /* tone_8.wav */,
 				412548E09E60BCEDA88E2C73 /* wrong.wav */,
 				A9DA4DB699AEDD7707C4D766 /* fanfare.wav */,
+				0AB04F479F36F39D6C6697D7 /* MicrophonePermissionCTA.swift */,
 			);
 			sourceTree = "<group>";
 		};
@@ -1256,6 +1259,7 @@
 				00D04E3E8A93D34ED1F586F5 /* RetraceGameEngine.swift in Sources */,
 				137744BAB60D8E31A7CCEE5A /* GlassesRuntime.swift in Sources */,
 				68604C31959CF54A8B6748A5 /* GameSoundPlayer.swift in Sources */,
+				CF5541AD892A1C9E7B349359 /* MicrophonePermissionCTA.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

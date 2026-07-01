@@ -34,6 +34,10 @@ struct GlassesSessionStandbyView: View {
 
   var body: some View {
     standby
+      // Non-blocking HFP warning: the glasses mic pipeline is broken. Auto-clears
+      // when `audioPipelineStatus` returns to `.ok` (buffers resume).
+      .overlay(alignment: .top) { audioWarningBanner }
+      .animation(.easeInOut(duration: 0.25), value: coordinator.audioPipelineStatus)
       // Invisible runtime hosts. Present only while their runtime is active;
       // render nothing — they keep the heavy VM alive and drive the lens.
       .background {
@@ -66,6 +70,56 @@ struct GlassesSessionStandbyView: View {
           )
         }
       }
+  }
+
+  // MARK: - HFP audio-failure warning (phone-only, auto-recovering)
+
+  @ViewBuilder
+  private var audioWarningBanner: some View {
+    if coordinator.audioPipelineStatus != .ok {
+      VStack(alignment: .leading, spacing: Spacing.sm) {
+        HStack(spacing: Spacing.md) {
+          Image(systemName: "waveform.slash")
+            .foregroundColor(.textPrimary)
+          Text("Audio pipeline disconnected")
+            .font(.retraceFace(.semibold, size: 16))
+            .foregroundColor(.textPrimary)
+        }
+        Text(audioWarningDetail)
+          .font(.inter(.regular, size: 14))
+          .foregroundColor(.textSecondary.opacity(0.85))
+          .fixedSize(horizontal: false, vertical: true)
+        Button {
+          coordinator.exitGlassesMode()
+        } label: {
+          Text("Take back on phone")
+            .font(.retraceFace(.semibold, size: 15))
+            .foregroundColor(.textPrimary)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, Spacing.sm)
+            .background(
+              RoundedRectangle(cornerRadius: Radius.md, style: .continuous)
+                .stroke(Color.textPrimary.opacity(0.3), lineWidth: 1)
+            )
+        }
+      }
+      .padding(Spacing.lg)
+      .glassPanel(cornerRadius: Radius.lg)
+      .padding(.horizontal, Spacing.screenPadding)
+      .padding(.top, Spacing.section)
+      .transition(.move(edge: .top).combined(with: .opacity))
+    }
+  }
+
+  private var audioWarningDetail: String {
+    switch coordinator.audioPipelineStatus {
+    case .micPermissionDenied:
+      return "Microphone access is off, so voice coaching can't hear you. Enable it in Settings › Microphone, then relaunch."
+    case .hfpNotFlowing:
+      return "The glasses microphone isn't streaming — voice coaching can't hear you. This clears automatically if audio recovers."
+    case .ok:
+      return ""
+    }
   }
 
   // MARK: - The one constant phone view
