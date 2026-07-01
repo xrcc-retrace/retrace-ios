@@ -46,13 +46,11 @@ struct DebugSettingsSection: View {
   /// procedure review screen exposes a reference-photo picker and the
   /// Coaching reference panel can show that image alongside the step clip.
   @AppStorage("referenceImageEnabled") private var referenceImageEnabled: Bool = false
-  #if DEBUG
   /// Mirrors `AudioSessionManager.routeAudioToMacForDemo` (same UserDefaults
   /// key). When on, iPhone-only coaching stops forcing the built-in speaker so
   /// the Gemini Live voice can route to a Mac over QuickTime-USB / HDMI for
-  /// demos. DEBUG-only — the audio path that reads it is also `#if DEBUG`.
+  /// demos.
   @AppStorage("debug.routeAudioToMacForDemo") private var routeAudioToMacForDemo: Bool = false
-  #endif
 
   @EnvironmentObject private var lensSession: LensSession
   @State private var smokeTestResult: String?
@@ -129,7 +127,6 @@ struct DebugSettingsSection: View {
       .background(Color.surfaceRaised)
       .cornerRadius(Radius.md)
 
-      #if DEBUG
       Toggle(isOn: $routeAudioToMacForDemo) {
         VStack(alignment: .leading, spacing: 2) {
           Text("Route AI audio to Mac (demo)")
@@ -145,7 +142,6 @@ struct DebugSettingsSection: View {
       .padding(14)
       .background(Color.surfaceRaised)
       .cornerRadius(Radius.md)
-      #endif
 
       CustomButton(
         title: lensSession.coordinator.isSending ? "Sending…" : "Send test tree to glasses",

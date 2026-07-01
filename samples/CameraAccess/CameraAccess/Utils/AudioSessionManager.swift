@@ -98,11 +98,6 @@ class AudioSessionManager: ObservableObject {
   /// Tracks scheduled buffers so we know when AI stops speaking.
   private var scheduledBufferCount = 0
 
-  /// One-shot: log the playback engine/route health on the first Gemini audio
-  /// chunk of a playback run so "can't hear the AI" is diagnosable. Reset in
-  /// `stopCapture()`.
-  private var playbackHealthLogged = false
-
   // MARK: - Lobby music (overlaps Gemini, ducked)
 
   /// Second player node mixed into the same engine as `playerNode`, used for
@@ -251,8 +246,7 @@ class AudioSessionManager: ObservableObject {
 
   // MARK: - Audio Session
 
-  #if DEBUG
-  /// Debug-only Mac-route demo. When true, `.coachingPhoneOnly` stops forcing the
+  /// Mac-route demo. When true, `.coachingPhoneOnly` stops forcing the
   /// iPhone speaker (uses `.default` instead of `.voiceChat`, drops `.defaultToSpeaker`,
   /// skips `overrideOutputAudioPort(.speaker)`) and disables VPIO/AEC, so Gemini
   /// Live's output can leave the phone over the QuickTime-over-USB / HDMI virtual
@@ -263,15 +257,10 @@ class AudioSessionManager: ObservableObject {
   nonisolated static var routeAudioToMacForDemo: Bool {
     UserDefaults.standard.bool(forKey: "debug.routeAudioToMacForDemo")
   }
-  #endif
 
   func configureAudioSession() {
     let session = AVAudioSession.sharedInstance()
-    #if DEBUG
     let demoRoute = (mode == .coachingPhoneOnly) && Self.routeAudioToMacForDemo
-    #else
-    let demoRoute = false
-    #endif
     do {
       switch mode {
       case .coaching:
@@ -680,11 +669,7 @@ class AudioSessionManager: ObservableObject {
       if capturedMode == .coaching || capturedMode == .coachingPhoneOnly {
         let isBTHFPInput = AVAudioSession.sharedInstance().currentRoute.inputs
           .contains { $0.portType == .bluetoothHFP }
-        #if DEBUG
         let demoRoute = (capturedMode == .coachingPhoneOnly) && Self.routeAudioToMacForDemo
-        #else
-        let demoRoute = false
-        #endif
         try node.setVoiceProcessingEnabled(!isBTHFPInput && !demoRoute)
       } else {
         try node.setVoiceProcessingEnabled(false)
@@ -733,11 +718,7 @@ class AudioSessionManager: ObservableObject {
             // returns success but `isRunning` flips false immediately.
             let isBTHFPInput = AVAudioSession.sharedInstance().currentRoute.inputs
               .contains { $0.portType == .bluetoothHFP }
-            #if DEBUG
             let demoRoute = (capturedMode == .coachingPhoneOnly) && Self.routeAudioToMacForDemo
-            #else
-            let demoRoute = false
-            #endif
             try inputNode.setVoiceProcessingEnabled(!isBTHFPInput && !demoRoute)
           } else {
             try inputNode.setVoiceProcessingEnabled(false)
@@ -843,11 +824,7 @@ class AudioSessionManager: ObservableObject {
     await Task.detached(priority: .userInitiated) { [inputNode = self.inputNode] in
       Self.configureSessionOffMain(mode: capturedMode, preferredGlassesNames: capturedNames)
       do {
-        #if DEBUG
         let demoRoute = (capturedMode == .coachingPhoneOnly) && Self.routeAudioToMacForDemo
-        #else
-        let demoRoute = false
-        #endif
         // Honor the same BT-HFP VPIO-disable gate as the main path — re-enabling
         // VPIO on the Display glasses route re-triggers the engine self-stop the
         // retry is trying to recover from.
@@ -891,11 +868,7 @@ class AudioSessionManager: ObservableObject {
     preferredGlassesNames: [String] = []
   ) {
     let session = AVAudioSession.sharedInstance()
-    #if DEBUG
     let demoRoute = (mode == .coachingPhoneOnly) && routeAudioToMacForDemo
-    #else
-    let demoRoute = false
-    #endif
     do {
       switch mode {
       case .coaching:
@@ -1058,11 +1031,7 @@ class AudioSessionManager: ObservableObject {
     if mode == .coaching || mode == .coachingPhoneOnly {
       let session = AVAudioSession.sharedInstance()
       let isBTHFPInput = session.currentRoute.inputs.contains { $0.portType == .bluetoothHFP }
-      #if DEBUG
       let demoRoute = (mode == .coachingPhoneOnly) && Self.routeAudioToMacForDemo
-      #else
-      let demoRoute = false
-      #endif
       let shouldUseVPIO = !isBTHFPInput && !demoRoute
       do {
         try inputNode.setVoiceProcessingEnabled(shouldUseVPIO)
@@ -1176,7 +1145,6 @@ class AudioSessionManager: ObservableObject {
     isCapturing = false
     isAISpeaking = false
     micStalled = false   // not capturing → no stall warning
-    playbackHealthLogged = false   // next playback run logs its health afresh
     scheduledBufferCount = 0
     onAudioBuffer = nil  // drop any capture handler so trailing taps can't fire
     onAudioBufferSecondary = nil
@@ -1402,6 +1370,11 @@ class AudioSessionManager: ObservableObject {
     // used on the input path.
     let rawPeak = Self.peakAmplitude(of: buffer)
 
+    // Start of an AI speaking burst (queue was empty). Used to log playback
+    // health once per turn — NOT once per session: this manager is long-lived
+    // and borrowed across Ask AI / coaching sessions, so a session-scoped
+    // one-shot would only ever log on the very first turn after arm.
+    let burstStart = (scheduledBufferCount == 0)
     scheduledBufferCount += 1
     Task { @MainActor [weak self] in
       guard let self = self else { return }
@@ -1418,18 +1391,21 @@ class AudioSessionManager: ObservableObject {
       self.aiOutputPeak += alpha * (rawPeak - self.aiOutputPeak)
     }
 
-    // Playback health + self-heal. The borrowed persistent-audio engine may
-    // have self-stopped (post-start config change) or the player may not be
-    // transporting — either produces "AI audio arrives but nothing is heard".
-    // Log the state once and recover so the voice actually reaches the speaker.
-    if !playbackHealthLogged {
-      playbackHealthLogged = true
+    // Playback health, logged once per AI turn (burst start). Confirms the
+    // engine/player are live and where output routes. NOTE: a BluetoothHFP
+    // output is EXPECTED whenever the glasses mic is open (mic capture forces
+    // the glasses off A2DP onto HFP for both directions). The HFP downlink is
+    // audible but rides a separate "call" volume that defaults low — if the
+    // coach can't be heard, raise the in-call volume, don't assume a bug.
+    if burstStart {
       let outs = AVAudioSession.sharedInstance().currentRoute.outputs
         .map { "\($0.portName)(\($0.portType.rawValue))" }
         .joined(separator: ",")
-      print("[AudioSession] playback first chunk (\(data.count) bytes): "
+      print("[AudioSession] AI-turn playback start (\(data.count) bytes): "
         + "engineRunning=\(engine.isRunning), playerPlaying=\(playerNode.isPlaying), out=[\(outs)]")
     }
+    // Self-heal: the borrowed persistent-audio engine may have self-stopped
+    // (post-start config change) or the player may not be transporting.
     if !engine.isRunning {
       // Engine died — schedule a restart on the main actor; this chunk is lost
       // but subsequent ones play once the engine is back.

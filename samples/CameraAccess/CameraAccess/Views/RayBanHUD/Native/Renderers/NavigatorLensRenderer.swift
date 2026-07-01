@@ -30,6 +30,9 @@ final class NavigatorLensRenderer: LensRenderer {
   /// element). Mirrors `ExpertLensRenderer`'s dedupe.
   private var lastSentSnapshot: NavigatorLensSnapshot?
 
+  /// Dedupes the per-step reference-image debug line so it prints once per change.
+  private var lastImageDiag: String?
+
   init(viewModel: NavigatorViewModel, lensSession: LensSession) {
     self.viewModel = viewModel
     self.lensSession = lensSession
@@ -171,6 +174,21 @@ final class NavigatorLensRenderer: LensRenderer {
       return url.absoluteString
     }()
 
+    // Debug: one line per (step, resolution) change on the detail screens so a
+    // missing reference image is diagnosable (http server → suppressed; no
+    // clip_url → nil; video → uses the recording pill instead).
+    switch viewModel.screen {
+    case .procedureDetail, .learnerProcedureDetail:
+      let scheme = ServerEndpoint.shared.resolvedBaseURL.hasPrefix("https://") ? "https" : "http"
+      let diag = "step=\(step?.stepNumber ?? -1) sourceType=\(detail?.sourceType ?? "nil") scheme=\(scheme) hasRecording=\(hasRecording) img=\(referenceImageURL ?? "nil")"
+      if diag != lastImageDiag {
+        lastImageDiag = diag
+        print("[Navigator] detail \(diag)")
+      }
+    default:
+      break
+    }
+
     return NavigatorLensSnapshot(
       screen: snapScreen,
       bannerURL: LensImageURL.bannerURL(),
@@ -263,22 +281,31 @@ final class NavigatorLensRenderer: LensRenderer {
   /// the reference-clip playback path (smooth `?profile=lens` variant + watchdog).
   /// On finish / stop it repaints the procedure-detail (steps) view.
   private func watchRecording() {
-    guard let detail = viewModel.detail,
-          let filename = detail.sourceVideo, !filename.isEmpty,
-          (detail.sourceType ?? "video").lowercased() == "video",
-          var uri = LensImageURL.uploadURL(filename: filename) else { return }
+    guard let detail = viewModel.detail else {
+      print("[Navigator] watchRecording skipped — no detail loaded"); return
+    }
+    guard let filename = detail.sourceVideo, !filename.isEmpty else {
+      print("[Navigator] watchRecording skipped — no source_video on \(detail.id)"); return
+    }
+    guard (detail.sourceType ?? "video").lowercased() == "video" else {
+      print("[Navigator] watchRecording skipped — sourceType=\(detail.sourceType ?? "nil"), not a recording"); return
+    }
+    guard var uri = LensImageURL.uploadURL(filename: filename) else {
+      print("[Navigator] watchRecording skipped — could not build upload URL (empty server base?)"); return
+    }
     // Request the bitrate-capped variant so the full recording streams smoothly
     // over the Bluetooth Display link (matches how step clips resolve).
     uri += (uri.contains("?") ? "&" : "?") + "profile=lens"
 
     let duration = detail.totalDuration
+    print("[Navigator] watchRecording → \(uri) (expectedDuration=\(duration)s)")
     Task { [weak self] in
       await self?.lensSession?.presentReferenceClip(
         uri: uri,
         expectedDuration: duration > 0 ? duration : nil,
-        onStarted: {},   // Navigator is not a live Gemini session — nothing to pause.
-        onEnded: { [weak self] in self?.repaintAfterClip() },
-        onError: { [weak self] _ in self?.repaintAfterClip() }
+        onStarted: { print("[Navigator] full-recording playback started") },
+        onEnded: { [weak self] in print("[Navigator] full-recording ended/stopped — returning to steps"); self?.repaintAfterClip() },
+        onError: { [weak self] reason in print("[Navigator] full-recording error: \(reason)"); self?.repaintAfterClip() }
       )
     }
   }
