@@ -66,6 +66,16 @@ final class DeviceSessionManager: ObservableObject {
   /// errorStream themselves) can still react.
   let sessionErrors = PassthroughSubject<DeviceSessionError, Never>()
 
+  /// Broadcast when `invalidate(reason:)` force-drops the shared session out of
+  /// band — i.e. a consumer detected the underlying transport is dead even
+  /// though the SDK never surfaced it (WARP `service_not_found` channel death
+  /// never reaches `errorStream()`; the only symptom is frame starvation). This
+  /// is the signal the SDK failed to provide: every live consumer must tear
+  /// down and re-acquire, because the `DeviceSession` they hold is a corpse.
+  /// Distinct from `sessionErrors` so we don't fake an SDK `DeviceSessionError`.
+  /// Payload is the human-readable reason.
+  let sessionInvalidated = PassthroughSubject<String, Never>()
+
   /// Last observed DAT `Permission.camera` status, refreshed every time
   /// `cameraPermissionStatus()` or `ensureCameraPermissionGranted()` runs.
   /// Published so onboarding / Profile UI can react without polling.
@@ -165,6 +175,12 @@ final class DeviceSessionManager: ObservableObject {
   /// `DCTEvent` use-after-free crash (deref of a freed `datax_list` in
   /// `tryOpenChannel`). Heuristic mitigation for an SDK-internal lifecycle gap.
   private var recentlyToreDown: Bool = false
+
+  /// Identity of a session force-dropped by `invalidate(reason:)`. The
+  /// serialized teardown nils `deviceSession` only after the async stop drains,
+  /// so for the synchronous window in between this lets `acquire()`'s `.started`
+  /// reuse branch refuse to hand back a session already known to be dead.
+  private var invalidatedSessionID: ObjectIdentifier?
 
   /// Per-device `LinkState` cache + listener tokens, keyed by `DeviceIdentifier`.
   /// Refreshed whenever `devicesStream()` emits and whenever a device's
@@ -401,6 +417,17 @@ final class DeviceSessionManager: ObservableObject {
     if let session = deviceSession {
       switch session.state {
       case .started:
+        // Liveness guard: a session force-dropped via `invalidate(reason:)`
+        // can still read `.started` for the brief window before its serialized
+        // teardown nils `deviceSession`. Reusing it would re-attach a fresh
+        // capability to a dead WARP stack (the exact bug we're fixing). Drop it
+        // and fall through to a fresh `createSession`.
+        if let invalidated = invalidatedSessionID, invalidated == ObjectIdentifier(session) {
+          log("acquire(\(consumerLabel)) → existing session was invalidated; dropping and creating fresh")
+          deviceSession = nil
+          stopSessionObservers()
+          break
+        }
         guard requirementsSatisfied(by: session, requirements: requirements) else {
           throw AcquireError.requirementsConflictWithActiveSession(requirements)
         }
@@ -574,6 +601,29 @@ final class DeviceSessionManager: ObservableObject {
     }
     lifecycleTask = task
     await task.value
+  }
+
+  /// Force-drop the shared session **regardless of held leases** and tell every
+  /// consumer to rebuild. Use when a consumer has determined the underlying
+  /// transport is dead but the SDK never surfaced it — a WARP `service_not_found`
+  /// channel death never reaches `errorStream()`, so the session keeps reading
+  /// `.started` and the normal teardown paths (`.stopped` / `.unavailable` /
+  /// last-lease `release`) never fire. The leases>0 guard in `release()` is
+  /// exactly what would otherwise pin the corpse alive (e.g. the `"lens"`
+  /// consumer holding a lease while the `"expert"` camera is dead), so this
+  /// bypasses it: clears all leases, marks the session invalid so a concurrent
+  /// `acquire` won't reuse it, runs the same serialized force-teardown as the
+  /// observer paths (which arms the 300 ms WARP-drain settle), then broadcasts
+  /// on `sessionInvalidated` so live consumers tear down and re-acquire a fresh
+  /// `createSession`.
+  func invalidate(reason: String) {
+    log("invalidate(\(reason)) → dropping \(leases.count) lease(s), forcing teardown")
+    if let session = deviceSession {
+      invalidatedSessionID = ObjectIdentifier(session)
+    }
+    leases.removeAll()
+    teardownActiveSession(reason: "invalidate: \(reason)")
+    sessionInvalidated.send(reason)
   }
 
   /// Serialized teardown of the active session, used by the registration-

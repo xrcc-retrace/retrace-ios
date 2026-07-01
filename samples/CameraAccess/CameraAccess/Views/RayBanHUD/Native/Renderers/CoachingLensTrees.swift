@@ -179,8 +179,7 @@ enum CoachingLensTrees {
           // Visible failure instead of a silent no-op. "Try again" re-attempts
           // full-screen playback (LensSession logs the concrete reason).
           LensComponents.cardPanel(spacing: 8, padding: 14) {
-            LensComponents.iconRow(.exclamationTriangle)
-            Text(errorMsg, style: .heading, color: .primary)
+            LensComponents.iconHeadingRow(.exclamationTriangle, errorMsg, style: .outline)
             togglePill(icon: .twoArrowsClockwise, label: "Try again", onTap: cb.onRetryClip)
           }
         } else {
@@ -202,8 +201,7 @@ enum CoachingLensTrees {
         LensComponents.cardPanel(spacing: 8, padding: 14) {
           Text("INSIGHTS", style: .meta, color: .secondary)
           if s.insights.isEmpty {
-            LensComponents.iconRow(.exclamationTriangle)
-            Text("No insights", style: .heading, color: .primary)
+            LensComponents.iconHeadingRow(.exclamationTriangle, "No insights", style: .outline)
             Text("Just follow the step instructions.", style: .body, color: .secondary)
           } else {
             for item in s.insights {
@@ -324,8 +322,7 @@ enum CoachingLensTrees {
         crossAlignment: .center,
         padding: 24
       ) {
-        LensComponents.iconRow(.checkmark, style: .filled)
-        Text("Step completed", style: .heading, color: .primary)
+        LensComponents.iconHeadingRow(.checkmark, "Step completed", style: .filled)
         Text("Step \(completedStep) of \(s.totalSteps)", style: .meta, color: .secondary)
       }
     }
@@ -350,8 +347,7 @@ enum CoachingLensTrees {
         crossAlignment: .center,
         padding: 20
       ) {
-        LensComponents.iconRow(.checkmark, style: .filled)
-        Text(s.procedureTitle ?? "Procedure complete", style: .heading, color: .primary)
+        LensComponents.iconHeadingRow(.checkmark, s.procedureTitle ?? "Procedure complete", style: .filled)
         if let duration = s.formattedSessionDuration {
           Text("\(s.totalSteps) steps · \(duration)", style: .body, color: .secondary)
         } else {

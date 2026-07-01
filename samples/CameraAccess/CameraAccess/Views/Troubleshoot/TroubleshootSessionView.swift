@@ -189,6 +189,7 @@ struct TroubleshootSessionView: View {
         GlassesSessionChrome(
           deviceName: glassesDeviceName,
           status: glassesSessionStatus,
+          lensUnavailable: viewModel.glassesLensUnavailable,
           showCameraFeed: $showCameraFeed
         )
       }
@@ -218,10 +219,9 @@ struct TroubleshootSessionView: View {
       viewModel.onExitConfirmed = {
         confirmDiagnosticExit()
       }
-      // Activate the troubleshoot lens renderer. Output is gated by
-      // `lensOutputEnabled` inside `LensSession.send`, so this is safe
-      // to call unconditionally — when the toggle is OFF, no sends
-      // reach the glasses.
+      // Activate the troubleshoot lens renderer. `LensSession.send` forwards to
+      // the coordinator, which no-ops safely when no Display-capable device is
+      // reachable — so this is safe to call unconditionally.
       //
       // DEFERRED until `isReadyForNativeLens`: the Display capability shares
       // the glasses' BT radio with the HFP mic. Starting it during the HFP

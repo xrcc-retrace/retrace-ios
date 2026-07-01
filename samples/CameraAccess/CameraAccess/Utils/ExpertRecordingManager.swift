@@ -103,8 +103,16 @@ class ExpertRecordingManager: ObservableObject {
   static let portraitSize: (width: Int, height: Int) = (720, 1280)
   static let landscapeSize: (width: Int, height: Int) = (1280, 720)
 
-  init(audioSessionManager: AudioSessionManager) {
+  /// True when `audioSessionManager` is a BORROWED glasses-native persistent
+  /// session (already armed + running, owned by `GlassesNavigationCoordinator`).
+  /// In that case this manager only installs/removes its writer endpoint on the
+  /// shared tap — it must NOT `startCaptureAsync()` / `stopCapture()` the
+  /// session, which would re-arm/tear-down HFP and re-introduce the radio race.
+  private let borrowedSession: Bool
+
+  init(audioSessionManager: AudioSessionManager, borrowedSession: Bool = false) {
     self.audioSessionManager = audioSessionManager
+    self.borrowedSession = borrowedSession
   }
 
   // MARK: - Recording Control
@@ -380,20 +388,27 @@ class ExpertRecordingManager: ObservableObject {
     // Throws on terminal failure (after one automatic retry) so we can
     // surface "audio failed" instead of silently producing a silent mp4.
     do {
-      try await audioSessionManager.startCaptureAsync()
-      // Optional post-audio settle window. Lets the HAL route-change
-      // notifications (HFP finalization, categoryChange/
-      // routeConfigurationChange) drain before the AVAssetWriter
-      // accepts its first sample. Without this drain on the glasses
-      // path, the route-change-driven XPC HAL reset that
-      // `engine.start()` triggers can invalidate writer's Video
-      // Toolbox session mid-first-batch (the rec-1 "Cannot Encode
-      // Media" failure that produces appendedFrameCount=3 — exactly
-      // the in-flight batch before the reset lands). iPhone passes
-      // 0 (default) and skips this.
-      if postAudioSettleMs > 0 {
-        print("[Recording] settling \(postAudioSettleMs)ms post-audio-start before arming writer")
-        try? await Task.sleep(nanoseconds: postAudioSettleMs * 1_000_000)
+      if borrowedSession {
+        // Borrowed glasses-native persistent session: already capturing and
+        // delivering buffers. Nothing to start — and no `engine.start()` means
+        // no HAL reset, so the post-audio settle below is unnecessary too.
+        print("[Recording] borrowing persistent audio (skip startCaptureAsync)")
+      } else {
+        try await audioSessionManager.startCaptureAsync()
+        // Optional post-audio settle window. Lets the HAL route-change
+        // notifications (HFP finalization, categoryChange/
+        // routeConfigurationChange) drain before the AVAssetWriter
+        // accepts its first sample. Without this drain on the glasses
+        // path, the route-change-driven XPC HAL reset that
+        // `engine.start()` triggers can invalidate writer's Video
+        // Toolbox session mid-first-batch (the rec-1 "Cannot Encode
+        // Media" failure that produces appendedFrameCount=3 — exactly
+        // the in-flight batch before the reset lands). iPhone passes
+        // 0 (default) and skips this.
+        if postAudioSettleMs > 0 {
+          print("[Recording] settling \(postAudioSettleMs)ms post-audio-start before arming writer")
+          try? await Task.sleep(nanoseconds: postAudioSettleMs * 1_000_000)
+        }
       }
     } catch {
       print("[Recording] Audio start failed: \(error.localizedDescription) — aborting")
@@ -448,9 +463,13 @@ class ExpertRecordingManager: ObservableObject {
     statsTimer?.invalidate()
     statsTimer = nil
 
-    // Stop audio capture
+    // Detach the writer endpoint. For a BORROWED persistent session leave the
+    // engine running (the coordinator owns it); only the legacy per-session
+    // manager is stopped here.
     audioSessionManager.onAudioBuffer = nil
-    audioSessionManager.stopCapture()
+    if !borrowedSession {
+      audioSessionManager.stopCapture()
+    }
 
     // Finalize writing
     videoInput?.markAsFinished()

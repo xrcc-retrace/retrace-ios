@@ -223,9 +223,16 @@ final class CoachingLensRenderer: LensRenderer {
     guard case .video(let url) = resolveReferenceMedia() else { return }
     clipErrorMessage = nil
 
+    // The step's clip length sizes the playback watchdog in LensSession
+    // (fires at duration + 5s if no terminal event arrives). nil/≤0 → 60s cap.
+    let expectedDuration: TimeInterval? = viewModel.displayedStep.map {
+      $0.timestampEnd - $0.timestampStart
+    }
+
     Task { [weak self] in
       await self?.lensSession?.presentReferenceClip(
         uri: url.absoluteString,
+        expectedDuration: expectedDuration,
         onStarted: { [weak self] in
           // Clip is committed to the lens — pause the Gemini loop
           // (mic/voice/frames) so the clip's audio isn't fed back, the
@@ -338,7 +345,11 @@ final class CoachingLensRenderer: LensRenderer {
       },
       onCompletionExit: { [weak viewModel] in
         Task { @MainActor in
-          viewModel?.onBackGesture?()
+          // Completion is terminal: run the host-installed exit (endSession +
+          // dismiss), same as the phone's "Return to workflows". Do NOT route
+          // through onBackGesture — that only opens the phone-local exit-confirm
+          // overlay, which leaves the lens unchanged and never ends the session.
+          viewModel?.onExitConfirmed?()
         }
       },
       onExitConfirmCancel: { [weak self] in

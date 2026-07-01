@@ -10,6 +10,8 @@ enum AppMode {
 struct ModeSelectionView: View {
   let wearables: WearablesInterface
   @ObservedObject var wearablesVM: WearablesViewModel
+  @EnvironmentObject private var glassesNav: GlassesNavigationCoordinator
+  @EnvironmentObject private var sessionManager: DeviceSessionManager
   @State private var selectedMode: AppMode?
 
   private let workflows: [LandingWorkflow] = [
@@ -53,6 +55,23 @@ struct ModeSelectionView: View {
     }
     .animation(.easeInOut(duration: 0.35), value: selectedMode)
     .tint(.textPrimary)
+    // Glasses-first navigation. The cover appears the moment "Launch on
+    // Display" is tapped: first the readiness gate (register + connect +
+    // verify a Display-capable device), then — once ready — the lens activates
+    // and the cover switches to the "Session on glasses" standby.
+    .fullScreenCover(isPresented: Binding(
+      get: { glassesNav.phase != .idle },
+      set: { if !$0 { glassesNav.exitGlassesMode() } }
+    )) {
+      switch glassesNav.phase {
+      case .preparing:
+        GlassesReadinessGateView(wearablesVM: wearablesVM)
+      case .active:
+        GlassesSessionStandbyView(coordinator: glassesNav, wearables: wearables)
+      case .idle:
+        EmptyView()
+      }
+    }
   }
 
   @ViewBuilder
@@ -84,12 +103,14 @@ struct ModeSelectionView: View {
           ScrollView(showsIndicators: false) {
             VStack(alignment: .leading, spacing: Spacing.section) {
               heroBlock
-                .padding(.top, Spacing.section + 100)
+                .padding(.top, Spacing.section + 80)
+
+              // Hero, button, and the three mode cards form one compact block
+              // near the top — no flexible gap. The footer follows directly.
+              launchOnDisplayButton
+                .padding(.top, Spacing.lg)
 
               workflowCards
-                .padding(.top, Spacing.jumbo)
-
-              Spacer(minLength: Spacing.section)
 
               versionFooter
             }
@@ -140,6 +161,12 @@ private extension ModeSelectionView {
     }
   }
 
+  var launchOnDisplayButton: some View {
+    LaunchOnDisplayButton(isReady: sessionManager.hasDisplayCapableDevice) {
+      glassesNav.beginLaunch()
+    }
+  }
+
   var workflowCards: some View {
     VStack(alignment: .leading, spacing: Spacing.lg) {
       ForEach(workflows) { workflow in
@@ -183,6 +210,128 @@ private struct LandingWorkflow: Identifiable {
   let mode: AppMode
 
   var id: AppMode { mode }
+}
+
+/// The flagship "Launch on Display" CTA. A luminous brand-gold treatment that
+/// signals this is the headline new feature: a slowly rotating angular gold
+/// gradient, a bright sheen band that sweeps across like the lens catching
+/// light, a breathing accent glow, and a press spring. Continuous motion is
+/// driven by `TimelineView(.animation)` (same cadence as the entry backdrop).
+private struct LaunchOnDisplayButton: View {
+  /// True only when a connected, Display-capable device is observed
+  /// (`DeviceSessionManager.hasDisplayCapableDevice`). Drives both the active
+  /// look AND pressability — the inactive variant is not a `Button` at all, so
+  /// it cannot be tapped.
+  let isReady: Bool
+  let action: () -> Void
+  @State private var start = Date()
+
+  var body: some View {
+    Group {
+      if isReady {
+        // Active: the luminous animated CTA, pressable.
+        TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: false)) { context in
+          let t = context.date.timeIntervalSince(start)
+          Button(action: action) {
+            label(t: t)
+          }
+          .buttonStyle(LaunchPressStyle())
+        }
+        .transition(.opacity)
+      } else {
+        // Inactive: static, dimmed, NON-pressable (no Button), with a hint.
+        inactiveLabel
+          .transition(.opacity)
+      }
+    }
+    .animation(.easeInOut(duration: 0.3), value: isReady)
+    .accessibilityLabel("Launch on Display glasses")
+    .accessibilityHint(isReady ? "" : "Connect your Ray-Ban Display glasses to enable")
+  }
+
+  /// Disabled treatment — muted surface, lock glyph, and a caption telling the
+  /// user what's missing. Deliberately NOT a `Button` so it's unpressable.
+  private var inactiveLabel: some View {
+    VStack(spacing: Spacing.sm) {
+      HStack(spacing: Spacing.md) {
+        Image(systemName: "eyeglasses")
+          .font(.system(size: 19, weight: .semibold))
+        Text("Launch on Display")
+          .font(.retraceFace(.semibold, size: 17))
+        Spacer(minLength: 0)
+        Image(systemName: "lock.fill")
+          .font(.system(size: 13, weight: .semibold))
+          .opacity(0.7)
+      }
+      .foregroundColor(.textSecondary)
+      .padding(.horizontal, Spacing.xl)
+      .padding(.vertical, Spacing.lg)
+      .frame(maxWidth: .infinity)
+      .background(
+        RoundedRectangle(cornerRadius: 16, style: .continuous)
+          .fill(Color.surfaceRaised)
+      )
+      .overlay(
+        RoundedRectangle(cornerRadius: 16, style: .continuous)
+          .stroke(Color.borderSubtle, lineWidth: 1)
+      )
+
+      Text("Connect your Ray-Ban Display glasses to launch")
+        .font(.inter(.regular, size: 13))
+        .foregroundColor(.textTertiary)
+        .frame(maxWidth: .infinity, alignment: .center)
+    }
+  }
+
+  @ViewBuilder
+  private func label(t: TimeInterval) -> some View {
+    // No sliding sheen. The whole button gently breathes: a soft scale pulse +
+    // a glow that swells and fades in sync. Clean, premium, not tacky.
+    let cornerRadius: CGFloat = 16
+    let phase = 0.5 + 0.5 * sin(t * 1.5)               // 0 … 1, ~4.2s period
+    let glowOpacity = 0.28 + 0.32 * phase              // 0.28 … 0.60
+    let glowRadius = CGFloat(13 + 11 * phase)          // 13 … 24
+    let pulse = CGFloat(1.0 + 0.016 * phase)           // 1.000 … 1.016
+
+    HStack(spacing: Spacing.md) {
+      Image(systemName: "eyeglasses")
+        .font(.system(size: 19, weight: .semibold))
+      Text("Launch on Display")
+        .font(.retraceFace(.semibold, size: 17))
+      Spacer(minLength: 0)
+      Image(systemName: "sparkles")
+        .font(.system(size: 14, weight: .semibold))
+        .opacity(0.9)
+    }
+    .foregroundColor(.backgroundPrimary)
+    .padding(.horizontal, Spacing.xl)
+    .padding(.vertical, Spacing.lg)
+    .frame(maxWidth: .infinity)
+    // Clean, static brand-gold fill.
+    .background(
+      LinearGradient(
+        colors: [Color.appBadgeAccent, Color.appPrimary],
+        startPoint: .topLeading,
+        endPoint: .bottomTrailing
+      )
+    )
+    .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+    .overlay(
+      RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        .strokeBorder(Color.white.opacity(0.22), lineWidth: 1)
+    )
+    // The pulse + breathing glow.
+    .scaleEffect(pulse)
+    .shadow(color: Color.appPrimary.opacity(glowOpacity), radius: glowRadius, x: 0, y: 6)
+  }
+}
+
+private struct LaunchPressStyle: SwiftUI.ButtonStyle {
+  func makeBody(configuration: SwiftUI.ButtonStyleConfiguration) -> some View {
+    configuration.label
+      .scaleEffect(configuration.isPressed ? 0.97 : 1.0)
+      .animation(.spring(response: 0.3, dampingFraction: 0.7), value: configuration.isPressed)
+  }
 }
 
 private struct EntryBackdropView: View {

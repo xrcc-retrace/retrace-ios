@@ -161,8 +161,8 @@ private struct IPhoneRecordingEngine: View {
       viewModel.camera.setPreviewInterfaceOrientation(resolved)
       // Step 9: wire the expert lens renderer. Stop confirms here fire
       // the same flow the phone Stop button uses — finalize the .mp4,
-      // bubble up via `onRecordingComplete`. Output is gated by
-      // `lensOutputEnabled` inside `LensSession.send`.
+      // bubble up via `onRecordingComplete`. Lens output is forwarded through
+      // `LensSession.send`, which no-ops safely without a Display device.
       let context = ExpertLensContext(
         recordingManager: viewModel.recordingManager,
         hudViewModel: viewModel.hudViewModel,
@@ -329,7 +329,14 @@ private struct GlassesRecordingEngine: View {
       Task { await viewModel.teardown() }
     }
     .alert("Error", isPresented: $viewModel.showError) {
-      Button("OK") { viewModel.dismissError() }
+      if viewModel.cameraConnectionLost {
+        // The glasses camera transport died (frame starvation). Offer a
+        // rebuild — `reconnect()` re-runs prepare() against a fresh session.
+        Button("Reconnect") { Task { await viewModel.reconnect() } }
+        Button("Cancel", role: .cancel) { viewModel.dismissError() }
+      } else {
+        Button("OK") { viewModel.dismissError() }
+      }
     } message: {
       Text(viewModel.errorMessage)
     }

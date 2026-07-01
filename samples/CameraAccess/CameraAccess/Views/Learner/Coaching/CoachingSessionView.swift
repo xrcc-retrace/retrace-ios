@@ -152,6 +152,7 @@ struct CoachingSessionView: View {
         GlassesSessionChrome(
           deviceName: glassesDeviceName,
           status: glassesSessionStatus,
+          lensUnavailable: viewModel.glassesLensUnavailable,
           showCameraFeed: $showCameraFeed
         )
       }

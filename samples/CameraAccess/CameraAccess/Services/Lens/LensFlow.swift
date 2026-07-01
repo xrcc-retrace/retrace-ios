@@ -17,5 +17,11 @@ enum LensFlow: Equatable {
   case coaching
   case troubleshoot
   case expert
+  /// Glasses-first navigation shell (home → mode hubs → list/detail). Driven
+  /// by `NavigatorViewModel`; the phone shows a "Session on glasses" standby.
+  case navigator
+  /// Ask-AI audio-only voice search (driven by `AskAISessionViewModel`),
+  /// launched from the Learner hub.
+  case askAI
   case handoffToPhone(reason: String)
 }

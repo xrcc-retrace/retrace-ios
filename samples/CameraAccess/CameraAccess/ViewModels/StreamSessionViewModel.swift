@@ -27,7 +27,7 @@ enum StreamingStatus {
 }
 
 @MainActor
-class StreamSessionViewModel: ObservableObject {
+class StreamSessionViewModel: ObservableObject, GlassesRuntime {
   /// Cross-instance teardown gate. When the user hits Stop and exits a
   /// recording, `.onDisappear` fires `Task { await teardown() }`
   /// (unstructured) and SwiftUI immediately tears down the view. The
@@ -97,8 +97,16 @@ class StreamSessionViewModel: ObservableObject {
   @Published var showPhotoPreview: Bool = false
 
   // Recording properties
-  let audioSessionManager = AudioSessionManager(mode: .recording)
-  lazy var recordingManager = ExpertRecordingManager(audioSessionManager: audioSessionManager)
+  let audioSessionManager: AudioSessionManager
+  /// True when `audioSessionManager` is a BORROWED glasses-native persistent
+  /// session owned by `GlassesNavigationCoordinator`. When true, this VM does
+  /// NOT arm (`prewarm`) or release (`deactivate`) the session — it only swaps
+  /// the writer endpoint on/off via `ExpertRecordingManager`.
+  private let borrowedAudio: Bool
+  lazy var recordingManager = ExpertRecordingManager(
+    audioSessionManager: audioSessionManager,
+    borrowedSession: borrowedAudio
+  )
   let uploadService: UploadService
 
   /// State layer behind the Expert HUD — tip rotation, audio meter
@@ -132,6 +140,39 @@ class StreamSessionViewModel: ObservableObject {
   private var framesForwardedDuringRecording: Int = 0
   private var framesDroppedNotRecording: Int = 0
   private var lastFrameStatLogAt: Date = .distantPast
+
+  // MARK: - Frame-starvation watchdog
+  //
+  // The DAT SDK's WARP transport can die mid-stream (`service_not_found`
+  // channel death) WITHOUT ever surfacing on the Swift `errorStream()` /
+  // `statePublisher` — the session keeps reading `.started` while frames
+  // silently stop (`[Recording] fps window: 0 fps`). The ONLY app-observable
+  // symptom is frame starvation, so this watchdog is the detector the SDK
+  // never provided. On a stall it forces the shared session to be invalidated
+  // (so a Reconnect rebuilds a fresh `createSession` instead of reusing the
+  // dead one) and surfaces a Reconnect affordance.
+
+  /// Set true when the watchdog detects the glasses camera transport died.
+  /// Drives the "Lost connection — Reconnect" affordance in the recording UI.
+  @Published var cameraConnectionLost: Bool = false
+
+  /// Stamped on every delivered video frame (on MainActor). The watchdog
+  /// compares `Date()` against this to detect starvation.
+  private var lastFrameAt: Date = .distantPast
+
+  /// When the current stream's `start()` returned — anchors the first-frame
+  /// grace period so a normally-slow first frame isn't a false positive.
+  private var streamStartedAt: Date = .distantPast
+
+  /// Repeating starvation-check task. Started after `streamSession.start()`,
+  /// cancelled in `teardown()` / on starvation.
+  private var frameWatchdogTask: Task<Void, Never>?
+
+  /// Tolerated gap before declaring the stream dead.
+  private static let frameStallThreshold: TimeInterval = 5.0
+  /// Window after `start()` for the first frame to arrive (matches the
+  /// 0.5–10 s first-frame latency the coaching path already tolerates).
+  private static let firstFrameGrace: TimeInterval = 10.0
 
   // MARK: - Live frame dimensions (set off-main, read on MainActor)
   // The DAT SDK auto-degrades resolution when BT/WiFi bandwidth is
@@ -334,10 +375,22 @@ class StreamSessionViewModel: ObservableObject {
   /// on the same physical device, per the SDK's capability-composition model.
   private let sessionManager: DeviceSessionManager
 
-  init(wearables: WearablesInterface, uploadService: UploadService, sessionManager: DeviceSessionManager) {
+  init(
+    wearables: WearablesInterface,
+    uploadService: UploadService,
+    sessionManager: DeviceSessionManager,
+    externalAudioManager: AudioSessionManager? = nil
+  ) {
     self.wearables = wearables
     self.uploadService = uploadService
     self.sessionManager = sessionManager
+    if let external = externalAudioManager {
+      self.audioSessionManager = external
+      self.borrowedAudio = true
+    } else {
+      self.audioSessionManager = AudioSessionManager(mode: .recording)
+      self.borrowedAudio = false
+    }
     // Let the SDK auto-select from available devices
     self.deviceSelector = AutoDeviceSelector(wearables: wearables)
 
@@ -425,14 +478,21 @@ class StreamSessionViewModel: ObservableObject {
     startHandTrackingIfAvailable()
     print("[Glasses] prepare() → handleStartStreaming")
     await handleStartStreaming()
-    print("[Glasses] prepare() → audioSessionManager.prewarm")
-    // Hand the audio layer the paired-glasses names so `.recording`'s prewarm
-    // pins the glasses' BT HFP input over any other connected HFP device
-    // (e.g. AirPods). The DAT stream is up by now, so `wearables.devices` is
-    // populated. Set before prewarm — that's where the off-main configure
-    // (and its setPreferredInput) runs.
-    audioSessionManager.preferredGlassesNames = DeviceSessionManager.pairedDeviceNames(from: wearables)
-    await audioSessionManager.prewarm()
+    // Borrowed glasses-native persistent session: HFP is already armed and
+    // running, owned by the coordinator. Skip prewarm + the glasses-name pin
+    // (already done at arm time) — re-arming is exactly the race we removed.
+    if !borrowedAudio {
+      print("[Glasses] prepare() → audioSessionManager.prewarm")
+      // Hand the audio layer the paired-glasses names so `.recording`'s prewarm
+      // pins the glasses' BT HFP input over any other connected HFP device
+      // (e.g. AirPods). The DAT stream is up by now, so `wearables.devices` is
+      // populated. Set before prewarm — that's where the off-main configure
+      // (and its setPreferredInput) runs.
+      audioSessionManager.preferredGlassesNames = DeviceSessionManager.pairedDeviceNames(from: wearables)
+      await audioSessionManager.prewarm()
+    } else {
+      print("[Glasses] prepare() → borrowing persistent audio (skip prewarm)")
+    }
 
     // Run the silent warmup recording cycle. The first AVAssetWriter
     // started against the glasses path in this process always fails
@@ -705,6 +765,7 @@ class StreamSessionViewModel: ObservableObject {
   /// apps' background audio resume — `stopCapture` only flips the
   /// category for recording modes, it doesn't deactivate.
   func teardown() {
+    stopFrameWatchdog()
     handLandmarkerService?.stop()
     handLandmarkerService = nil
     hudViewModel.resetHandTracking()
@@ -760,7 +821,8 @@ class StreamSessionViewModel: ObservableObject {
     // before it kicks its own start.
     let manager = sessionManager
     let audio = audioSessionManager
-    Self.teardownInFlight = Task { [self, streamToStop, sessionToStop] in
+    let borrowed = borrowedAudio
+    Self.teardownInFlight = Task { [self, streamToStop, sessionToStop, borrowed] in
       _ = self  // strong capture — keeps the VM alive through teardown
       _ = sessionToStop  // retained until release completes
       print("[Glasses] teardown → stopping streamSession")
@@ -777,11 +839,25 @@ class StreamSessionViewModel: ObservableObject {
       // Because the next recording's `prepare()` awaits this Task, its
       // `prewarm()` HFP grab can't race the release — which is what
       // triggered the system call UI on the second record.
-      audio.deactivate()
-      try? await Task.sleep(nanoseconds: 200_000_000)  // 200 ms HFP route settle
-      print("[Glasses] teardown → audio deactivated + HFP settled")
+      //
+      // BORROWED persistent session: the coordinator owns the HFP route and
+      // keeps it up for the next runtime — do NOT deactivate it here.
+      if !borrowed {
+        audio.deactivate()
+        try? await Task.sleep(nanoseconds: 200_000_000)  // 200 ms HFP route settle
+        print("[Glasses] teardown → audio deactivated + HFP settled")
+      }
       print("[Glasses] teardown complete")
     }
+  }
+
+  /// `GlassesRuntime` teardown: kick the existing `teardown()`, then await its
+  /// in-flight task so the camera Stream stop + `expert` lease release complete
+  /// before the coordinator exits. `teardown()` already strong-captures, so the
+  /// only thing missing for a deterministic exit is awaiting it — which this does.
+  func shutdown() async {
+    teardown()
+    await Self.teardownInFlight?.value
   }
 
   /// Spin up the MediaPipe hand landmarker and pipe glasses video frames
@@ -883,17 +959,15 @@ class StreamSessionViewModel: ObservableObject {
         // datAppOnTheGlassesUpdateRequired masking bug both go away.
         let manager = sessionManager
         do {
-          // Intent-aware acquire (mirrors `GeminiLiveSessionBase`): when
-          // the user has lens output enabled AND a Display-capable
-          // device is reachable, bias to `.requiresDisplay` so the
-          // multi-paired Display + Vanguard scenario lands the shared
+          // Intent-aware acquire (mirrors `GeminiLiveSessionBase`): when a
+          // Display-capable device is reachable, bias to `.requiresDisplay` so
+          // the multi-paired Display + Vanguard scenario lands the shared
           // DeviceSession on Display — guaranteeing the lens consumer
           // can attach. Otherwise `.any` preserves Step 13 behavior on
           // non-display DAT glasses.
-          let wantsLens = UserDefaults.standard.bool(forKey: "lensOutputEnabled")
-          let prefersDisplay = wantsLens && manager.hasDisplayCapableDevice
+          let prefersDisplay = manager.hasDisplayCapableDevice
           let req: DeviceSessionManager.DeviceRequirements = prefersDisplay ? .requiresDisplay : .any
-          print("[Glasses] startSession() → manager.acquire('expert', req=\(req)) (wantsLens=\(wantsLens), hasDisplay=\(manager.hasDisplayCapableDevice))")
+          print("[Glasses] startSession() → manager.acquire('expert', req=\(req)) (hasDisplay=\(manager.hasDisplayCapableDevice))")
           let acquired = try await manager.acquire(consumerLabel: "expert", requirements: req)
           print("[Glasses] manager.acquire ✓ (state=\(acquired.state))")
           print("[Glasses] addStream(config: codec=raw, resolution=.medium, fps=30) → …")
@@ -945,6 +1019,12 @@ class StreamSessionViewModel: ObservableObject {
     print("[Glasses] streamSession.start() → …")
     await streamSession?.start()
     print("[Glasses] streamSession.start() ✓")
+
+    // Arm the frame-starvation watchdog. `start()` only confirms the SDK
+    // accepted the start — not that frames flow — and a WARP transport death
+    // never surfaces on errorStream/statePublisher, so frame starvation is the
+    // only signal that the camera died.
+    startFrameWatchdog()
   }
 
   /// Wait for a DAT `DeviceSession` to reach `.stopped` after `stop()`.
@@ -1082,6 +1162,9 @@ class StreamSessionViewModel: ObservableObject {
       // === Path 2 — recording append. MainActor only for the gate. ===
       Task { @MainActor [weak self] in
         guard let self else { return }
+        // Liveness stamp for the frame-starvation watchdog — every delivered
+        // frame, recording or not.
+        self.lastFrameAt = Date()
         if self.recordingManager.isRecording {
           // Re-stamp PTS to host clock before append — see
           // `restampVideoBufferWithHostClock` for why. Falls back to
@@ -1179,6 +1262,84 @@ class StreamSessionViewModel: ObservableObject {
   private func showError(_ message: String) {
     errorMessage = message
     showError = true
+  }
+
+  // MARK: - Frame-starvation watchdog
+
+  /// Arm the watchdog. Called after `streamSession.start()` returns.
+  private func startFrameWatchdog() {
+    frameWatchdogTask?.cancel()
+    streamStartedAt = Date()
+    lastFrameAt = .distantPast  // no frame yet this stream
+    frameWatchdogTask = Task { [weak self] in
+      while !Task.isCancelled {
+        try? await Task.sleep(nanoseconds: 2_000_000_000)  // 2 s tick
+        guard let self else { return }
+        self.checkFrameStarvation()
+      }
+    }
+  }
+
+  private func stopFrameWatchdog() {
+    frameWatchdogTask?.cancel()
+    frameWatchdogTask = nil
+  }
+
+  private func checkFrameStarvation() {
+    guard frameWatchdogTask != nil, !cameraConnectionLost, isStreaming else { return }
+    let now = Date()
+    if !hasReceivedFirstFrame {
+      // Startup stall: stream came up but no frame ever landed.
+      if now.timeIntervalSince(streamStartedAt) > Self.firstFrameGrace {
+        handleCameraStarvation(reason: "no first frame within \(Int(Self.firstFrameGrace))s of start")
+      }
+      return
+    }
+    // Mid-stream stall: frames were flowing, then stopped.
+    if now.timeIntervalSince(lastFrameAt) > Self.frameStallThreshold {
+      handleCameraStarvation(reason: "no frames for \(Int(Self.frameStallThreshold))s")
+    }
+  }
+
+  /// The transport is dead but the SDK never surfaced it. Force-drop the shared
+  /// session and surface a Reconnect affordance (no silent auto-retry).
+  private func handleCameraStarvation(reason: String) {
+    guard !cameraConnectionLost else { return }
+    print("[Glasses] ⚠️ camera frame starvation — \(reason); invalidating shared session")
+    cameraConnectionLost = true
+    stopFrameWatchdog()
+
+    // If a recording was in flight it's been capturing nothing — finalize it
+    // (it'll report failure and clean up its temp file) so no writer dangles.
+    if recordingManager.isRecording {
+      Task { [recordingManager] in _ = await recordingManager.stopRecording() }
+    }
+
+    // Force the manager to drop the dead session, bypassing the lens lease
+    // that would otherwise pin it — so Reconnect rebuilds a fresh session.
+    sessionManager.invalidate(reason: "glasses camera frame starvation (\(reason))")
+
+    // Drop listeners + local capability refs so a trailing event can't push
+    // into a half-dead pipeline and so startSession() re-acquires instead of
+    // "reusing existing streamSession".
+    stateListenerToken = nil
+    videoFrameListenerToken = nil
+    errorListenerToken = nil
+    photoDataListenerToken = nil
+    streamSession = nil
+    deviceSession = nil
+    hasReceivedFirstFrame = false
+    streamingStatus = .stopped
+    showError("Lost connection to the glasses camera. Tap Reconnect to try again.")
+  }
+
+  /// User tapped Reconnect after a detected camera death. The manager already
+  /// invalidated (nil'd) the dead session, so `prepare()` → `startSession()`
+  /// re-acquires a genuinely fresh `createSession`.
+  func reconnect() async {
+    cameraConnectionLost = false
+    dismissError()
+    await prepare()
   }
 
   func stopSession() async {

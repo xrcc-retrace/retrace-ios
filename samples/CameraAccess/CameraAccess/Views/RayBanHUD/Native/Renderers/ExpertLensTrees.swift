@@ -27,6 +27,9 @@ struct ExpertLensCallbacks {
   let onRetreatTip: @Sendable () -> Void
   let onStopTapped: @Sendable () -> Void
   let onStopCancel: @Sendable () -> Void
+  /// Glasses-first only: tap Start on the lens pre-flight. No-op in the
+  /// phone-launched flow (that path never renders the lens Start affordance).
+  let onStart: @Sendable () -> Void
 }
 
 // MARK: - Top-level dispatch
@@ -37,10 +40,13 @@ enum ExpertLensTrees {
     snapshot s: ExpertLensSnapshot,
     callbacks cb: ExpertLensCallbacks
   ) -> FlexBox {
-    // Pre-recording / warmup → handoff card on the lens. The Start CTA
-    // lives on the phone chrome; the lens just tells the user where to
-    // look. Step 10 generalizes this routing.
+    // Pre-recording / warmup. Glasses-first (lens-launched) recording shows a
+    // lens pre-flight with a Start affordance; the phone-launched flow keeps
+    // the "use your phone" handoff card (Start lives on the phone chrome).
     if !s.isHUDActive {
+      if s.canStartFromLens {
+        return preflightTree(snapshot: s, callbacks: cb)
+      }
       return LensComponents.handoffCard(reason: "Get ready on your phone")
     }
 
@@ -49,6 +55,62 @@ enum ExpertLensTrees {
     }
 
     return narrationTipTree(snapshot: s, callbacks: cb)
+  }
+
+  // MARK: - Pre-flight (glasses-first, lens-launched)
+
+  /// "Ready to record" intermediary shown before the user starts a glasses-
+  /// first capture. The Start pill is a static `.card` row (not a DSL Button),
+  /// visible at rest; it reads "Preparing…" and no-ops until warmup finishes
+  /// (`isReadyToRecord`), then flips to an enabled "Start recording".
+  static func preflightTree(
+    snapshot s: ExpertLensSnapshot,
+    callbacks cb: ExpertLensCallbacks
+  ) -> FlexBox {
+    // Start fires only once ready; a no-op until warmup completes.
+    let startAction: @Sendable () -> Void
+    if s.isReadyToRecord {
+      startAction = cb.onStart
+    } else {
+      startAction = {}
+    }
+    return FlexBox(
+      direction: MWDATDisplay.Direction.column,
+      spacing: 12,
+      alignment: .start,
+      crossAlignment: .stretch
+    ) {
+      LensComponents.cardPanel(
+        spacing: 8,
+        alignment: .center,
+        crossAlignment: .center,
+        padding: 18
+      ) {
+        Text("Ready to record", style: .heading, color: .primary)
+        Text("Look at the task, then press start", style: .body, color: .secondary)
+      }
+
+      // Start pill — enabled only once warmup completes.
+      FlexBox(
+        direction: MWDATDisplay.Direction.row,
+        spacing: 10,
+        alignment: .center,
+        crossAlignment: .center
+      ) {
+        Icon(name: .videoCamera, style: .filled)
+        Text(
+          s.isReadyToRecord ? "Start recording" : "Preparing…",
+          style: .body,
+          color: s.isReadyToRecord ? .primary : .secondary
+        )
+      }
+      .padding(14)
+      .background(.card)
+      .onTap(startAction)
+
+      LensComponents.actionPill(icon: .arrowLeft, label: "Cancel", onTap: cb.onExit)
+    }
+    .padding(12)
   }
 
   // MARK: - 15. Narration tip page
@@ -95,8 +157,12 @@ enum ExpertLensTrees {
         crossAlignment: .center
       ) {
         Icon(name: .videoCamera, style: .filled)
+        // Static "REC" — no live mm:ss timer. A per-second timer re-sent the
+        // lens tree every second, contending with the glasses video stream on
+        // the single BT radio (WARP `service_not_found` choke). Icon stays
+        // paired with a Text so it doesn't balloon (lens icon-sizing rule).
         Text(
-          formatMMSS(s.recordingDurationWholeSeconds),
+          "REC",
           style: .body,
           color: .primary
         )
@@ -212,13 +278,5 @@ enum ExpertLensTrees {
       }
     }
     .padding(12)
-  }
-
-  // MARK: - Helpers
-
-  private static func formatMMSS(_ seconds: Int) -> String {
-    let m = seconds / 60
-    let s = seconds % 60
-    return String(format: "%02d:%02d", m, s)
   }
 }

@@ -37,18 +37,31 @@ final class ExpertLensContext {
   let onStopConfirmed: () -> Void
   let onExitRequested: () -> Void
 
+  /// Glasses-first only: tapping Start on the lens pre-flight. When nil (the
+  /// phone-launched flow), the pre-flight shows the "use your phone" handoff
+  /// card and Start lives on the phone chrome instead.
+  let onStart: (() -> Void)?
+  /// Emits `true` once the recorder has finished warmup and a Start tap will
+  /// succeed (drives the lens pre-flight Start enabled state). Nil → not lens-
+  /// launched.
+  let readinessPublisher: AnyPublisher<Bool, Never>?
+
   init(
     recordingManager: ExpertRecordingManager,
     hudViewModel: ExpertRecordingHUDViewModel,
     transport: CaptureTransport,
     onStopConfirmed: @escaping () -> Void,
-    onExitRequested: @escaping () -> Void
+    onExitRequested: @escaping () -> Void,
+    onStart: (() -> Void)? = nil,
+    readinessPublisher: AnyPublisher<Bool, Never>? = nil
   ) {
     self.recordingManager = recordingManager
     self.hudViewModel = hudViewModel
     self.transport = transport
     self.onStopConfirmed = onStopConfirmed
     self.onExitRequested = onExitRequested
+    self.onStart = onStart
+    self.readinessPublisher = readinessPublisher
   }
 }
 
@@ -73,12 +86,15 @@ final class ExpertLensRenderer: LensRenderer {
   /// isn't active.
   private var stopCountdownTask: Task<Void, Never>?
 
-  /// Last snapshot we actually sent. `recordingManager.$recordingDuration`
-  /// ticks at ~30 Hz; the 120ms throttle still leaves ~8 redraws/sec on
-  /// the wire even though the *visible* state (whole-second timer + tip
-  /// index) only changes at 1 Hz. Skipping equal snapshots collapses
-  /// those to one BT send per real state change.
+  /// Last snapshot we actually sent. The 120ms throttle can still fire the
+  /// sink several times per second (tip carousel, warmup flips), so we skip
+  /// sends whose projected snapshot is byte-identical to the last — collapsing
+  /// them to one BT send per real, visible state change.
   private var lastSentSnapshot: ExpertLensSnapshot?
+
+  /// Latest value from `context.readinessPublisher` (glasses-first only).
+  /// Drives the lens pre-flight Start enabled state.
+  private var isReadyToRecord: Bool = false
 
   // MARK: - Subscriptions
 
@@ -103,16 +119,18 @@ final class ExpertLensRenderer: LensRenderer {
   // MARK: - Subscription wiring
 
   /// CombineLatest over the published signals the lens cares about:
-  /// recording state (drives the handoff/tip routing + the timer + the
-  /// warmup gate, bundled as a CombineLatest3) and the tip index (carousel).
+  /// recording state (drives the handoff/tip routing + the warmup gate) and
+  /// the tip index (carousel).
   ///
-  /// The recording duration is debounced to whole-second granularity in
-  /// `projectSnapshot()` — the underlying float fires at ~30 Hz which
-  /// would BT-spam if forwarded raw.
+  /// The recording duration is deliberately NOT observed here. The on-lens
+  /// timer used to re-render every second, and during glasses recording those
+  /// `display.send`s share the ONE BT radio with the live video stream (+ HFP
+  /// audio) — enough contention to choke the WARP transport (the
+  /// `service_not_found` death). The lens now shows a static "REC" indicator,
+  /// so it only sends on real state changes (start/stop, tip, stop-confirm).
   private func subscribe() {
-    let recording = Publishers.CombineLatest3(
+    let recording = Publishers.CombineLatest(
       context.recordingManager.$isRecording,
-      context.recordingManager.$recordingDuration,
       context.recordingManager.$isWarmingUp
     )
     Publishers.CombineLatest(recording, context.hudViewModel.$tipIndex)
@@ -123,6 +141,19 @@ final class ExpertLensRenderer: LensRenderer {
         self?.scheduleSend()
       }
       .store(in: &cancellables)
+
+    // Glasses-first: re-render when the recorder becomes ready so the lens
+    // pre-flight Start flips from "Preparing…" to enabled.
+    if let readiness = context.readinessPublisher {
+      readiness
+        .removeDuplicates()
+        .receive(on: DispatchQueue.main)
+        .sink { [weak self] ready in
+          self?.isReadyToRecord = ready
+          self?.scheduleSend()
+        }
+        .store(in: &cancellables)
+    }
   }
 
   // MARK: - Snapshot projection
@@ -131,8 +162,9 @@ final class ExpertLensRenderer: LensRenderer {
     let tip = context.hudViewModel.currentTip
     return ExpertLensSnapshot(
       isHUDActive: context.recordingManager.isHUDActive,
+      canStartFromLens: context.onStart != nil,
+      isReadyToRecord: isReadyToRecord,
       isRecording: context.recordingManager.isRecording,
-      recordingDurationWholeSeconds: Int(context.recordingManager.recordingDuration),
       tipIndex: context.hudViewModel.tipIndex,
       totalTips: ExpertCoachingTips.pool.count,
       currentTipTitle: tip.title,
@@ -146,8 +178,8 @@ final class ExpertLensRenderer: LensRenderer {
 
   private func scheduleSend() {
     let snapshot = projectSnapshot()
-    // Whole-second timer + per-tip cadence means consecutive snapshots
-    // are mostly identical. Equality check skips redundant BT sends.
+    // With no live timer, snapshots only change on real state transitions
+    // (start/stop, tip, stop-confirm). Equality check skips redundant BT sends.
     if let last = lastSentSnapshot, last == snapshot { return }
     lastSentSnapshot = snapshot
     let callbacks = makeCallbacks()
@@ -189,6 +221,11 @@ final class ExpertLensRenderer: LensRenderer {
       onStopCancel: { [weak self] in
         Task { @MainActor [weak self] in
           self?.cancelStopCountdown()
+        }
+      },
+      onStart: { [weak self] in
+        Task { @MainActor [weak self] in
+          self?.context.onStart?()
         }
       }
     )

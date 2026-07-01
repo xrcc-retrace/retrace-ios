@@ -27,8 +27,9 @@ enum SlideDirection: Equatable {
 /// behavior via template-method overrides.
 ///
 /// Mode-specific state: procedure-bound step tracking, `showPiP` reference
-/// clips, heartbeat scheduler (`[check]` markers on silence to unblock
-/// Gemini 3.1 Flash's VAD-gated video evaluation), progress-store
+/// clips, oracle-poll scheduler (POSTs the latest camera JPEG to the
+/// server-side `/verify` visual oracle on a timer, then relays advances /
+/// corrections into Gemini Live as text turns), progress-store
 /// integration, session-duration display. Everything else — audio, camera
 /// (both transports), WebSocket, tool-call forwarding, transcripts,
 /// barge-in, session resumption — lives on the base.
@@ -77,27 +78,37 @@ class CoachingSessionViewModel: GeminiLiveSessionBase {
   // fires on resumption reconnects) keeps honoring it.
   private var activeMonitoring = true
 
-  // MARK: - Heartbeat
+  // MARK: - Oracle poll (server-side visual verification)
   //
-  // Design (see .claude/plans/snappy-singing-harbor.md):
-  //   Primary path — onTurnComplete → Task.sleep(5s) → send [check]. Matches
-  //   the sanctioned `setTimeout` form from live-api-web-console#20.
-  //   Fallback — if the model stays silent on a [check] (the desired default
-  //   when nothing's wrong, since no onTurnComplete fires in that case), a
-  //   second Task.sleep reschedules so we don't stall forever.
+  // Visual step verification lives on the SERVER, not in Gemini Live. On the
+  // same timer that used to send a `[check]` marker into the Live socket, we
+  // now POST the learner's latest camera JPEG to
+  // `/api/learner/session/{id}/verify`. A Flash model on the server compares
+  // it against the step's spatial end-state + error states and returns a
+  // verdict; on a confirmed completion the server advances the session and
+  // returns the next-step payload, on a visible mistake it returns a
+  // correction. The phone mirrors local UI and INJECTS a text turn into Live
+  // (which stays purely conversational) so it speaks the event. Live no
+  // longer receives `[check]` at all.
   //
-  // These are coaching-only: the marker prompts Gemini to evaluate video on
-  // silent audio. Diagnostic / future modes don't need this signal.
+  //   Primary path — onTurnComplete → sleep → poll. Fallback — a second
+  //   sleep reschedules so a silent stretch doesn't stall the poll loop.
+  //
+  // These are coaching-only. Diagnostic / future modes don't poll.
 
   private var heartbeatTask: Task<Void, Never>?
   private var heartbeatEnabled = false
-  private static let heartbeatIntervalSeconds: UInt64 = 5
-  private static let heartbeatMarker = "[check]"
-  /// Quiet-streak window used by the heartbeat gate. The gate refuses to
-  /// send if `lastAudioActivityAt` is within this window. 1.5s comfortably
+  private static let oraclePollIntervalSeconds: UInt64 = 4
+  /// Cached most-recent encoded camera JPEG, updated from `onEncodedFrame`
+  /// (the same throttled ~1fps frames the base already sends to Gemini Live).
+  /// The oracle poll ships this; nil until the first frame arrives.
+  private var lastFrameJPEG: Data?
+  /// Quiet-streak window used by the poll gate. The gate refuses to poll
+  /// if `lastAudioActivityAt` is within this window. 1.5s comfortably
   /// bridges the longest natural gaps between Gemini's audio chunks
   /// (~0.3-0.5s at sentence boundaries) and the local playback tail, so
-  /// the gate cannot pass mid-utterance from either side.
+  /// the gate cannot pass mid-utterance from either side — an oracle-
+  /// injected turn can't collide with a real user or model turn.
   private static let heartbeatQuietWindow: TimeInterval = 1.5
 
   // MARK: - Computed
@@ -237,11 +248,17 @@ class CoachingSessionViewModel: GeminiLiveSessionBase {
     wearables: WearablesInterface,
     serverBaseURL: String,
     transport: CaptureTransport = .glasses,
-    sessionManager: DeviceSessionManager
+    sessionManager: DeviceSessionManager,
+    externalAudioManager: AudioSessionManager? = nil
   ) {
     self.procedure = procedure
     self._transport = transport
-    super.init(wearables: wearables, serverBaseURL: serverBaseURL, sessionManager: sessionManager)
+    super.init(
+      wearables: wearables,
+      serverBaseURL: serverBaseURL,
+      sessionManager: sessionManager,
+      externalAudioManager: externalAudioManager
+    )
   }
 
   // MARK: - Lifecycle (public entry / exit)
@@ -296,6 +313,19 @@ class CoachingSessionViewModel: GeminiLiveSessionBase {
     stopGeminiLiveSession()
     stopCameraStream()
     print("[Coaching] ── session ENDED")
+  }
+
+  /// `GlassesRuntime` teardown: run the normal end-session cleanup using the
+  /// stored progress store, then AWAIT the camera teardown so the coordinator
+  /// can guarantee the glasses camera is off before returning to the phone.
+  override func shutdown() async {
+    if let store = progressStore {
+      endSession(progressStore: store)
+    } else {
+      stopGeminiLiveSession()
+      stopCameraStream()
+    }
+    await awaitCameraTeardown()
   }
 
   private static func deleteLearnerSession(sessionId: String, serverBaseURL: String) async {
@@ -358,17 +388,16 @@ class CoachingSessionViewModel: GeminiLiveSessionBase {
   }
 
   override func onConnectedExtra() {
-    // Heartbeat arms on every .connected transition (including resumption
-    // reconnects). scheduleNextHeartbeat cancels any prior tick before
-    // starting, so this is safe to call more than once.
+    // The oracle poll arms on every .connected transition (including
+    // resumption reconnects). scheduleNextHeartbeat cancels any prior tick
+    // before starting, so this is safe to call more than once.
     //
     // Passive mode (Active Monitoring off) is the master switch: never arm the
-    // heartbeat, so no `[check]` markers are sent and the model gets no
-    // silent-period evaluation turns — fully reactive, no visual interjection
-    // and no visual advance.
+    // poll loop, so no frames are sent to the server oracle and no visual
+    // interjection / advance happens — fully reactive, verbal-only.
     guard activeMonitoring else {
       heartbeatEnabled = false
-      print("[Coaching] passive mode — heartbeat disabled")
+      print("[Coaching] passive mode — oracle poll disabled")
       return
     }
     heartbeatEnabled = true
@@ -376,15 +405,14 @@ class CoachingSessionViewModel: GeminiLiveSessionBase {
   }
 
   override func onTurnCompleteExtra() async {
-    // Heartbeat cadence is anchored on turnComplete (the sanctioned pattern
-    // from google-gemini/live-api-web-console#20). This fires ~5s after the
-    // model finishes replying, naturally avoiding heartbeat-during-AI-speech
-    // collisions.
+    // Poll cadence is anchored on turnComplete: this re-arms ~4s after the
+    // model finishes replying, so the poll (and any advance/correction turn
+    // it injects) naturally avoids colliding with the model mid-speech.
     scheduleNextHeartbeat()
   }
 
   override func willStopGeminiLiveSession() {
-    // Stop the heartbeat scheduler BEFORE the base drops Combine subs so
+    // Stop the oracle-poll scheduler BEFORE the base drops Combine subs so
     // an in-flight Task.sleep can't wake up into a half-torn-down service.
     heartbeatEnabled = false
     heartbeatTask?.cancel()
@@ -393,6 +421,13 @@ class CoachingSessionViewModel: GeminiLiveSessionBase {
 
   override func handleToolCallExtras(name: String, args: [String: Any], result: [String: Any]) async {
     applyLearnerToolResult(name: name, args: args, result: result)
+  }
+
+  /// Cache the freshest encoded camera JPEG for the oracle poll. Runs on the
+  /// MainActor for every frame the base hands to Gemini Live (both transports),
+  /// so we reuse the existing ~1fps capture pipeline — no second camera.
+  override func onEncodedFrame(_ jpeg: Data) {
+    lastFrameJPEG = jpeg
   }
 
   override func toolCallSummary(name: String, args: [String: Any], result: [String: Any]) -> String {
@@ -491,16 +526,17 @@ class CoachingSessionViewModel: GeminiLiveSessionBase {
     }
   }
 
-  // MARK: - Heartbeat scheduling (coaching-only)
+  // MARK: - Oracle poll scheduling (coaching-only)
 
   private func scheduleNextHeartbeat() {
     guard heartbeatEnabled else { return }
     heartbeatTask?.cancel()
     heartbeatTask = Task { @MainActor [weak self] in
-      try? await Task.sleep(nanoseconds: Self.heartbeatIntervalSeconds * 1_000_000_000)
+      try? await Task.sleep(nanoseconds: Self.oraclePollIntervalSeconds * 1_000_000_000)
       guard !Task.isCancelled, let self = self, self.heartbeatEnabled else { return }
-      // Foolproof gate: never ship `[check]` while either side is
-      // producing audio. See `canSendHeartbeatNow` for the truth table.
+      // Foolproof gate: never poll (and never inject an advance/correction
+      // turn) while either side is producing audio or a tool call is in
+      // flight. See `canSendHeartbeatNow` for the truth table.
       guard self.canSendHeartbeatNow() else {
         // Activity within the quiet window (or the model is mid-turn,
         // or a tool is in flight). Bail this tick and let the fallback
@@ -508,24 +544,27 @@ class CoachingSessionViewModel: GeminiLiveSessionBase {
         self.scheduleHeartbeatFallback()
         return
       }
-      await self.sendHeartbeat()
-      // Fallback in case Gemini stays silent (no onTurnComplete will fire).
+      await self.runOraclePoll()
+      // Fallback: an oracle poll rarely triggers a model turn (no
+      // onTurnComplete fires on a skip/pending), so re-arm ourselves.
       self.scheduleHeartbeatFallback()
     }
   }
 
   private func scheduleHeartbeatFallback() {
     heartbeatTask = Task { @MainActor [weak self] in
-      try? await Task.sleep(nanoseconds: Self.heartbeatIntervalSeconds * 1_000_000_000)
+      try? await Task.sleep(nanoseconds: Self.oraclePollIntervalSeconds * 1_000_000_000)
       guard !Task.isCancelled, let self = self, self.heartbeatEnabled else { return }
       self.scheduleNextHeartbeat()
     }
   }
 
-  /// Single source of truth for whether a heartbeat is safe to send right
+  /// Single source of truth for whether an oracle poll is safe to run right
   /// now. Three independent gates — wire-level, local-playback, and
   /// quiet-streak — must all be quiet. Any one alone has a known race;
-  /// together they're foolproof.
+  /// together they're foolproof. Gating the poll (not just the send) keeps an
+  /// oracle-injected `[ADVANCE]`/`[CORRECTION]` turn from colliding with a
+  /// real user turn or the model's own in-flight generation.
   ///
   /// - `isModelGenerating`: Gemini wire flag, set on each inbound audio
   ///   chunk and cleared on `turnComplete` / `interrupted` / 2s watchdog.
@@ -540,21 +579,88 @@ class CoachingSessionViewModel: GeminiLiveSessionBase {
     return sinceActivity >= Self.heartbeatQuietWindow
   }
 
-  private func sendHeartbeat() async {
-    guard let service = geminiService else { return }
+  /// One oracle tick: ship the latest camera JPEG to the server-side visual
+  /// oracle, then act on the verdict. `advanced`/`completed` update local UI
+  /// via the existing `applyLearnerToolResult` path (the server already
+  /// advanced the session) and inject a congratulatory `[ADVANCE]` turn;
+  /// `error` injects a `[CORRECTION]` turn without touching step state.
+  private func runOraclePoll() async {
+    guard activeMonitoring, canSendHeartbeatNow() else { return }
+    guard let sessionId, let frame = lastFrameJPEG else { return }
+
+    let resp: VerifyResponse
     do {
-      try await service.sendClientTextTurn(Self.heartbeatMarker)
-      appendHeartbeatActivity()
+      resp = try await ProcedureAPIService().verifyStep(sessionId: sessionId, frameJPEG: frame)
     } catch {
-      // Transient send errors are non-fatal — the next scheduled tick will retry.
-      print("[Coaching] heartbeat send failed: \(error)")
+      // Treat a failed / timed-out poll as a skipped tick.
+      print("[Coaching] oracle verify failed: \(error)")
+      return
+    }
+
+    guard let service = geminiService else { return }
+
+    switch resp.status {
+    case "skip", "pending":
+      // Nothing confirmed this tick — verbal-only step, not auto-advancing,
+      // or the end-state isn't visible yet.
+      break
+
+    case "error":
+      let correction = resp.errorText ?? ""
+      do {
+        try await service.sendClientTextTurn(
+          "[CORRECTION] \(correction). Tell the learner concisely how to fix it."
+        )
+        appendOracleActivity("Correction: \(correction)")
+      } catch {
+        print("[Coaching] oracle correction inject failed: \(error)")
+      }
+
+    case "advanced":
+      // Server already advanced the session; mirror local UI exactly like a
+      // tool-call advance, then tell Live to coach the next step.
+      var result: [String: Any] = ["status": "advanced"]
+      if let n = resp.newStep { result["new_step"] = n }
+      if let t = resp.stepTitle { result["step_title"] = t }
+      if let d = resp.stepDescription { result["step_description"] = d }
+      if let c = resp.completionCriteria { result["completion_criteria"] = c }
+      applyLearnerToolResult(name: "advance_step", args: [:], result: result)
+      appendOracleActivity("Advanced to step \(resp.newStep.map(String.init) ?? "?")")
+      do {
+        try await service.sendClientTextTurn(
+          "[ADVANCE] The learner just finished this step. Next step: "
+          + "\(resp.stepTitle ?? "") — \(resp.stepDescription ?? ""). "
+          + "Congratulate them briefly, then coach this next step."
+        )
+      } catch {
+        print("[Coaching] oracle advance inject failed: \(error)")
+      }
+
+    case "completed":
+      applyLearnerToolResult(
+        name: "advance_step",
+        args: [:],
+        result: ["status": "completed", "message": resp.message ?? ""]
+      )
+      appendOracleActivity("Procedure complete")
+      do {
+        try await service.sendClientTextTurn(
+          "[ADVANCE] The learner just finished the final step. "
+          + "Give them a short, warm congratulations to close out."
+        )
+      } catch {
+        print("[Coaching] oracle completion inject failed: \(error)")
+      }
+
+    default:
+      break
     }
   }
 
-  private func appendHeartbeatActivity() {
+  private func appendOracleActivity(_ text: String) {
     activity.append(ActivityEntry(
-      kind: .toolCall(name: "heartbeat"),
-      text: "[check]",
+      kind: .toolCall(name: "verify"),
+      text: text,
       timestamp: Date()
     ))
     trimActivity()

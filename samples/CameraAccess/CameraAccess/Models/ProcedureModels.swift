@@ -98,6 +98,12 @@ struct ProcedureStepResponse: Codable, Identifiable, Equatable {
   let warnings: [String]
   let errorCriteria: [String]
   let clipUrl: String?
+  // How reliably this step's end-state can be verified from the camera by
+  // the server-side visual oracle: "reliable" | "marginal" | "none"
+  // ("none" = verbal-only, no visual auto-advance). Optional for backward
+  // compatibility with servers that predate the column — defaults to
+  // "reliable".
+  let visualVerifiability: String
 
   enum CodingKeys: String, CodingKey {
     case title, description, tips, warnings
@@ -106,6 +112,7 @@ struct ProcedureStepResponse: Codable, Identifiable, Equatable {
     case timestampEnd = "timestamp_end"
     case errorCriteria = "error_criteria"
     case clipUrl = "clip_url"
+    case visualVerifiability = "visual_verifiability"
   }
 
   init(
@@ -117,7 +124,8 @@ struct ProcedureStepResponse: Codable, Identifiable, Equatable {
     tips: [String] = [],
     warnings: [String] = [],
     errorCriteria: [String] = [],
-    clipUrl: String? = nil
+    clipUrl: String? = nil,
+    visualVerifiability: String = "reliable"
   ) {
     self.stepNumber = stepNumber
     self.title = title
@@ -128,6 +136,7 @@ struct ProcedureStepResponse: Codable, Identifiable, Equatable {
     self.warnings = warnings
     self.errorCriteria = errorCriteria
     self.clipUrl = clipUrl
+    self.visualVerifiability = visualVerifiability
   }
 
   // Custom decoder so old servers that predate the error_criteria column
@@ -144,6 +153,7 @@ struct ProcedureStepResponse: Codable, Identifiable, Equatable {
     warnings = try c.decode([String].self, forKey: .warnings)
     errorCriteria = try c.decodeIfPresent([String].self, forKey: .errorCriteria) ?? []
     clipUrl = try c.decodeIfPresent(String.self, forKey: .clipUrl)
+    visualVerifiability = try c.decodeIfPresent(String.self, forKey: .visualVerifiability) ?? "reliable"
   }
 
   var hasAnyInsights: Bool {
@@ -253,12 +263,43 @@ struct StepUpdateRequest: Codable {
   var timestampStart: Double?
   var timestampEnd: Double?
   var errorCriteria: [String]?
+  var visualVerifiability: String? = nil
 
   enum CodingKeys: String, CodingKey {
     case title, description, tips, warnings
     case timestampStart = "timestamp_start"
     case timestampEnd = "timestamp_end"
     case errorCriteria = "error_criteria"
+    case visualVerifiability = "visual_verifiability"
+  }
+}
+
+// MARK: - Verify (server-side visual oracle)
+
+/// Response from `POST /api/learner/session/{id}/verify` — the server-side
+/// visual step oracle. The phone POSTs the learner's latest camera JPEG on
+/// a timer; the server runs a Flash model against the current step's spatial
+/// end-state + error states and returns a verdict. Lenient (only `status`
+/// is guaranteed) so partial / unknown payloads don't throw. On `advanced`/
+/// `completed` the shape mirrors the `advance_step` tool-call result, so the
+/// payload feeds straight into `applyLearnerToolResult`.
+struct VerifyResponse: Codable {
+  /// skip | pending | error | advanced | completed
+  let status: String
+  let errorText: String?         // correction sentence (status == "error")
+  let newStep: Int?              // 1-indexed step number (status == "advanced")
+  let stepTitle: String?
+  let stepDescription: String?
+  let completionCriteria: String?
+  let message: String?           // closing message (status == "completed")
+
+  enum CodingKeys: String, CodingKey {
+    case status, message
+    case errorText = "error_text"
+    case newStep = "new_step"
+    case stepTitle = "step_title"
+    case stepDescription = "step_description"
+    case completionCriteria = "completion_criteria"
   }
 }
 

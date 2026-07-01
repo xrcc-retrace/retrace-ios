@@ -97,7 +97,7 @@ class AudioSessionManager: ObservableObject {
   /// fan into `mainMixerNode` and out the glasses/phone speaker.
   private let musicNode = AVAudioPlayerNode()
   /// Ducked low so Gemini stays intelligible if it speaks over the music.
-  private let musicVolume: Float = 0.18
+  private let musicVolume: Float = 0.10
   /// True while a lobby loop is scheduled/playing. Guards idempotent start/stop.
   private var musicPlaying = false
 
@@ -142,6 +142,22 @@ class AudioSessionManager: ObservableObject {
   /// (which would post a fresh route-change cascade and undo the
   /// warmup). Reset by `stopCapture()`.
   private var didConfigureSession = false
+
+  /// Pending waiter for `awaitHFPRouteReady(_:)` — the event-driven
+  /// replacement for the fixed HFP warmup sleep. Resolved `true` by
+  /// `handleRouteChange` the instant the glasses BT HFP route comes up with
+  /// a settled input format, or `false` by the caller's timeout / teardown.
+  /// All access is `@MainActor`, so there's no resume race.
+  private var hfpReadyContinuation: CheckedContinuation<Bool, Never>?
+
+  /// Resumed by `recordCapturedBuffer` when the FIRST mic PCM buffer actually
+  /// arrives (SCO link carrying data), or `false` on the caller's timeout /
+  /// teardown. Distinct from `hfpReadyContinuation`, which only proves the HFP
+  /// route exists — not that it's delivering audio. Callers who must have the
+  /// mic "locked in" before doing something that could disturb the BT radio
+  /// (e.g. attaching the Display capability) await this. `@MainActor` access,
+  /// so no resume race.
+  private var firstBufferContinuation: CheckedContinuation<Bool, Never>?
 
   /// Called on the audio capture queue with each PCM buffer.
   var onAudioBuffer: ((AVAudioPCMBuffer, AVAudioTime) -> Void)?
@@ -306,22 +322,97 @@ class AudioSessionManager: ObservableObject {
   }
 
   /// Public entry point that runs ONLY the session configure step (no
-  /// engine, no tap, no playback). Used by callers that need to insert
-  /// a delay between session activation and `engine.start()`. The
-  /// Meta DAT iOS docs at
+  /// engine, no tap, no playback). Used by callers that need to wait for
+  /// the HFP route to come up between session activation and
+  /// `engine.start()`. The Meta DAT iOS docs at
   /// https://wearables.developer.meta.com/docs/develop/dat/microphones-and-speakers#ios-sample-code
   /// state: "When planning to use HFP and streaming simultaneously,
   /// ensure that HFP is fully configured before initiating any
-  /// streaming session that requires audio functionality." The
-  /// canonical worked example uses a ~2-second delay. We mirror that:
-  /// `configureSessionOnly()` → `await Task.sleep(2 s)` →
-  /// `startCapture()` (which short-circuits its own configure step
-  /// via the `didConfigureSession` flag set above).
+  /// streaming session that requires audio functionality." The sample
+  /// uses a fixed ~2 s delay; we instead drive that wait off the actual
+  /// route-up event:
+  /// `configureSessionOnly()` → `await awaitHFPRouteReady(timeout:)` →
+  /// `startCapture()` (which short-circuits its own configure step via
+  /// the `didConfigureSession` flag set above).
   ///
   /// Idempotent — re-calling after a successful configure is a no-op.
   func configureSessionOnly() {
     guard !didConfigureSession else { return }
     configureAudioSession()
+  }
+
+  /// Event-driven replacement for the fixed HFP warmup sleep. After
+  /// `configureSessionOnly()` has pinned the glasses' BT HFP input, iOS
+  /// negotiates the SCO link asynchronously and posts a route change when
+  /// it's up. Suspend until the glasses HFP route is the active input with
+  /// a settled (non-zero) format — proof it's safe for `startCapture()`'s
+  /// `engine.start()` to attach without hitting the half-negotiated-route
+  /// silent-stop. Returns:
+  ///   - `true` immediately when the route is already up (warm reuse), or
+  ///     as soon as the route-up event lands (often well under the ceiling);
+  ///   - `false` if `timeout` elapses first — the caller still proceeds, and
+  ///     the downstream first-PCM-buffer wait + recovery sheet are the
+  ///     backstop, exactly as with the old fixed sleep. So the ceiling can
+  ///     only make startup faster, never slower, than the constant it
+  ///     replaces.
+  ///
+  /// Glasses modes only; phone-only modes return `true` at once (built-in
+  /// mic, no SCO negotiation).
+  func awaitHFPRouteReady(timeout: TimeInterval) async -> Bool {
+    guard isGlassesMode else { return true }
+    if glassesHFPRouteReady() { return true }
+    return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+      self.hfpReadyContinuation = cont
+      Task { @MainActor [self] in
+        try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+        if let pending = self.hfpReadyContinuation {
+          self.hfpReadyContinuation = nil
+          print("[AudioSession] HFP route not confirmed within \(timeout)s — proceeding on the ceiling (first-buffer wait is the backstop)")
+          pending.resume(returning: false)
+        }
+      }
+    }
+  }
+
+  /// Suspend until the FIRST mic PCM buffer arrives — proof the SCO link is
+  /// actually carrying audio, not merely that the route exists and the engine
+  /// started. Returns `true` on the first buffer (or immediately if one already
+  /// arrived), `false` if `timeout` elapses first. Callers that must have the
+  /// mic "locked in" before disturbing the shared BT radio (e.g. attaching the
+  /// Display capability, which can tear down a route-ready-but-not-yet-flowing
+  /// HFP link) await this after `startCapture()`. Glasses modes only; phone-only
+  /// modes return `true` at once. Requires `startCapture()` to have been called.
+  func awaitFirstMicBuffer(timeout: TimeInterval) async -> Bool {
+    guard isGlassesMode else { return true }
+    if lastBufferReceivedAt != nil { return true }
+    return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+      self.firstBufferContinuation = cont
+      Task { @MainActor [self] in
+        try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+        if let pending = self.firstBufferContinuation {
+          self.firstBufferContinuation = nil
+          print("[AudioSession] ⚠ First mic buffer not seen within \(timeout)s — HFP not locked in")
+          pending.resume(returning: false)
+        }
+      }
+    }
+  }
+
+  /// True when the glasses' BT HFP port is the active input AND its format
+  /// has settled (non-zero sample rate — the same pre-start validity gate
+  /// `ensureValidInputFormat()` uses). Prefers an exact glasses-port match
+  /// so a second connected HFP device (e.g. AirPods) can't satisfy the gate;
+  /// falls back to "any BT HFP input" only when the glasses port couldn't be
+  /// named (the `wearables.devices` list is briefly empty), in which case
+  /// the input was already pinned to the glasses.
+  private func glassesHFPRouteReady() -> Bool {
+    guard inputNode.inputFormat(forBus: 0).sampleRate > 0 else { return false }
+    let session = AVAudioSession.sharedInstance()
+    let current = session.currentRoute.inputs
+    if let glasses = Self.selectGlassesInput(from: session, names: preferredGlassesNames) {
+      return current.contains { $0.uid == glasses.uid }
+    }
+    return current.contains { $0.portType == .bluetoothHFP }
   }
 
   /// Match heuristics applied (in `selectGlassesInput`) to a `.bluetoothHFP`
@@ -913,6 +1004,18 @@ class AudioSessionManager: ObservableObject {
     // session was activated, so gate on either. The engine/tap teardown below
     // is a safe no-op when nothing was started.
     guard isCapturing || didConfigureSession else { return }
+    // Release any in-flight HFP warmup waiter so a teardown mid-warmup
+    // doesn't leave a suspended continuation hanging until its timeout.
+    if let pending = hfpReadyContinuation {
+      hfpReadyContinuation = nil
+      pending.resume(returning: false)
+    }
+    // Same for a first-mic-buffer waiter — a teardown before the first buffer
+    // must release it rather than let it hang until timeout.
+    if let pending = firstBufferContinuation {
+      firstBufferContinuation = nil
+      pending.resume(returning: false)
+    }
     inputNode.removeTap(onBus: 0)
     // Flush pending playback buffers FIRST so the player-node stop can't be
     // racing with a scheduled buffer callback (only applies to coaching modes).
@@ -997,9 +1100,15 @@ class AudioSessionManager: ObservableObject {
     let peak = Self.peakAmplitude(of: buffer)
     Task { @MainActor [weak self] in
       guard let self = self else { return }
+      let wasFirstBuffer = self.lastBufferReceivedAt == nil
       self.lastBufferReceivedAt = Date()
       self.captureBuffersSinceLastFlush += 1
       self.silentMicWarned = false  // buffers are flowing; re-arm watchdog
+      if wasFirstBuffer, let pending = self.firstBufferContinuation {
+        // SCO is now carrying data — release any `awaitFirstMicBuffer` waiter.
+        self.firstBufferContinuation = nil
+        pending.resume(returning: true)
+      }
       self.lastBufferPeak = peak
       // EMA shape mirrors `aiOutputPeak`: faster attack than release so a
       // sharp utterance pops the meter, then it tails off softly.
@@ -1371,6 +1480,18 @@ class AudioSessionManager: ObservableObject {
 
     Task { @MainActor in
       self.checkBluetoothRoute()
+
+      // Event-driven HFP warmup: if a caller is suspended in
+      // `awaitHFPRouteReady`, resolve it the instant the glasses BT HFP
+      // route is actually up with a settled format. Gated by
+      // `glassesHFPRouteReady()`, so intermediate route changes (built-in
+      // mic, half-negotiated SCO) don't fire it early.
+      if self.hfpReadyContinuation != nil, self.glassesHFPRouteReady() {
+        let pending = self.hfpReadyContinuation
+        self.hfpReadyContinuation = nil
+        print("[AudioSession] HFP glasses route confirmed (reason=\(reasonLabel)) — releasing warmup wait")
+        pending?.resume(returning: true)
+      }
 
       // Route changes that can alter the input format or invalidate the tap.
       // When capturing, drop the old tap, reinit the converter against the new

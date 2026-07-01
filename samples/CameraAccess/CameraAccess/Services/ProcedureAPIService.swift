@@ -186,6 +186,39 @@ class ProcedureAPIService: ObservableObject {
     return json
   }
 
+  // MARK: - Visual step verification (server-side oracle)
+
+  /// POST the learner's latest camera JPEG to the server-side visual oracle.
+  /// The server compares it against the current step's spatial end-state +
+  /// error states and returns a verdict (`skip` / `pending` / `error` /
+  /// `advanced` / `completed`). On `advanced`/`completed` the server has
+  /// already advanced the session; the phone mirrors local UI + relays the
+  /// event into Gemini Live. Multipart body carries one file part `frame`.
+  func verifyStep(sessionId: String, frameJPEG: Data) async throws -> VerifyResponse {
+    guard let url = URL(string: "\(serverBaseURL)/api/learner/session/\(sessionId)/verify") else {
+      throw APIError.invalidURL
+    }
+    let boundary = "Boundary-\(UUID().uuidString)"
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+    request.timeoutInterval = 10
+
+    var body = Data()
+    body.append("--\(boundary)\r\n".data(using: .utf8)!)
+    body.append("Content-Disposition: form-data; name=\"frame\"; filename=\"frame.jpg\"\r\n".data(using: .utf8)!)
+    body.append("Content-Type: image/jpeg\r\n\r\n".data(using: .utf8)!)
+    body.append(frameJPEG)
+    body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
+    request.httpBody = body
+
+    let (data, response) = try await URLSession.shared.data(for: request)
+    guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+      throw APIError.serverError
+    }
+    return try decoder.decode(VerifyResponse.self, from: data)
+  }
+
   // MARK: - Troubleshoot (diagnostic) session
 
   func startDiagnosticSession(voice: String) async throws -> DiagnosticSessionStartResponse {
@@ -246,6 +279,59 @@ class ProcedureAPIService: ObservableObject {
 
   func endDiagnosticSession(sessionId: String) async {
     guard let url = URL(string: "\(serverBaseURL)/api/troubleshoot/session/\(sessionId)") else {
+      return
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = "DELETE"
+    _ = try? await URLSession.shared.data(for: request)
+  }
+
+  // MARK: - Ask AI (lightweight audio-only voice search)
+
+  func startAskAISession(voice: String) async throws -> AskAISessionStartResponse {
+    guard let url = URL(string: "\(serverBaseURL)/api/ask_ai/session/start") else {
+      throw APIError.invalidURL
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try JSONSerialization.data(withJSONObject: ["voice": voice])
+    let (data, response) = try await URLSession.shared.data(for: request)
+    guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+      throw APIError.serverError
+    }
+    return try decoder.decode(AskAISessionStartResponse.self, from: data)
+  }
+
+  func handoffAskAIToLearner(
+    sessionId: String,
+    procedureId: String,
+    autoAdvance: Bool,
+    activeMonitoring: Bool,
+    voice: String
+  ) async throws -> LearnerSessionStartResponse {
+    guard let url = URL(string: "\(serverBaseURL)/api/ask_ai/session/\(sessionId)/handoff") else {
+      throw APIError.invalidURL
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    let body: [String: Any] = [
+      "procedure_id": procedureId,
+      "auto_advance": autoAdvance,
+      "active_monitoring": activeMonitoring,
+      "voice": voice,
+    ]
+    request.httpBody = try JSONSerialization.data(withJSONObject: body)
+    let (data, response) = try await URLSession.shared.data(for: request)
+    guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+      throw APIError.serverError
+    }
+    return try decoder.decode(LearnerSessionStartResponse.self, from: data)
+  }
+
+  func endAskAISession(sessionId: String) async {
+    guard let url = URL(string: "\(serverBaseURL)/api/ask_ai/session/\(sessionId)") else {
       return
     }
     var request = URLRequest(url: url)

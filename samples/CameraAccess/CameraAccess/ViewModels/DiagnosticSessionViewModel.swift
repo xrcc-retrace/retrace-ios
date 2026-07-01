@@ -19,7 +19,20 @@ class DiagnosticSessionViewModel: GeminiLiveSessionBase {
   @Published var phase: DiagnosticPhase = .discovering
   @Published var identifiedProduct: IdentifiedProduct?
   @Published var candidateProcedures: [CandidateProcedure] = []
-  @Published var resolution: DiagnosticResolution?
+  @Published var resolution: DiagnosticResolution? {
+    didSet {
+      // Arm a minimum-dwell floor whenever a terminal resolution lands so a
+      // duplicate `search_procedures` / `web_search_for_fix` tool call that
+      // Gemini re-issues within a second or two can't wipe the shown result
+      // and rewind the surface back to "searching". See `isResolvedSurfaceLocked`.
+      if resolution != nil {
+        armResolvedFloor()
+      } else {
+        resolvedFloorTask?.cancel()
+        resolvedFloorTask = nil
+      }
+    }
+  }
   @Published var showManualUploadSheet = false
   @Published var handoffInFlight = false
   @Published var handoffError: String?
@@ -143,6 +156,32 @@ class DiagnosticSessionViewModel: GeminiLiveSessionBase {
   private var foundFixHoldTask: Task<Void, Never>?
   private static let foundFixHoldSeconds: UInt64 = 2_500_000_000
 
+  /// Minimum-dwell floor on the resolved/found surface. Armed (via
+  /// `resolution`'s `didSet`) the moment a terminal resolution lands, plus the
+  /// pre-resolution `.foundFix` flash window covered by `foundFixHoldTask`.
+  /// While the surface is locked, a search tool name re-appearing in flight —
+  /// or a duplicate search result — is treated as a redundant Gemini re-issue
+  /// and ignored, so it can't rewind the user back to "searching".
+  private var resolvedFloorTask: Task<Void, Never>?
+  private static let resolvedSurfaceFloorSeconds: UInt64 = 3_000_000_000 // 3.0s
+
+  /// True while the resolved/found surface is locked in. A search tool name
+  /// re-appearing during this window is a duplicate Gemini call, not a genuine
+  /// user-driven retry (manual upload / verbal "search again" take many
+  /// seconds, well past the floor).
+  private var isResolvedSurfaceLocked: Bool {
+    resolvedFloorTask != nil || foundFixHoldTask != nil
+  }
+
+  private func armResolvedFloor() {
+    resolvedFloorTask?.cancel()
+    resolvedFloorTask = Task { @MainActor [weak self] in
+      try? await Task.sleep(nanoseconds: Self.resolvedSurfaceFloorSeconds)
+      guard let self, !Task.isCancelled else { return }
+      self.resolvedFloorTask = nil
+    }
+  }
+
   /// 800 ms — web search runs ~10-20s with two natural transitions, so
   /// this gives ≤1.5s lag at each boundary while keeping load light.
   private static let webSearchPollIntervalNanos: UInt64 = 800_000_000
@@ -162,10 +201,16 @@ class DiagnosticSessionViewModel: GeminiLiveSessionBase {
     wearables: WearablesInterface,
     serverBaseURL: String,
     transport: CaptureTransport,
-    sessionManager: DeviceSessionManager
+    sessionManager: DeviceSessionManager,
+    externalAudioManager: AudioSessionManager? = nil
   ) {
     self.diagnosticTransport = transport
-    super.init(wearables: wearables, serverBaseURL: serverBaseURL, sessionManager: sessionManager)
+    super.init(
+      wearables: wearables,
+      serverBaseURL: serverBaseURL,
+      sessionManager: sessionManager,
+      externalAudioManager: externalAudioManager
+    )
 
     // Derive `searchStage` and `searchNarration` from the base's
     // published map of in-flight tool names. Updates in real time as
@@ -197,7 +242,16 @@ class DiagnosticSessionViewModel: GeminiLiveSessionBase {
         // user has since rejected and the AI re-issues search_procedures,
         // the resolved/no-solution page would otherwise stay mounted
         // while the new search ran invisibly.
-        if activeNames.contains("search_procedures") {
+        // While the resolved/found surface is locked (a terminal resolution
+        // just landed, or the `.foundFix` flash is mid-hold), a search tool
+        // re-appearing in flight is a duplicate Gemini re-issue, not a user
+        // retry — leave the shown result intact and don't rewind to
+        // "searching". The raw `searchStage` mirror above still tracks it.
+        let searchActive = activeNames.contains("search_procedures")
+          || activeNames.contains("web_search_for_fix")
+        if searchActive && self.isResolvedSurfaceLocked {
+          // Duplicate in-flight search; ignore for the narration surface.
+        } else if activeNames.contains("search_procedures") {
           self.libraryMissHoldTask?.cancel()
           self.libraryMissHoldTask = nil
           self.foundFixHoldTask?.cancel()
@@ -250,6 +304,8 @@ class DiagnosticSessionViewModel: GeminiLiveSessionBase {
     libraryMissHoldTask = nil
     foundFixHoldTask?.cancel()
     foundFixHoldTask = nil
+    resolvedFloorTask?.cancel()
+    resolvedFloorTask = nil
     pendingResolution = nil
     cancelWebSearchProgressPolling()
 
@@ -319,10 +375,19 @@ class DiagnosticSessionViewModel: GeminiLiveSessionBase {
     libraryMissHoldTask = nil
     foundFixHoldTask?.cancel()
     foundFixHoldTask = nil
+    resolvedFloorTask?.cancel()
+    resolvedFloorTask = nil
     pendingResolution = nil
     cancelWebSearchProgressPolling()
     stopCameraStream()
     stopGeminiLiveSession()
+  }
+
+  /// `GlassesRuntime` teardown: end the session, then AWAIT the camera teardown
+  /// so the coordinator can guarantee the camera is off before exiting.
+  override func shutdown() async {
+    endSession()
+    await awaitCameraTeardown()
   }
 
   // MARK: - Handoff to Learner
@@ -587,6 +652,9 @@ class DiagnosticSessionViewModel: GeminiLiveSessionBase {
       phase = .diagnosing
 
     case "search_procedures":
+      // A duplicate search result arriving while the resolved surface is
+      // locked must not re-buffer/re-arm over the already-shown result.
+      if isResolvedSurfaceLocked { break }
       let candidates = (result["candidates"] as? [[String: Any]])?
         .compactMap { CandidateProcedure(fromJSON: $0) } ?? []
       candidateProcedures = candidates
@@ -604,6 +672,9 @@ class DiagnosticSessionViewModel: GeminiLiveSessionBase {
       }
 
     case "web_search_for_fix":
+      // A duplicate web-search result arriving while the resolved surface is
+      // locked must not re-arm the `.foundFix` flash over the shown result.
+      if isResolvedSurfaceLocked { break }
       let pending: DiagnosticResolution? = {
         let status = (result["status"] as? String) ?? ""
         switch status {

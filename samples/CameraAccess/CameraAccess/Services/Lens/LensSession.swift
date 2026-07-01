@@ -7,14 +7,10 @@
 // `.onAppear` and `deactivate()` on `.onDisappear` so the right
 // renderer is wired to the right view model at the right time.
 //
-// Output is gated by the `@AppStorage("lensOutputEnabled")` toggle in
-// Server Settings → Debug. When the toggle is OFF, every `send(_:)`
-// silently no-ops. This keeps Step 3+ work safe to iterate on without
-// disturbing the existing emulator UX.
-//
-// In Step 3 the dispatcher is minimal: it owns the coordinator and
-// gates sends on the toggle. `activate(_:vm:)` is a no-op until renderers
-// land in Steps 6, 8, 9.
+// Every `send(_:)` forwards to the coordinator, which owns the on-glasses
+// Display lifecycle (lazy-attach, lazy-detach). When no Display-capable
+// device is reachable the coordinator's acquire fails non-fatally and logs
+// once per attach attempt — sends from an iPhone-only run cost nothing.
 //
 
 import Combine
@@ -34,9 +30,13 @@ final class LensSession: ObservableObject {
   /// The active renderer. Single-slot; replaced on `activate(_:vm:)`.
   private var currentRenderer: LensRenderer?
 
-  /// Whether the last `send(_:)` saw the toggle ON. Used to log once
-  /// per state transition (toggle flip) instead of per-send.
-  private var lastLoggedToggleState: Bool? = nil
+  /// Safety-net timer for reference-clip playback. Armed when a clip starts,
+  /// cancelled on the terminal `.ended`/`.stopped` event, on error, on a
+  /// back-gesture stop, or when a new clip replaces it. If the SDK never
+  /// delivers a terminal event (BT drop mid-clip, display detach), this fires
+  /// `onEnded` so the caller's restore path (un-mute Gemini, un-gate camera)
+  /// still runs instead of latching the camera/mic off until session teardown.
+  private var clipWatchdog: Task<Void, Never>?
 
   init(coordinator: LensDisplayCoordinator) {
     self.coordinator = coordinator
@@ -52,22 +52,10 @@ final class LensSession: ObservableObject {
   /// once the Display capability reaches `.started`. We must NOT short-
   /// circuit here on `display == nil`, or the lens never attaches.
   ///
-  /// The only gate that belongs in this wrapper is the user-controlled
-  /// `lensOutputEnabled` toggle from Server Settings → Debug.
   /// Acquire-time failures (non-display device active, no display-capable
   /// device reachable, DAT helper missing) surface via the coordinator's
   /// own log lines — once per attach attempt, not per send.
   func send(_ view: some DisplayableView) async {
-    let toggleOn = UserDefaults.standard.bool(forKey: "lensOutputEnabled")
-    if lastLoggedToggleState != toggleOn {
-      if toggleOn {
-        print("[LensSession] send forwarding → coordinator (lensOutputEnabled=true)")
-      } else {
-        print("[LensSession] send suppressed — lensOutputEnabled=false in Server Settings → Debug")
-      }
-      lastLoggedToggleState = toggleOn
-    }
-    guard toggleOn else { return }
     await coordinator.send(view)
   }
 
@@ -107,6 +95,22 @@ final class LensSession: ObservableObject {
       currentRenderer = ExpertLensRenderer(context: context, lensSession: self)
       print("[LensSession] activate(.expert) ✓")
 
+    case .navigator:
+      guard let navVM = vm as? NavigatorViewModel else {
+        print("[LensSession] activate(.navigator) skipped — vm is not NavigatorViewModel")
+        return
+      }
+      currentRenderer = NavigatorLensRenderer(viewModel: navVM, lensSession: self)
+      print("[LensSession] activate(.navigator) ✓")
+
+    case .askAI:
+      guard let askVM = vm as? AskAISessionViewModel else {
+        print("[LensSession] activate(.askAI) skipped — vm is not AskAISessionViewModel")
+        return
+      }
+      currentRenderer = AskAILensRenderer(viewModel: askVM, lensSession: self)
+      print("[LensSession] activate(.askAI) ✓")
+
     case .handoffToPhone, .idle:
       // Step 10 lands `.handoffToPhone`. For now activation is a no-op
       // and the lens retains whatever tree was last sent.
@@ -123,7 +127,6 @@ final class LensSession: ObservableObject {
   func deactivate() {
     currentRenderer?.cancel()
     currentRenderer = nil
-    lastLoggedToggleState = nil
     currentFlow = .idle
     Task { [weak self] in
       await self?.send(FlexBox(direction: MWDATDisplay.Direction.column) {})
@@ -148,13 +151,21 @@ final class LensSession: ObservableObject {
   /// playback/load failure (e.g. the server 404'd the .mp4). The renderer
   /// uses it to surface a visible "couldn't load clip" card on the lens
   /// instead of failing silently.
+  /// `expectedDuration` (the step's clip length, when known) sizes the
+  /// playback watchdog: it fires at `expectedDuration + 5s`, or a hard 60s
+  /// cap when the duration is unknown/non-positive.
   func presentReferenceClip(
     uri: String,
+    expectedDuration: TimeInterval? = nil,
     onStarted: @escaping () -> Void = {},
     onEnded: @escaping () -> Void,
     onError: @escaping (String) -> Void = { _ in }
   ) async {
-    guard UserDefaults.standard.bool(forKey: "lensOutputEnabled") else { return }
+    // A new clip supersedes any prior one — cancel a stale watchdog so it
+    // can't fire against this presentation.
+    clipWatchdog?.cancel()
+    clipWatchdog = nil
+
     guard let display = coordinator.display else {
       print("[LensSession] presentReferenceClip skipped — display not attached")
       onError("Display not attached")
@@ -186,6 +197,8 @@ final class LensSession: ObservableObject {
         }
       case .ended, .stopped:
         Task { @MainActor [weak self] in
+          self?.clipWatchdog?.cancel()
+          self?.clipWatchdog = nil
           self?.coordinator.display?.onPlaybackEvent = nil
           onEnded()
         }
@@ -197,10 +210,27 @@ final class LensSession: ObservableObject {
     // All guards have passed and we're committed to displaying the clip —
     // signal "started" now so the caller can pause the Gemini loop. Firing
     // here (not before the guards) guarantees a matching terminal event
-    // (`.ended` / `.stopped`) will arrive to un-pause; the silent
-    // `lensOutputEnabled`-off early-return above never reaches this point,
-    // so the caller can't latch the gate closed forever.
+    // (`.ended` / `.stopped`) will arrive to un-pause; the display-not-attached
+    // early-return above never reaches this point, so the caller can't latch
+    // the gate closed forever.
     onStarted()
+
+    // Arm the safety-net watchdog now that the clip is committed. If no
+    // terminal `.ended`/`.stopped` ever arrives (BT drop mid-clip, display
+    // detach), this fires `onEnded` on the main actor so the caller still
+    // restores the camera + Gemini audio and repaints the step card.
+    let timeout = (expectedDuration.map { $0 > 0 ? $0 + 5 : 60 }) ?? 60
+    clipWatchdog = Task { [weak self] in
+      try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+      guard !Task.isCancelled else { return }
+      await MainActor.run {
+        guard let self, !Task.isCancelled else { return }
+        print("[LensSession] clip watchdog fired after \(Int(timeout))s — forcing restore")
+        self.clipWatchdog = nil
+        self.coordinator.display?.onPlaybackEvent = nil
+        onEnded()
+      }
+    }
 
     // `MWDATDisplay.VideoPlayer` is qualified explicitly because this
     // file imports SwiftUI (for `@MainActor` plumbing) and SwiftUI's
@@ -217,6 +247,8 @@ final class LensSession: ObservableObject {
           // Hand the failure back to the renderer on the main actor so it
           // can paint an error card. Clear the now-stale playback handler.
           Task { @MainActor [weak self] in
+            self?.clipWatchdog?.cancel()
+            self?.clipWatchdog = nil
             self?.coordinator.display?.onPlaybackEvent = nil
             onError(String(describing: error))
           }
@@ -234,6 +266,10 @@ final class LensSession: ObservableObject {
   /// "interrupt playback on back gesture" path. This exists so that
   /// path has a single call site to target.
   func dismissReferenceClip() async {
+    // The `sendVideoStop()` below produces a `.stopped` event that cancels the
+    // watchdog too, but cancel eagerly in case the stop event is itself dropped.
+    clipWatchdog?.cancel()
+    clipWatchdog = nil
     guard let display = coordinator.display else { return }
     await display.sendVideoStop()
   }

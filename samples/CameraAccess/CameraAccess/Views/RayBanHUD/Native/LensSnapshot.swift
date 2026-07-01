@@ -157,8 +157,15 @@ struct ExpertLensSnapshot: Equatable {
   // routes to the narration tip page.
   let isHUDActive: Bool
 
+  // Glasses-first (lens-launched) recording. When `canStartFromLens` is true,
+  // the pre-recording surface shows a lens Start affordance (gated on
+  // `isReadyToRecord`) instead of the "use your phone" handoff card. Both are
+  // false in the phone-launched flow (the phone owns Start), so that path is
+  // unchanged.
+  let canStartFromLens: Bool
+  let isReadyToRecord: Bool
+
   let isRecording: Bool
-  let recordingDurationWholeSeconds: Int      // debounced from float duration
 
   // Narration tip carousel
   let tipIndex: Int                           // 0-based

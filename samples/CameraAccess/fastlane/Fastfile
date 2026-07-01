@@ -13,25 +13,34 @@ platform :ios do
 
     setup_ci
 
+    app_identifier = "com.xrcc.retrace.ios.v1"
+
     match(
       type: "appstore",
       readonly: true,
-      app_identifier: "com.xrcc.retrace.ios.v1"
+      app_identifier: app_identifier
     )
+
+    # Don't hardcode the profile name: match may append a numeric suffix
+    # (e.g. "... 1782854476") when the canonical name is already taken on the
+    # Dev Portal by a stale profile. Use whatever match actually installed.
+    profile_name = ENV["sigh_#{app_identifier}_appstore_profile-name"]
+    UI.user_error!("Could not resolve provisioning profile name from match") if profile_name.to_s.empty?
+    UI.message("Using provisioning profile: #{profile_name}")
 
     update_code_signing_settings(
       path: "CameraAccess.xcodeproj",
       use_automatic_signing: false,
       team_id: "V56DG94ZL5",
-      bundle_identifier: "com.xrcc.retrace.ios.v1",
+      bundle_identifier: app_identifier,
       code_sign_identity: "Apple Distribution",
-      profile_name: "match AppStore com.xrcc.retrace.ios.v1",
+      profile_name: profile_name,
       targets: ["CameraAccess"]
     )
 
     increment_build_number(
       build_number: latest_testflight_build_number(
-        app_identifier: "com.xrcc.retrace.ios.v1"
+        app_identifier: app_identifier
       ) + 1,
       xcodeproj: "CameraAccess.xcodeproj"
     )
@@ -44,7 +53,7 @@ platform :ios do
       clean: true,
       export_options: {
         provisioningProfiles: {
-          "com.xrcc.retrace.ios.v1" => "match AppStore com.xrcc.retrace.ios.v1"
+          app_identifier => profile_name
         }
       }
     )

@@ -148,7 +148,7 @@ Record a procedure end-to-end from the glasses or the iPhone, review the raw cap
 - **Discover** — all procedures from the server.
 - **Library** — saved + in-progress procedures, tracked locally via `LocalProgressStore`.
 - **Progress** — session history (completed / abandoned / in-progress).
-- **Profile** — voice picker with audio previews fetched from the server (`/api/learner/voices`), plus a single **Active Monitoring** toggle (`activeMonitoringEnabled`). Active = the coaching VM arms the `[check]` heartbeat, the AI watches for mistakes and auto-advances on visual completion; Passive = no heartbeat, fully reactive, verbal-only. The single toggle drives both wire flags (`active_monitoring` + `auto_advance`, always equal) in the `/api/learner/session/start` body; the heartbeat itself is gated in `CoachingSessionViewModel.onConnectedExtra()`.
+- **Profile** — voice picker with audio previews fetched from the server (`/api/learner/voices`), plus a single **Active Monitoring** toggle (`activeMonitoringEnabled`). Active = the coaching VM polls the server-side verification oracle (posts a camera frame to `/verify` on a ~4s timer), which drives visual auto-advance and error interjection; Passive = no polling, fully reactive, verbal-only. The single toggle drives both wire flags (`active_monitoring` + `auto_advance`, always equal) in the `/api/learner/session/start` body; the poll loop is armed/gated in `CoachingSessionViewModel.onConnectedExtra()`.
 - **Coaching** — the headline flow. Gemini Live voice coaching with PiP reference-clip overlay, activity feed (learner transcripts, AI replies, tool calls), mute, and live connection status.
 - **Troubleshoot** (`Views/Troubleshoot/`) — Parallel Live session backed by `/api/troubleshoot/*`. `TroubleshootSessionView` + `DiagnosticSessionViewModel` orchestrate the diagnose-then-coach flow: user describes a broken product, Gemini issues `identify_product` → `confirm_identification`, then `search_procedures`; on no-match the model calls `web_search_for_fix` (returns a procedure with cited sources) and finally `handoff_to_learner` to spawn a normal coaching session. Includes `DiagnosticPhaseBar`, `DiagnosticResolutionPanel`, `ManualUploadSheet`, `TroubleshootConfirmOverlay`, `TroubleshootPageHandler`, and HUD `Pages/`.
 
@@ -206,7 +206,8 @@ The HUD reads `HandGestureService.$state` to drive focus rings, the recede-and-a
 - **Send gate** — per-buffer gate with three inputs: mic muted, a pending tool call, or Gemini not ready. Logged only on OPEN / CLOSED transitions, not per buffer.
 - **Session resumption** — persists `sessionResumptionUpdate.new_handle`. On `goAway` (~60 s warning) or socket error, the view model mints a handle-baked token via `POST /api/learner/session/{id}/token?handle=...`, reconnects, waits for `setupComplete`, then injects `GET /api/learner/session/{id}/context-summary` as a user turn to re-orient the model on the real current step.
 - **Barge-in** — `serverContent.interrupted` triggers a playback buffer flush via `AudioSessionManager.clearPlaybackBuffer(reason: "barge-in")` so the learner doesn't hear the stale reply continuing.
-- **Tool calls** — `json.toolCall.functionCalls[]` → `onToolCall(id, name, args)`. The VM forwards to the server via `POST /api/learner/session/{id}/tool-call`, unwraps `{result: {...}}`, updates local state (step index, PiP toggle, completion), and sends a `toolResponse` back to Gemini.
+- **Tool calls** — `json.toolCall.functionCalls[]` → `onToolCall(id, name, args)`. The VM forwards to the server via `POST /api/learner/session/{id}/tool-call`, unwraps `{result: {...}}`, updates local state (step index, PiP toggle, completion), and sends a `toolResponse` back to Gemini. `advance_step` here is **verbal-only** (learner said "done").
+- **Visual advance + interjection are out-of-band, not tool calls.** `CoachingSessionViewModel.runOraclePoll()` posts the latest camera frame to `/api/learner/session/{id}/verify`; on an `advanced`/`completed`/`error` verdict it updates local state via `applyLearnerToolResult` and injects an `[ADVANCE]`/`[CORRECTION]` text turn into Live via `sendClientTextTurn`. Live never decides completion from the video itself.
 - **Pending tool-call set** — a `Set<String>` of in-flight tool call ids (not a single `Optional<String>`). If Gemini ever emits multiple function calls in one `toolCall` frame, the audio/video send gate stays closed until the last one completes.
 - **Context growth observability** — logs every crossed 10k band of `usageMetadata.totalTokenCount`. Drops >30k between samples are flagged as server-side context compression firing (100k → 40k).
 
@@ -227,7 +228,7 @@ There are **two parallel lens surfaces**, both driven off the same per-flow view
 2. **Real native lens** — actual `MWDATDisplay` output on the glasses, via a `FlexBox`/`VideoPlayer` tree:
 
 ```
-per-flow VM ──► LensSession (Services/Lens, dispatcher; @AppStorage("lensOutputEnabled")-gated)
+per-flow VM ──► LensSession (Services/Lens, dispatcher; pass-through to the coordinator, no toggle gate)
                    │
                    ▼
             *LensRenderer  (Coaching / Expert / Troubleshoot, in Views/RayBanHUD/Native/Renderers)
@@ -239,9 +240,9 @@ per-flow VM ──► LensSession (Services/Lens, dispatcher; @AppStorage("lensO
             DeviceSessionManager  (consumer "lens")
 ```
 
-- `LensDisplayCoordinator` is the **`"lens"` Display consumer** of `DeviceSessionManager`. With the `deviceSessionManagerEnabled` debug toggle ON it calls `acquire(consumerLabel: "lens", requirements: .requiresDisplay)` + `session.addDisplay()`, sharing one `DeviceSession` with the camera consumer (`"gemini-live"`); OFF it falls back to inline `wearables.createSession`. The DSM consumers in use are `"expert"`, `"gemini-live"`, and `"lens"`.
+- `LensDisplayCoordinator` is the **`"lens"` Display consumer** of `DeviceSessionManager`. It unconditionally calls `acquire(consumerLabel: "lens", requirements: .requiresDisplay)` + `session.addDisplay()`, sharing one `DeviceSession` with the camera consumer (`"gemini-live"`). The DSM consumers in use are `"expert"`, `"gemini-live"`, and `"lens"`; DSM is always on and is the sole caller of `wearables.createSession` (no inline fallback).
 - Support types in `Views/RayBanHUD/Native/`: `LensIconMap` (SF Symbol → DAT 0.7's fixed 127-icon set), `LensImageURL` (HTTPS URIs for `MWDATDisplay.Image`/`VideoPlayer`, reads `ServerEndpoint` — the lens can't take raw frames, so it pulls server URLs like the `/api/clips/.../step_n.jpg` poster), `LensSnapshot` (Equatable value snapshots so `.removeDuplicates()` cuts BT traffic), `LensComponents`.
-- **Both native paths are OFF by default**, behind the `lensOutputEnabled` + `deviceSessionManagerEnabled` toggles in **Server Settings → Debug**. `Info.plist`'s `MWDAT.DAMEnabled = true` is load-bearing — without it `MWDATDisplay.capability.start()` silently no-ops.
+- **Both native paths are always on** (the `lensOutputEnabled` + `deviceSessionManagerEnabled` debug toggles were removed). `LensSession.send` forwards every send and no-ops safely when no Display device is attached. `Info.plist`'s `MWDAT.DAMEnabled = true` is load-bearing — without it `MWDATDisplay.capability.start()` silently no-ops.
 
 ## Project Layout
 
@@ -267,17 +268,17 @@ samples/CameraAccess/
 │   ├── Models/
 │   │   ├── CaptureTransport.swift     # .glasses | .iPhone
 │   │   ├── DiagnosticModels.swift     # Codable mirrors of /api/troubleshoot (session, state, handoff, manual upload/status, candidate procedure, diagnostic log entry)
-│   │   └── ProcedureModels.swift      # Codable mirrors of server models (procedures, steps, session, voices, SessionRecord)
+│   │   └── ProcedureModels.swift      # Codable mirrors of server models (procedures, steps incl. visualVerifiability, session, voices, SessionRecord) + VerifyResponse (oracle verdict)
 │   ├── Services/
 │   │   ├── BonjourDiscovery.swift     # NWBrowser for _retrace._tcp; caches serverBaseURL
 │   │   ├── ServerEndpoint.swift       # 4-mode backend resolver (.auto/.local/.cloud/.custom) + compiled-in cloud URL; mirrors result to UserDefaults["serverBaseURL"]
 │   │   ├── GeminiLiveService.swift    # Direct WebSocket, binary-frame JSON sniffing, resumption, barge-in, tool plumbing
 │   │   ├── GeminiTokenManager.swift   # actor — force-refresh with optional resumption handle, concurrent-caller dedup
 │   │   ├── LocalProgressStore.swift   # Saved procedures + session history (UserDefaults)
-│   │   ├── ProcedureAPIService.swift  # REST client for /api/procedures and /api/learner
+│   │   ├── ProcedureAPIService.swift  # REST client for /api/procedures and /api/learner (incl. verifyStep — multipart camera frame → VerifyResponse)
 │   │   ├── CompletionFeedback.swift / WorkflowPlaybackAudioSession.swift
 │   │   ├── Lens/                      # On-glasses MWDATDisplay rendering — see "Lens (on-glasses Display) subsystem" below
-│   │   │   ├── LensSession.swift          # Top-level dispatcher; @AppStorage("lensOutputEnabled")-gated
+│   │   │   ├── LensSession.swift          # Top-level dispatcher; pass-through to coordinator (no toggle gate)
 │   │   │   ├── LensFlow.swift             # enum: .idle/.coaching/.troubleshoot/.expert/.handoffToPhone
 │   │   │   └── LensRendererProtocol.swift
 │   │   └── VoicePreviewPlayer.swift
@@ -292,9 +293,9 @@ samples/CameraAccess/
 │   │   ├── StreamSessionViewModel.swift       # glasses stream preview
 │   │   ├── IPhoneExpertRecordingViewModel.swift
 │   │   ├── IPhoneCoachingCameraSource.swift
-│   │   ├── GeminiLiveSessionBase.swift        # Shared base — token lifecycle, reconnect-on-goAway, setup-complete gate, JPEG frame throttle (videoMinInterval 1.0s / videoJpegQuality 0.85), pendingToolCallIds, cameraLifecycleTask. Used by Coaching + Diagnostic VMs.
+│   │   ├── GeminiLiveSessionBase.swift        # Shared base — token lifecycle, reconnect-on-goAway, setup-complete gate, JPEG frame throttle (videoMinInterval 1.0s / videoJpegQuality 0.85), `onEncodedFrame(_:)` hook (fires per throttled JPEG so subclasses can cache the latest frame for the oracle), pendingToolCallIds, cameraLifecycleTask. Used by Coaching + Diagnostic VMs.
 │   │   ├── LensDisplayCoordinator.swift       # Owns the DAT Display capability (the "lens" DeviceSessionManager consumer); lazy-attach, pendingAction queue, requiresDATAppUpdate. See Lens subsystem below.
-│   │   ├── CoachingSessionViewModel.swift     # the big one — Gemini Live orchestration, transport switch, transcripts, tool calls, resumption
+│   │   ├── CoachingSessionViewModel.swift     # the big one — Gemini Live orchestration, transport switch, transcripts, tool calls, resumption. `runOraclePoll()` (on the ~4s timer, gated by activeMonitoring + canSendHeartbeatNow) posts `lastFrameJPEG` to `/verify`; on advanced/completed reuses `applyLearnerToolResult` for local state and injects `[ADVANCE]`, on error injects `[CORRECTION]`, via `service.sendClientTextTurn`.
 │   │   ├── DiagnosticSessionViewModel.swift   # Troubleshoot-mode Live session. Forwards tool calls to /api/troubleshoot/*; on handoff_to_learner, transitions into a fresh coaching session.
 │   │   ├── DiscoverViewModel.swift
 │   │   ├── LibraryViewModel.swift
@@ -432,6 +433,6 @@ When you ship a new pattern, **update the doc** so it stays authoritative.
 - **Don't reuse ephemeral tokens.** Google documents `uses=1`. Every retry and resumption path mints a new one. If an initial handshake fails, call `tokenManager.forceRefresh()` before retry.
 - **Teardown order in `stopGeminiLiveSession` matters.** Close send gate → drop Combine subs → stop audio capture → disconnect Gemini → null the service. Any other order causes "notConnected" spam or a racy `onAudioData` into a deallocated manager.
 - **Room-tone on mic start.** The first few mic buffers can be silent — `AudioSessionManager` has diagnostics for this. If you see "silent mic" warnings, check `AudioSessionMode` is correct for the transport.
-- **JPEG sent from glasses path is driven off the DAT video publisher.** Each frame is encoded straight from the pixel buffer via `CIContext.jpegRepresentation(...)` (no `UIImage` round-trip) at `videoJpegQuality = 0.85`, throttled to `videoMinInterval = 1.0 s` (≈1 fps) — both constants live on `GeminiLiveSessionBase`. Re-run the token-budget math before changing the interval or quality.
+- **JPEG sent from glasses path is driven off the DAT video publisher.** Each frame is encoded straight from the pixel buffer via `CIContext.jpegRepresentation(...)` (no `UIImage` round-trip) at `videoJpegQuality = 0.85`, throttled to `videoMinInterval = 1.0 s` (≈1 fps) — both constants live on `GeminiLiveSessionBase`. Re-run the token-budget math before changing the interval or quality. The same throttled frame is also handed to `onEncodedFrame(_:)`, which `CoachingSessionViewModel` caches as `lastFrameJPEG` and posts to the `/verify` oracle — so there's no second camera tap.
 - **HUD confirm registrations are token-stamped.** `HUDHoverCoordinator.registerConfirm` returns a `UUID`; `unregisterConfirm(id:token:)` is gated on it. SwiftUI fires the new view's `.onAppear` before the old view's `.onDisappear` during page transitions, so an unkeyed unregister would wipe the new page's freshly-installed closure whenever two pages share a `HUDControl` id (e.g. `.diagnosticToggleMute` / `.diagnosticExit` on every Troubleshoot page). Failure mode is asymmetric and easy to miss: touch tap keeps working (it captures `onConfirm` directly via `.onTapGesture`) while pinch-select / voice-select silently no-ops on every page after the first. If you ever stand up a parallel id-keyed registry, mirror the token pattern.
 - **HUD handler-stack pushes are token-stamped too.** `HUDHoverCoordinator.push` returns a `UUID`; `pop(token:)` is a no-op for stack removal *and* for `hovered` re-anchoring unless that token is currently topmost. Same lifecycle ordering means an outgoing page's pop can race an incoming overlay's push: without the topmost guard, the page's pop stomps the overlay's freshly-set `hovered` (e.g. `.confirmIdentification`) and pinch-select fires whatever the page had selected before the overlay opened (`.diagnosticToggleMute`). Same asymmetric failure as the confirm-registry version — touch tap is fine, pinch / voice select goes to the wrong control. The `.hudInputHandler { … }` modifier is the only call-site of `push` / `pop`; preserve that contract instead of letting overlays hand-roll `.onAppear { hovered = … }`.

@@ -68,10 +68,29 @@ final class LensDisplayCoordinator: ObservableObject {
   private var displayStateContinuation: AsyncStream<DisplayState>.Continuation?
   private var pendingAction: (() async -> Void)?
 
+  /// Single-flight send serialization. `capability.send(_:)` MUST NOT be called
+  /// concurrently: `send(_:)` is re-entered on the main actor while a prior send
+  /// is suspended inside `capability.send`, so awaiting inline would put two
+  /// sends in flight. Overlapping sends make the MWDATDisplay link throw
+  /// "Superseded by new display request" and — worse — WEDGE the link, so it
+  /// stops rendering new trees AND stops routing taps back (a frozen,
+  /// unresponsive lens). Renderers fire `Task { await send(...) }` freely; we
+  /// coalesce here. `queuedSend` holds the LATEST tree (latest-wins; stale
+  /// frames drop), `sendDrainTask` is the lone serial drainer.
+  private var queuedSend: ((Display) async -> Void)?
+  private var sendDrainTask: Task<Void, Never>?
+
   /// Cancellable for the manager's sessionErrors fan-out, when the
   /// manager path is active. Replaces the inline `sessionErrorTask`
   /// in that mode.
   private var managerSessionErrorsCancellable: AnyCancellable?
+
+  /// Cancellable for the manager's `sessionInvalidated` fan-out — a forced
+  /// out-of-band session drop (a sibling consumer detected the shared transport
+  /// is dead via frame starvation, which never reaches `errorStream`). When it
+  /// fires our `DeviceSession` is a corpse, so we detach rather than keep
+  /// rendering onto it.
+  private var managerSessionInvalidatedCancellable: AnyCancellable?
 
   /// Set true once an `attachToDisplay()` attempt fails with a reason
   /// that won't resolve without external state change (active glasses
@@ -109,6 +128,7 @@ final class LensDisplayCoordinator: ObservableObject {
     registrationTask?.cancel()
     displayStateTask?.cancel()
     managerSessionErrorsCancellable?.cancel()
+    managerSessionInvalidatedCancellable?.cancel()
   }
 
   // MARK: - Registration Observation
@@ -148,7 +168,15 @@ final class LensDisplayCoordinator: ObservableObject {
   /// the view is queued and fires once the display becomes ready.
   func send(_ view: some DisplayableView) async {
     if let display, isConnected {
-      await doSend(view, on: display)
+      // Serialize: stash the latest tree (latest-wins) and ensure ONE drainer
+      // runs. Do NOT `await doSend` inline — `send` re-enters on the main actor
+      // while a prior `doSend` is suspended in `capability.send`, so an inline
+      // await would overlap two sends and wedge the link (see `queuedSend`).
+      let sendableView = view
+      queuedSend = { [weak self] cap in await self?.doSend(sendableView, on: cap) }
+      if sendDrainTask == nil {
+        sendDrainTask = Task { [weak self] in await self?.drainSends() }
+      }
       return
     }
 
@@ -163,6 +191,20 @@ final class LensDisplayCoordinator: ObservableObject {
     if display == nil {
       await attachToDisplay()
     }
+  }
+
+  /// Serial send drainer. Sends one tree at a time so `capability.send` is never
+  /// called concurrently. Re-reads `display`/`isConnected` each iteration so a
+  /// teardown mid-drain stops us before sending to a stopping/stopped capability
+  /// (preserves the WARP-drain ordering — we never call `send` once the link is
+  /// going away). Exits when the queue is empty or the link is gone, then nils
+  /// itself so the next `send(_:)` restarts it.
+  private func drainSends() async {
+    while let next = queuedSend, let cap = display, isConnected {
+      queuedSend = nil
+      await next(cap)
+    }
+    sendDrainTask = nil
   }
 
   func clearSessionStartFailure() {
@@ -213,6 +255,12 @@ final class LensDisplayCoordinator: ObservableObject {
       Task { @MainActor [weak self] in
         guard let self else { return }
         self.handleSessionError(error)
+      }
+    }
+    managerSessionInvalidatedCancellable = manager.sessionInvalidated.sink { [weak self] reason in
+      Task { @MainActor [weak self] in
+        guard let self else { return }
+        await self.handleSessionInvalidated(reason)
       }
     }
 
@@ -302,6 +350,7 @@ final class LensDisplayCoordinator: ObservableObject {
             self.isConnected = false
           case .stopped:
             self.isConnected = false
+            self.queuedSend = nil
             self.stateListenerToken = nil
             self.displayStateContinuation?.finish()
             self.displayStateContinuation = nil
@@ -346,6 +395,8 @@ final class LensDisplayCoordinator: ObservableObject {
     // The manager's session-error fan-out subscription for this attach.
     managerSessionErrorsCancellable?.cancel()
     managerSessionErrorsCancellable = nil
+    managerSessionInvalidatedCancellable?.cancel()
+    managerSessionInvalidatedCancellable = nil
 
     // Release the DeviceSession. The manager owns it, so drop our local
     // ref BEFORE telling the manager — if the manager decides to stop the
@@ -356,6 +407,11 @@ final class LensDisplayCoordinator: ObservableObject {
 
     isConnected = false
     pendingAction = nil
+    // Drop any tree still queued for the (now gone) link. The drainer, if
+    // running, exits on its next `display`/`isConnected` re-check. We do NOT
+    // cancel `sendDrainTask` here — it may be suspended inside `capability.send`
+    // and cancelling would race teardown; letting it drain naturally is safe.
+    queuedSend = nil
   }
 
   private func handleSessionError(_ error: DeviceSessionError) {
@@ -363,5 +419,14 @@ final class LensDisplayCoordinator: ObservableObject {
     requiresDATAppUpdate = error == .datAppOnTheGlassesUpdateRequired
     didFailToStartSession = true
     errorMessage = "DeviceSessionError.\(error): \(error.localizedDescription)"
+  }
+
+  /// The shared session was force-invalidated out of band (a sibling consumer
+  /// detected the transport is dead). Our `DeviceSession` is now a corpse —
+  /// detach the display capability instead of pumping `send`s into a dead link.
+  /// A subsequent renderer `send` will lazily re-attach via a fresh session.
+  private func handleSessionInvalidated(_ reason: String) async {
+    print("[LensDisplayCoordinator] session invalidated → \(reason); detaching display")
+    await detachFromDisplay()
   }
 }

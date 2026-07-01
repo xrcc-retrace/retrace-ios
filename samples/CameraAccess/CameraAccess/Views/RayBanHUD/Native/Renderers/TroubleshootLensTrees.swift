@@ -112,7 +112,7 @@ enum TroubleshootLensTrees {
       alignment: .start,
       crossAlignment: .stretch
     ) {
-      LensComponents.phaseSegments(activeIndex: 0)
+      LensComponents.phaseHeader(icon: .circleHandle, title: "Identify")
       LensComponents.cardPanel(spacing: 8, padding: 14) {
         Text("Show me what's broken", style: .heading, color: .primary)
         Text("Or describe it out loud — say or show the device.", style: .body, color: .secondary)
@@ -138,7 +138,7 @@ enum TroubleshootLensTrees {
       alignment: .start,
       crossAlignment: .stretch
     ) {
-      LensComponents.phaseSegments(activeIndex: 1)
+      LensComponents.phaseHeader(icon: .bug, title: "Diagnose")
       // Product chip — the identified device carried into diagnose, mirroring
       // the phone HUD's yellow chip (lens can't fill yellow, so it's a `.card`
       // chip). `.alignSelf(.center)` makes it a compact centered pill (it would
@@ -168,21 +168,20 @@ enum TroubleshootLensTrees {
     isMuted: Bool,
     animFrame: Int
   ) -> FlexBox {
-    // Icons are limited to DAT's fixed set; pick glyphs that render solidly
-    // (the old `.metaAi` / `.eye` rendered as faint/ambiguous blobs). `.clock`
-    // doubles as the synthesizing "this takes a moment" cue.
-    let (iconName, title, detail): (IconName, String, String?) = {
+    // The phase header carries the (small) icon now; the status card is just
+    // the live title + detail per narration sub-state.
+    let (title, detail): (String, String?) = {
       switch narration {
       case .searchingLibrary:
-        return (.nineSquaresGrid, "Searching your library", "Checking your saved procedures.")
+        return ("Searching your library", "Checking your saved procedures.")
       case .libraryMissed:
-        return (.exclamationCircle, "No procedure found in your library.", "Looking online next.")
+        return ("No procedure found in your library.", "Looking online next.")
       case .searchingWeb:
-        return (.globeWesternHemisphere, "Searching online", "Reddit, iFixit, repair forums.")
+        return ("Searching online", "Reddit, iFixit, repair forums.")
       case .synthesizing(let n):
-        return (.clock, "Synthesizing the procedure", "Found \(n) source\(n == 1 ? "" : "s") on Reddit, iFixit, repair forums.")
+        return ("Synthesizing the procedure", "Found \(n) source\(n == 1 ? "" : "s") on Reddit, iFixit, repair forums.")
       case .foundFix(let n):
-        return (.checkmarkCircle, "Solution found", "From \(n) online source\(n == 1 ? "" : "s").")
+        return ("Solution found", "From \(n) online source\(n == 1 ? "" : "s").")
       }
     }()
 
@@ -202,15 +201,13 @@ enum TroubleshootLensTrees {
       alignment: .start,
       crossAlignment: .stretch
     ) {
-      LensComponents.phaseSegments(activeIndex: 2)
+      LensComponents.phaseHeader(icon: .lightBulb, title: "Find a fix", subtitle: "Library and web")
       LensComponents.cardPanel(spacing: 8, padding: 14) {
-        // Animated airplane during the online search; static stage icon
-        // otherwise. A lone `Icon` as a direct column child renders huge on the
-        // lens (fills the card, text overlaps it); `iconRow` keeps it inline.
+        // Animated paper-airplane track during the online search; the brief
+        // states are text-only (the header carries the small phase icon, so
+        // there's no second oversized status icon in the card).
         if animated {
           LensComponents.airplaneTrack(frame: animFrame)
-        } else {
-          LensComponents.iconRow(iconName)
         }
         Text(title, style: .heading, color: .primary)
         if let detail {
@@ -262,7 +259,7 @@ enum TroubleshootLensTrees {
       alignment: .start,
       crossAlignment: .stretch
     ) {
-      LensComponents.phaseSegments(activeIndex: 2)
+      LensComponents.phaseHeader(icon: .lightBulb, title: "Find a fix", subtitle: "Library and web")
       LensComponents.cardPanel(spacing: 8, padding: 14) {
         Text(procedureTitle, style: .heading, color: .primary)
         if !sourceText.isEmpty {
@@ -294,10 +291,8 @@ enum TroubleshootLensTrees {
       alignment: .start,
       crossAlignment: .stretch
     ) {
-      LensComponents.phaseSegments(activeIndex: 2)
+      LensComponents.phaseHeader(icon: .lightBulb, title: "Find a fix", subtitle: "Library and web")
       LensComponents.cardPanel(spacing: 8, padding: 14) {
-        // Small top-left icon (see `iconRow` — a lone Icon renders huge).
-        LensComponents.iconRow(.exclamationCircle)
         Text("Nothing found", style: .heading, color: .primary)
         Text(
           "Couldn't match a saved procedure or synthesize one from the web. Try uploading a manual.",
@@ -357,8 +352,8 @@ enum TroubleshootLensTrees {
       // all times. Default focus = "That's it" (first tappable in tree order).
       // If this reads well on-glass, roll the same pattern out to the
       // resolved / no-solution / exit buttons.
-      Button(label: "That's it", style: .primary, onClick: cb.onConfirmIdentification)
-      Button(label: "Try again", style: .secondary, onClick: cb.onRequestReIdentify)
+      Button(label: "That's it", style: .primary, iconName: .checkmark, onClick: cb.onConfirmIdentification)
+      Button(label: "Try again", style: .secondary, iconName: .twoArrowsClockwise, onClick: cb.onRequestReIdentify)
     }
     .padding(12)
   }

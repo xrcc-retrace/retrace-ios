@@ -46,16 +46,6 @@ struct DebugSettingsSection: View {
   /// procedure review screen exposes a reference-photo picker and the
   /// Coaching reference panel can show that image alongside the step clip.
   @AppStorage("referenceImageEnabled") private var referenceImageEnabled: Bool = false
-  /// When true, every `LensSession.send(_:)` reaches the on-glasses
-  /// display. When false (default), all sends silently no-op so the
-  /// existing SwiftUI emulator is the only visible HUD. Flip on when
-  /// iterating on native lens output during development.
-  @AppStorage("lensOutputEnabled") private var lensOutputEnabled: Bool = false
-  /// Experiment: when true, the glasses camera Stream is stopped while a
-  /// reference clip plays on the lens (and restarted when it ends), to free the
-  /// Bluetooth link for the clip. Default off = current behavior. Pair with the
-  /// `[LensClip] first frame after Xms` log to A/B whether it helps playback.
-  @AppStorage("pauseCameraDuringClip") private var pauseCameraDuringClip: Bool = false
 
   @EnvironmentObject private var lensSession: LensSession
   @State private var smokeTestResult: String?
@@ -116,22 +106,6 @@ struct DebugSettingsSection: View {
       .background(Color.surfaceRaised)
       .cornerRadius(Radius.md)
 
-      Toggle(isOn: $pauseCameraDuringClip) {
-        VStack(alignment: .leading, spacing: 2) {
-          Text("Pause camera during clip (experiment)")
-            .font(.retraceCallout)
-            .foregroundColor(.textPrimary)
-          Text("While a reference clip plays on the glasses lens, stop the glasses camera stream so its frames stop competing for the Bluetooth link, then restart it when the clip ends. Glasses only. Watch the “[LensClip] first frame after Xms” log with this off vs on to see if it helps.")
-            .font(.retraceCaption1)
-            .foregroundColor(.textTertiary)
-            .fixedSize(horizontal: false, vertical: true)
-        }
-      }
-      .tint(.appPrimary)
-      .padding(14)
-      .background(Color.surfaceRaised)
-      .cornerRadius(Radius.md)
-
       Toggle(isOn: $referenceImageEnabled) {
         VStack(alignment: .leading, spacing: 2) {
           Text("Reference image upload")
@@ -148,26 +122,10 @@ struct DebugSettingsSection: View {
       .background(Color.surfaceRaised)
       .cornerRadius(Radius.md)
 
-      Toggle(isOn: $lensOutputEnabled) {
-        VStack(alignment: .leading, spacing: 2) {
-          Text("Send to glasses lens")
-            .font(.retraceCallout)
-            .foregroundColor(.textPrimary)
-          Text("Mirrors every page to the actual Meta Ray-Ban Display lens via the DAT SDK display capability. The phone-side SwiftUI emulator keeps running either way; this is purely additive. Off by default while the native lens layer is under development.")
-            .font(.retraceCaption1)
-            .foregroundColor(.textTertiary)
-            .fixedSize(horizontal: false, vertical: true)
-        }
-      }
-      .tint(.appPrimary)
-      .padding(14)
-      .background(Color.surfaceRaised)
-      .cornerRadius(Radius.md)
-
       CustomButton(
         title: lensSession.coordinator.isSending ? "Sending…" : "Send test tree to glasses",
         style: .secondary,
-        isDisabled: lensSession.coordinator.isSending || !lensOutputEnabled
+        isDisabled: lensSession.coordinator.isSending
       ) {
         Task {
           await sendSmokeTestTree()

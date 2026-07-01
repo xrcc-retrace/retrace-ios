@@ -157,6 +157,21 @@ struct StepEditView: View {
             placeholder: "Describe a visible mistake the coach should catch"
           )
 
+          // Visual verifiability (read-only) — how reliably the server-side
+          // oracle can confirm this step's end-state from the camera and
+          // auto-advance. Set at extraction time; not editable here.
+          HStack(spacing: Spacing.sm) {
+            Image(systemName: "eye")
+              .font(.system(size: 11, weight: .semibold))
+            Text("Auto-advance: \(verifiabilityLabel)")
+              .font(.retraceCaption1)
+          }
+          .foregroundColor(.textSecondary)
+          .padding(.horizontal, Spacing.md)
+          .padding(.vertical, Spacing.sm)
+          .background(Color.surfaceRaised)
+          .clipShape(Capsule())
+
           // Error
           if let error = errorMessage {
             Text(error)
@@ -205,7 +220,8 @@ struct StepEditView: View {
         tips: cleanTips,
         warnings: cleanWarnings,
         errorCriteria: cleanErrorCriteria,
-        clipUrl: step.clipUrl
+        clipUrl: step.clipUrl,
+        visualVerifiability: step.visualVerifiability
       )
       // Dismiss before propagating the merge. If we mutate the parent's
       // `steps` array first, the parent re-renders and the NavigationLink
@@ -241,6 +257,16 @@ struct StepEditView: View {
       errorMessage = error.localizedDescription
     }
     isSaving = false
+  }
+
+  /// Human-readable label for `visualVerifiability`. Maps the server's
+  /// `none` to "Verbal-only"; otherwise capitalizes the raw value
+  /// ("reliable" → "Reliable", "marginal" → "Marginal").
+  private var verifiabilityLabel: String {
+    switch step.visualVerifiability.lowercased() {
+    case "none": return "Verbal-only"
+    default: return step.visualVerifiability.capitalized
+    }
   }
 
   private func formatTimestamp(_ seconds: Double) -> String {

@@ -34,6 +34,7 @@ struct CameraAccessApp: App {
   @StateObject private var deviceSessionManager: DeviceSessionManager
   @StateObject private var lensDisplayCoordinator: LensDisplayCoordinator
   @StateObject private var lensSession: LensSession
+  @StateObject private var glassesNavCoordinator: GlassesNavigationCoordinator
 
   init() {
     RetraceNavBarAppearance.install()
@@ -103,7 +104,15 @@ struct CameraAccessApp: App {
     self._wearablesViewModel = StateObject(wrappedValue: WearablesViewModel(wearables: wearables, sessionManager: manager))
     let coordinator = LensDisplayCoordinator(wearables: wearables, sessionManager: manager)
     self._lensDisplayCoordinator = StateObject(wrappedValue: coordinator)
-    self._lensSession = StateObject(wrappedValue: LensSession(coordinator: coordinator))
+    let lens = LensSession(coordinator: coordinator)
+    self._lensSession = StateObject(wrappedValue: lens)
+    self._glassesNavCoordinator = StateObject(
+      wrappedValue: GlassesNavigationCoordinator(
+        lensSession: lens,
+        api: ProcedureAPIService(),
+        wearables: wearables
+      )
+    )
   }
 
   var body: some Scene {
@@ -113,6 +122,7 @@ struct CameraAccessApp: App {
         .environmentObject(lensSession)
         .environmentObject(lensDisplayCoordinator)
         .environmentObject(deviceSessionManager)
+        .environmentObject(glassesNavCoordinator)
         .preferredColorScheme(.dark)
         .alert("Error", isPresented: $wearablesViewModel.showError) {
           Button("OK") {
