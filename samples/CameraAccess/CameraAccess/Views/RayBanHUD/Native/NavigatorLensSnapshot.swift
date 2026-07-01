@@ -75,7 +75,13 @@ struct NavigatorLensSnapshot: Equatable {
   let listPage: Int            // 0-based
   let listPageCount: Int
 
-  // MARK: Learner hub — category filter chips
+  /// Which slice of the Learner list is showing. Local mirror of
+  /// `NavigatorViewModel.ListTab` — no VM types leak into the snapshot.
+  enum ListTab: Equatable { case saved, all }
+
+  // MARK: Learner hub — Saved/All tab + category filter chips
+  let listTab: ListTab
+  let savedCount: Int
   let categories: [String]
   let selectedCategory: String
 

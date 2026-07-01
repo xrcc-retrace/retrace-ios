@@ -13,6 +13,17 @@ class LocalProgressStore: ObservableObject {
     loadHistory()
   }
 
+  /// Re-reads persisted state from `UserDefaults`. There is no single shared
+  /// instance of this store — each screen constructs its own — so a
+  /// long-lived instance (e.g. the glasses navigator's) can go stale relative
+  /// to writes made through a different instance (e.g. the phone Learner
+  /// tab's). Call this before reading saved/history state on a long-lived
+  /// instance.
+  func reload() {
+    loadSaved()
+    loadHistory()
+  }
+
   // MARK: - Bookmarks
 
   func toggleSaved(_ procedureId: String) {

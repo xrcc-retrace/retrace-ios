@@ -113,7 +113,7 @@ final class GlassesNavigationCoordinator: ObservableObject {
     self.lensSession = lensSession
     self.wearables = wearables
     self.sessionManager = sessionManager
-    self.navigatorVM = NavigatorViewModel(api: api)
+    self.navigatorVM = NavigatorViewModel(api: api, progressStore: LocalProgressStore())
     // Record on the lens delegates here so the coordinator owns the session
     // swap (navigator → expert recording → navigator).
     self.navigatorVM.onRecordRequested = { [weak self] in
