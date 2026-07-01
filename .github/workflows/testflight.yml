@@ -26,6 +26,13 @@ jobs:
       - name: Verify Xcode version
         run: xcodebuild -version
 
+      # Xcode 26 (latest-stable) ships the Metal compiler as a separately
+      # downloadable component that GitHub's macos runners no longer bundle.
+      # Without it, archiving DiamondLogoDither.metal fails with
+      # "cannot execute tool 'metal' due to missing Metal Toolchain".
+      - name: Download Metal Toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
+
       - name: Set up Ruby
         uses: ruby/setup-ruby@v1
         with:
