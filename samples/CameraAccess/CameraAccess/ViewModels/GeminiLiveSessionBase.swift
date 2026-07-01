@@ -192,6 +192,33 @@ class GeminiLiveSessionBase: ObservableObject {
   /// checks this so the resulting `.stopped` isn't surfaced as "Glasses stream dropped."
   var isCameraPausedForClip = false
 
+  // MARK: - Push-to-talk (walkie-talkie) — demo mode only
+
+  /// True while the mic is sending via push-to-talk (finger held, or latched on
+  /// by a quick tap). Observed by the Talk capsule for its engaged styling.
+  @Published var isTalkEngaged = false
+  /// A quick tap latches Talk ON until the next tap. Distinct from a momentary
+  /// hold, which stops on release.
+  private var isTalkLatched = false
+  private var talkPressStartedAt: Date?
+  /// Bumped on every press / scheduled close so a re-press cancels a pending
+  /// release "tail" (see `endTalkWithTail`).
+  private var talkCloseGeneration = 0
+
+  /// Subclass opt-in. Only Coaching shows a Talk button; Troubleshoot stays
+  /// always-listening even in demo mode.
+  var supportsPushToTalk: Bool { false }
+
+  /// Push-to-talk is active only for the iPhone Mac-route demo. Reads
+  /// UserDefaults directly (no `#if`) — the key is only ever written by the
+  /// DEBUG-only Settings toggle, so it stays false in Release ⇒ shipped
+  /// behavior is unchanged.
+  var isPushToTalkActive: Bool {
+    supportsPushToTalk
+      && transport == .iPhone
+      && UserDefaults.standard.bool(forKey: "debug.routeAudioToMacForDemo")
+  }
+
   // MARK: - Transcript coalescing
 
   var learnerTurnOpen = false
@@ -444,6 +471,18 @@ class GeminiLiveSessionBase: ObservableObject {
   /// mutations are safe.
   func handleToolCallExtras(name: String, args: [String: Any], result: [String: Any]) async {}
 
+  /// Whether a tool call should flush queued AI playback (`clearPlaybackBuffer`)
+  /// so a half-spoken reply doesn't continue over the next turn. Default `true`
+  /// — Coaching keeps this behavior unchanged in every state, including the
+  /// Mac-route demo. Troubleshoot overrides it to skip the flush in the
+  /// push-to-talk demo: it fires tool calls (identify/confirm/search) back-to-back
+  /// while the AI is still narrating, and with the mic gated closed by push-to-talk
+  /// there's no open-mic self-echo for the flush to defend against — so flushing on
+  /// every tool call only chops the AI's voice (and, in the AEC-off demo graph, can
+  /// leave the player stopped → total silence). Barge-in (line ~499) and the
+  /// Talk-button flush (line ~341) are unaffected.
+  var flushPlaybackOnToolCall: Bool { true }
+
   /// Audio-session mode for the current transport. Coaching picks
   /// `.coaching` with HFP glasses or `.coachingPhoneOnly` with iPhone.
   /// Default `.coachingPhoneOnly` works for iPhone-only modes.
@@ -490,12 +529,78 @@ class GeminiLiveSessionBase: ObservableObject {
   func setMuted(_ muted: Bool) {
     guard isMuted != muted else { return }
     isMuted = muted
-    isSendingAudio = !isMuted
+    recomputeSendGate()
     if isMuted {
       voiceStatus = "Muted"
       userInputPeak = 0
     } else if geminiConnectionState == .connected {
-      voiceStatus = "Listening"
+      voiceStatus = isTalkEngaged ? "Talking…" : idleListeningStatus
+    }
+  }
+
+  /// Single source of truth for the mic send gate. Normal mode: mute controls
+  /// everything. Push-to-talk mode: send only while Talk is engaged and not muted.
+  func recomputeSendGate() {
+    isSendingAudio = isPushToTalkActive ? (isTalkEngaged && !isMuted) : !isMuted
+  }
+
+  /// Status shown when connected, unmuted, and the AI isn't speaking.
+  var idleListeningStatus: String {
+    isPushToTalkActive ? "Tap or hold to talk" : "Listening"
+  }
+
+  // MARK: - Push-to-talk control (called from the Talk capsule's gestures)
+
+  /// Touch-down on Talk: open the mic and take the floor. No-op while muted
+  /// (Mute is a hard override) or when PTT isn't active.
+  func talkPressBegan() {
+    guard isPushToTalkActive, !isMuted else { return }
+    talkCloseGeneration += 1            // cancel any pending release tail
+    talkPressStartedAt = Date()
+    audioManager?.clearPlaybackBuffer(reason: "push-to-talk")  // interrupt AI, take floor
+    isTalkEngaged = true
+    recomputeSendGate()
+    voiceStatus = "Talking…"
+  }
+
+  /// Touch-up on Talk. A quick tap (<300 ms) toggles a latch; a longer hold is
+  /// momentary and stops on release.
+  func talkPressEnded() {
+    // No-op while muted (the matching press was also a no-op) or when PTT is off.
+    guard isPushToTalkActive, !isMuted else { return }
+    let held = talkPressStartedAt.map { Date().timeIntervalSince($0) } ?? 0
+    talkPressStartedAt = nil
+    if held < 0.3 {                     // quick tap → toggle latch
+      isTalkLatched.toggle()
+      if isTalkLatched {
+        isTalkEngaged = true
+        recomputeSendGate()
+        voiceStatus = "Talking…"
+        return
+      }
+    }
+    isTalkLatched = false
+    endTalk()                           // momentary release, or tap-to-unlatch
+  }
+
+  /// End the user's turn: keep the gate open a short tail so in-flight audio
+  /// flushes, then close it and send `audioStreamEnd` so Gemini's automatic VAD
+  /// finalizes the turn and replies immediately (just stopping the byte stream
+  /// is unreliable — auto VAD often never endpoints). A re-press bumps
+  /// `talkCloseGeneration` and cancels this close.
+  private func endTalk(_ tail: TimeInterval = 0.2) {
+    talkCloseGeneration += 1
+    let gen = talkCloseGeneration
+    voiceStatus = "…"
+    Task { @MainActor in
+      try? await Task.sleep(nanoseconds: UInt64(tail * 1_000_000_000))
+      guard self.talkCloseGeneration == gen else { return }  // re-engaged → abort
+      self.isTalkEngaged = false
+      self.recomputeSendGate()                               // stop sending audio
+      try? await self.geminiService?.sendAudioStreamEnd()    // force turn end → reply
+      if self.geminiConnectionState == .connected, !self.isMuted {
+        self.voiceStatus = self.idleListeningStatus
+      }
     }
   }
 
@@ -850,8 +955,8 @@ class GeminiLiveSessionBase: ObservableObject {
         self.isAISpeaking = false
         self.assistantTurnOpen = false
         self.learnerTurnOpen = false
-        if !self.isMuted {
-          self.voiceStatus = "Listening"
+        if !self.isMuted, !self.isTalkEngaged {
+          self.voiceStatus = self.idleListeningStatus
         }
         await self.onTurnCompleteExtra()
       }
@@ -926,6 +1031,10 @@ class GeminiLiveSessionBase: ObservableObject {
         try? await self.geminiService?.sendAudio(pcmData)
       }
     }
+
+    // In push-to-talk (demo) mode the session must start NOT sending — the mic
+    // opens only while the Talk button is engaged.
+    recomputeSendGate()
 
     // 6. Connect. Setup-complete flips state to .connected inside the service;
     // our observer (below) picks that up and gates the audio send path open.
@@ -1802,7 +1911,9 @@ class GeminiLiveSessionBase: ObservableObject {
 
     pendingToolCallIds.insert(id)
     pendingToolCallNames[id] = name
-    audioManager?.clearPlaybackBuffer(reason: "tool-call")
+    if flushPlaybackOnToolCall {
+      audioManager?.clearPlaybackBuffer(reason: "tool-call")
+    }
 
     let startedAt = Date()
     print("[GeminiLive] ▶ Tool call START name=\(name) id=\(id) args=\(args)")
@@ -1962,7 +2073,7 @@ class GeminiLiveSessionBase: ObservableObject {
         switch state {
         case .connected:
           self.isGeminiReady = true
-          self.voiceStatus = self.isMuted ? "Muted" : "Listening"
+          self.voiceStatus = self.isMuted ? "Muted" : self.idleListeningStatus
           print("[GeminiLive] Gemini Live connected")
           self.sendIntroSeedIfNeeded()
           // Subclasses that want a turnComplete-scheduled heartbeat rely on

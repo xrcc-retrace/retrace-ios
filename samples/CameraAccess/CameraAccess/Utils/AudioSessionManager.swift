@@ -225,8 +225,27 @@ class AudioSessionManager: ObservableObject {
 
   // MARK: - Audio Session
 
+  #if DEBUG
+  /// Debug-only Mac-route demo. When true, `.coachingPhoneOnly` stops forcing the
+  /// iPhone speaker (uses `.default` instead of `.voiceChat`, drops `.defaultToSpeaker`,
+  /// skips `overrideOutputAudioPort(.speaker)`) and disables VPIO/AEC, so Gemini
+  /// Live's output can leave the phone over the QuickTime-over-USB / HDMI virtual
+  /// route to a connected Mac. The mic side is handled by walkie-talkie push-to-talk
+  /// (`GeminiLiveSessionBase.isPushToTalkActive`), which closes the mic while the AI
+  /// speaks, so hardware AEC isn't needed. Same UserDefaults key the Settings toggle
+  /// writes; `nonisolated static` so both the main-actor and off-main config paths read it.
+  nonisolated static var routeAudioToMacForDemo: Bool {
+    UserDefaults.standard.bool(forKey: "debug.routeAudioToMacForDemo")
+  }
+  #endif
+
   func configureAudioSession() {
     let session = AVAudioSession.sharedInstance()
+    #if DEBUG
+    let demoRoute = (mode == .coachingPhoneOnly) && Self.routeAudioToMacForDemo
+    #else
+    let demoRoute = false
+    #endif
     do {
       switch mode {
       case .coaching:
@@ -254,10 +273,13 @@ class AudioSessionManager: ObservableObject {
       case .coachingPhoneOnly:
         // Full-duplex with AEC, forced to built-in mic + loudspeaker even when
         // HFP glasses are paired. The learner explicitly chose the iPhone transport.
+        // Demo route (`demoRoute`): `.default` mode + no `.defaultToSpeaker` so the
+        // output can take the Mac's QuickTime-USB / HDMI virtual route instead of
+        // being pinned to the phone loudspeaker.
         try session.setCategory(
           .playAndRecord,
-          mode: .voiceChat,
-          options: [.defaultToSpeaker]  // no HFP / A2DP
+          mode: demoRoute ? .default : .voiceChat,
+          options: demoRoute ? [] : [.defaultToSpeaker]  // no HFP / A2DP
         )
       case .recording:
         // Simplex capture. No `.voiceChat` (no AEC processing), no `.defaultToSpeaker`
@@ -289,10 +311,11 @@ class AudioSessionManager: ObservableObject {
       // until the user manually taps play. Activation-time option, not
       // deactivation-time — iOS associates it with the session lifecycle.
       try session.setActive(true, options: .notifyOthersOnDeactivation)
-      if mode == .coachingPhoneOnly {
+      if mode == .coachingPhoneOnly, !demoRoute {
         // Belt-and-suspenders: even with `.defaultToSpeaker`, an actively routed
         // HFP output could sneak through if the user paired glasses mid-session.
         // This override forces the loudspeaker for the life of this activation.
+        // Skipped in the DEBUG demo route so output can reach the Mac.
         try session.overrideOutputAudioPort(.speaker)
       }
       if mode == .coachingPhoneOnly || mode == .recordingPhoneOnly {
@@ -630,7 +653,12 @@ class AudioSessionManager: ObservableObject {
       if capturedMode == .coaching || capturedMode == .coachingPhoneOnly {
         let isBTHFPInput = AVAudioSession.sharedInstance().currentRoute.inputs
           .contains { $0.portType == .bluetoothHFP }
-        try node.setVoiceProcessingEnabled(!isBTHFPInput)
+        #if DEBUG
+        let demoRoute = (capturedMode == .coachingPhoneOnly) && Self.routeAudioToMacForDemo
+        #else
+        let demoRoute = false
+        #endif
+        try node.setVoiceProcessingEnabled(!isBTHFPInput && !demoRoute)
       } else {
         try node.setVoiceProcessingEnabled(false)
       }
@@ -678,7 +706,12 @@ class AudioSessionManager: ObservableObject {
             // returns success but `isRunning` flips false immediately.
             let isBTHFPInput = AVAudioSession.sharedInstance().currentRoute.inputs
               .contains { $0.portType == .bluetoothHFP }
-            try inputNode.setVoiceProcessingEnabled(!isBTHFPInput)
+            #if DEBUG
+            let demoRoute = (capturedMode == .coachingPhoneOnly) && Self.routeAudioToMacForDemo
+            #else
+            let demoRoute = false
+            #endif
+            try inputNode.setVoiceProcessingEnabled(!isBTHFPInput && !demoRoute)
           } else {
             try inputNode.setVoiceProcessingEnabled(false)
           }
@@ -783,7 +816,12 @@ class AudioSessionManager: ObservableObject {
     await Task.detached(priority: .userInitiated) { [inputNode = self.inputNode] in
       Self.configureSessionOffMain(mode: capturedMode, preferredGlassesNames: capturedNames)
       do {
-        if capturedMode == .coaching || capturedMode == .coachingPhoneOnly {
+        #if DEBUG
+        let demoRoute = (capturedMode == .coachingPhoneOnly) && Self.routeAudioToMacForDemo
+        #else
+        let demoRoute = false
+        #endif
+        if (capturedMode == .coaching || capturedMode == .coachingPhoneOnly), !demoRoute {
           try inputNode.setVoiceProcessingEnabled(true)
         } else {
           try inputNode.setVoiceProcessingEnabled(false)
@@ -825,6 +863,11 @@ class AudioSessionManager: ObservableObject {
     preferredGlassesNames: [String] = []
   ) {
     let session = AVAudioSession.sharedInstance()
+    #if DEBUG
+    let demoRoute = (mode == .coachingPhoneOnly) && routeAudioToMacForDemo
+    #else
+    let demoRoute = false
+    #endif
     do {
       switch mode {
       case .coaching:
@@ -834,10 +877,11 @@ class AudioSessionManager: ObservableObject {
           options: [.allowBluetoothHFP, .allowBluetoothA2DP, .defaultToSpeaker]
         )
       case .coachingPhoneOnly:
+        // Mirror the main-actor demo-route branch (see `configureAudioSession()`).
         try session.setCategory(
           .playAndRecord,
-          mode: .voiceChat,
-          options: [.defaultToSpeaker]
+          mode: demoRoute ? .default : .voiceChat,
+          options: demoRoute ? [] : [.defaultToSpeaker]
         )
       case .recording:
         // A2DP is invalid with `.record` (output-only profile); see the
@@ -859,7 +903,7 @@ class AudioSessionManager: ObservableObject {
       // sample bakes `.notifyOthersOnDeactivation` into activation so Music
       // resumes cleanly when we tear down.
       try session.setActive(true, options: .notifyOthersOnDeactivation)
-      if mode == .coachingPhoneOnly {
+      if mode == .coachingPhoneOnly, !demoRoute {
         try session.overrideOutputAudioPort(.speaker)
       }
       if mode == .coachingPhoneOnly || mode == .recordingPhoneOnly {
@@ -919,11 +963,19 @@ class AudioSessionManager: ObservableObject {
     if mode == .coaching || mode == .coachingPhoneOnly {
       let session = AVAudioSession.sharedInstance()
       let isBTHFPInput = session.currentRoute.inputs.contains { $0.portType == .bluetoothHFP }
-      let shouldUseVPIO = !isBTHFPInput
+      #if DEBUG
+      let demoRoute = (mode == .coachingPhoneOnly) && Self.routeAudioToMacForDemo
+      #else
+      let demoRoute = false
+      #endif
+      // VPIO/AEC also disabled for the Mac-route demo: the voice-processing IO unit
+      // pins output to call-audio routing, which won't take the QuickTime-USB route.
+      // Push-to-talk closes the mic while the AI speaks, so we don't need AEC.
+      let shouldUseVPIO = !isBTHFPInput && !demoRoute
       do {
         try inputNode.setVoiceProcessingEnabled(shouldUseVPIO)
         if !shouldUseVPIO {
-          print("[AudioSession] BT HFP input detected — disabling VPIO (known incompatibility with Display-glasses HFP unit; engine.start would silently stop)")
+          print("[AudioSession] VPIO disabled (BT-HFP input or Mac-route demo) — avoids Display-glasses HFP incompatibility / keeps demo output on the Mac route")
         }
       } catch {
         print("[AudioSession] ⚠ Failed to set voice processing enabled=\(shouldUseVPIO): \(error)")

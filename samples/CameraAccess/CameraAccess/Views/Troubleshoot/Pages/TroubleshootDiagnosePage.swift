@@ -12,6 +12,9 @@ struct TroubleshootDiagnosePage: RayBanHUDView {
   /// Focus-engine `.dismiss` → trigger the end-diagnostic confirmation
   /// alert. Owned by `TroubleshootSessionView`.
   let onDismiss: () -> Void
+  /// Demo flag — surfaces the walkie-talkie Talk capsule (push-to-talk) so
+  /// AI audio can route to a Mac without the mic echoing it back.
+  @AppStorage("debug.routeAudioToMacForDemo") private var routeAudioToMacForDemo = false
 
   var body: some View {
     VStack(spacing: 8) {
@@ -48,7 +51,11 @@ struct TroubleshootDiagnosePage: RayBanHUDView {
       muteControl: .diagnosticToggleMute,
       exitControl: .diagnosticExit,
       onToggleMute: { viewModel.toggleMute() },
-      onExit: onDismiss
+      onExit: onDismiss,
+      isPushToTalk: routeAudioToMacForDemo,
+      isTalkEngaged: viewModel.isTalkEngaged,
+      onTalkDown: { viewModel.talkPressBegan() },
+      onTalkUp: { viewModel.talkPressEnded() }
     )
   }
 
