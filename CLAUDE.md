@@ -54,7 +54,7 @@ The resolved value is mirrored back into `UserDefaults["serverBaseURL"]` for leg
 
 ### Mock device (no glasses required)
 
-Debug builds include `MockDeviceKit`. Use the in-app debug menu (shake-gesture overlay) to pair a simulated Ray-Ban Meta. XCUITests with `--ui-testing` auto-pair `MockRaybanMeta` with bundled `plant.mp4` / `plant.png` resources.
+Debug builds include `MockDeviceKit`. Use the in-app debug menu (shake-gesture overlay) to pair a simulated Ray-Ban Meta. XCUITests with `--ui-testing` auto-pair a mock via `pairGlasses(model: .rayBanMeta)` (0.8 API; returns `any MockGlasses` — `MockRaybanMeta` / `pairRaybanMeta()` were removed) with bundled `plant.mp4` / `plant.png` resources.
 
 ## TestFlight deployment
 
@@ -175,9 +175,11 @@ The HUD reads `HandGestureService.$state` to drive focus rings, the recede-and-a
 
 ### Glasses path
 
-- DAT SDK `MWDATCamera.Stream` via `wearables.createSession(deviceSelector:)` → `deviceSession.addStream(config: StreamConfiguration(...))` (0.7 API; `Stream` is a capability attached to the `DeviceSession`, not a top-level type — there's no public init).
+- DAT SDK `MWDATCamera.Stream` via `wearables.createSession(deviceSelector:)` → `deviceSession.addStream(config: StreamConfiguration(...))` (0.8 API; `Stream` is managed directly via the `DeviceSession`, not a top-level type — there's no public init).
 - `AutoDeviceSelector` picks the best paired device.
 - Audio flows through BT HFP.
+- **Video transport (DAT 0.8):** the SDK automatically acquires a WiFi link lease for high-bandwidth video when available, falling back to BT Classic. There is no API flag — the opt-in is `NSBonjourServices` containing `_bonjour._tcp` + a non-empty `NSLocalNetworkUsageDescription` + the `wifi-info` / `HotspotConfiguration` entitlements. If any of those are missing the SDK **silently** stays on BT.
+- **The WiFi "high link" is a WiFi Direct / SoftAP join, and video PAUSES during it.** Binary inspection of MWDATCore/MWDATCamera (`SoftAPNetworkJoiners`, `JoinWifiDirectGroupMessage`, `WifiSelector`, `ACDCLinkLease`; NEHotspotConfiguration via NetworkExtension) shows the link is a multi-second P2P join that fires shortly after stream start and on bandwidth jumps (e.g. record start). A multi-second frame gap with `Stream.state` stuck at `.streaming` is EXPECTED during migration — which is why both frame watchdogs are **two-stage**: soft at 5 s (log `frame gap >5s — possible WiFi link migration`, hold teardown, coaching shows "Reconnecting camera…"), hard at 30 s (invalidate + failed, the pre-existing behavior). A survived gap logs `✓ frames resumed after N.Ns gap` — that N is the migration-time measurement. Debugging a hard death: search device Console for `WifiSelector`, `LinkLease`, `SoftAP`, `markWifiStartError`, `WIFI_DIRECT`. Demo-day fallback if WiFi stays unreliable: remove `_bonjour._tcp` from `NSBonjourServices` to pin video back to BT.
 
 ### iPhone path
 
@@ -210,6 +212,7 @@ The HUD reads `HandGestureService.$state` to drive focus rings, the recede-and-a
 - **Visual advance + interjection are out-of-band, not tool calls.** `CoachingSessionViewModel.runOraclePoll()` posts the latest camera frame to `/api/learner/session/{id}/verify`; on an `advanced`/`completed`/`error` verdict it updates local state via `applyLearnerToolResult` and injects an `[ADVANCE]`/`[CORRECTION]` text turn into Live via `sendClientTextTurn`. Live never decides completion from the video itself.
 - **Pending tool-call set** — a `Set<String>` of in-flight tool call ids (not a single `Optional<String>`). If Gemini ever emits multiple function calls in one `toolCall` frame, the audio/video send gate stays closed until the last one completes.
 - **Context growth observability** — logs every crossed 10k band of `usageMetadata.totalTokenCount`. Drops >30k between samples are flagged as server-side context compression firing (100k → 40k).
+- **Camera loan on troubleshoot→coaching handoff** — the diagnostic VM does NOT stop the glasses camera on `handoff_to_learner`; it deposits the live `Stream` + its held `"gemini-live"` DSM lease into `GeminiLiveSessionBase.pendingCameraLoan` (via `loanCameraForHandoff()`), and the coaching VM's `setupCameraStream()` claims it — adopting the running stream instead of `addStream`+`start`. This keeps the WiFi video link + camera alive across the handoff (no LED blink, no SoftAP re-join). **Never stop and re-add a `Stream` back-to-back on a shared `DeviceSession`**: the SDK reports `.stopped` before its WARP threads exit, and the successor stream attaches to a half-drained pipe (one frame, then starvation). Non-handoff stop→start paths are protected by a drain anchor in `stopCameraStream` (`awaitStreamStopped` + 300 ms settle). An unclaimed loan is swept after 15 s. (Briefly reverted 2026-07-01 while chasing the WiFi dead-link bug — root cause turned out to be the Meta AI per-glasses WiFi permission, so the loan came back.)
 
 ### Token management
 
@@ -331,7 +334,7 @@ samples/CameraAccess/
 
 ## DAT SDK conventions
 
-**Canonical reference: the `mwdat-ios:*` plugin skills.** Meta ships its DAT iOS guidance as a Claude Code plugin (pinned at 0.7.0). Invoke the relevant skill rather than re-deriving from memory or this doc:
+**Canonical reference: the `mwdat-ios:*` plugin skills.** Meta ships its DAT iOS guidance as a Claude Code plugin. The app is on SDK **0.8.0**; the locally installed plugin marketplace may lag (it documented 0.7.0 at the time of the 0.8 migration) — cross-check version-sensitive claims against the SDK changelog. Invoke the relevant skill rather than re-deriving from memory or this doc:
 
 | Question | Invoke |
 |---|---|
@@ -352,8 +355,9 @@ Do NOT keep duplicate copies of the SDK's module list, type names, naming conven
 These are NOT in the plugin. They're Retrace-specific rules layered on top.
 
 1. **`Services/DeviceSessionManager.swift` owns every `DeviceSession`.** Never call `wearables.createSession(...)` directly from a new consumer. See `.claude/rules/dat-conventions.md` for the full invariant.
-2. **`MWDATCore.Permission` has only `.camera`** (0.7.0). Microphone gating is iOS-native via `AVAudioApplication.requestRecordPermission()`, prompted at session start by `AudioSessionManager`. Don't try `Permission.microphone` — it doesn't exist.
+2. **`MWDATCore.Permission` has only `.camera`** (still true in 0.8.0). Microphone gating is iOS-native via `AVAudioApplication.requestRecordPermission()`, prompted at session start by `AudioSessionManager`. Don't try `Permission.microphone` — it doesn't exist.
 3. **`datAppOnTheGlassesUpdateRequired` gets a dedicated recovery sheet** for both consumers (camera-streaming via `pendingDATHelperUpdate` → `DATHelperUpdateRequiredSheet`; display via `requiresDATAppUpdate` → Server Settings inline). Mirror for any new consumer; both deep-link to `wearables.openDATGlassesAppUpdate()`.
+4. **`Stream`/`Display` `start()`/`stop()` are synchronous since 0.8** — never treat their return as readiness or completion. Readiness comes from `statePublisher` transitions or first-frame proof (frame watchdogs); stop-completion ordering is anchored on `DeviceSessionManager.release` (which awaits DeviceSession `.stopped`) or a bounded `statePublisher → .stopped` wait (see `GeminiLiveSessionBase.awaitStreamStopped`).
 
 ## Permissions (`Info.plist`)
 
@@ -362,7 +366,8 @@ Already configured:
 - `NSBluetoothAlwaysUsageDescription` — DAT SDK Bluetooth.
 - `NSCameraUsageDescription` — iPhone capture path + coaching camera.
 - `NSMicrophoneUsageDescription` — expert narration + AI coaching.
-- `NSLocalNetworkUsageDescription` + `NSBonjourServices = ["_retrace._tcp"]` — server discovery.
+- `NSLocalNetworkUsageDescription` + `NSBonjourServices = ["_retrace._tcp", "_bonjour._tcp"]` — server discovery (`_retrace._tcp`) and DAT 0.8 WiFi video transport (`_bonjour._tcp`).
+- `CameraAccess.entitlements` carries `com.apple.developer.networking.wifi-info` + `com.apple.developer.networking.HotspotConfiguration` — required for the DAT 0.8 WiFi link lease (matches Meta's 0.8 sample apps). ⚠️ Both App IDs (`com.xrccart.retrace.ios.v1` local, `com.xrcc.retrace.ios.v1` CI) need the matching capabilities in the developer portal, and the match profile must be regenerated (`bundle exec fastlane match appstore`) before the next TestFlight tag.
 - `NSPhotoLibraryAddUsageDescription` (save captured photos) + `NSPhotoLibraryUsageDescription` (read, for uploading existing videos).
 - `UIBackgroundModes = ["bluetooth-central", "bluetooth-peripheral", "external-accessory", "processing"]` — DAT glasses stay connected in background.
 - `UISupportedExternalAccessoryProtocols = ["com.meta.ar.wearable"]`.

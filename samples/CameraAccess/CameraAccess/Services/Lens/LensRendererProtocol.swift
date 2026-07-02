@@ -24,4 +24,10 @@ protocol LensRenderer: AnyObject {
   /// per-renderer state. Idempotent — called from `LensSession.deactivate()`
   /// and again from `activate()` of a new renderer.
   func cancel()
+
+  /// Force a re-send of the CURRENT lens tree, even if the projected snapshot is
+  /// unchanged. Used to recover the on-glasses HUD after the system "back" gesture
+  /// (middle-finger pinch) dismissed it — the session keeps running, only the lens
+  /// content was cleared. Renderers with a dedupe cache must clear it first.
+  func repaint()
 }

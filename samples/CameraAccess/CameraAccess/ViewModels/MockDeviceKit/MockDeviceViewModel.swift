@@ -41,7 +41,7 @@ extension MockDeviceCardView {
 
     // Display name for the mock device in the UI
     var deviceName: String {
-      if device is MockRaybanMeta {
+      if device is any MockGlasses {
         return "RayBan Meta Glasses"
       }
       return "Device"
@@ -70,14 +70,14 @@ extension MockDeviceCardView {
     }
 
     func unfold() {
-      if let rayBanDevice = device as? MockDisplaylessGlasses {
+      if let rayBanDevice = device as? any MockGlasses {
         rayBanDevice.unfold()
         isUnfolded = true
       }
     }
 
     func fold() {
-      if let rayBanDevice = device as? MockDisplaylessGlasses {
+      if let rayBanDevice = device as? any MockGlasses {
         rayBanDevice.fold()
         isUnfolded = false
       }
@@ -85,7 +85,7 @@ extension MockDeviceCardView {
 
     // Load mock video content from a file URL
     func selectVideo(from url: URL) {
-      if let cameraKit = (device as? MockDisplaylessGlasses)?.services.camera {
+      if let cameraKit = (device as? any MockGlasses)?.services.camera {
         cameraKit.setCameraFeed(fileURL: url)
         hasCameraFeed = true
         cameraSource = nil
@@ -96,7 +96,7 @@ extension MockDeviceCardView {
     // DAT SDK 0.6 feature — lets the developer exercise the real StreamSession
     // → videoFramePublisher path without putting on glasses. Front or back.
     func setCameraFeed(_ facing: CameraFacing) {
-      guard let cameraKit = (device as? MockDisplaylessGlasses)?.services.camera else {
+      guard let cameraKit = (device as? any MockGlasses)?.services.camera else {
         return
       }
       Task {
@@ -115,7 +115,7 @@ extension MockDeviceCardView {
 
     // Load mock image content
     func selectImage(from url: URL) {
-      if let cameraKit = (device as? MockDisplaylessGlasses)?.services.camera {
+      if let cameraKit = (device as? any MockGlasses)?.services.camera {
         cameraKit.setCapturedImage(fileURL: url)
         hasCapturedImage = true
       }

@@ -59,6 +59,16 @@ final class LensSession: ObservableObject {
     await coordinator.send(view)
   }
 
+  /// Re-paint whatever lens is currently active on the glasses. Recovery path for
+  /// the system "back" gesture dismissing the HUD mid-session (camera/Gemini/audio
+  /// stay up; only the Display content was cleared). Re-enables lazy re-attach in
+  /// case the dismiss detached the Display, then forces the active renderer to
+  /// re-send its current tree. No-op when nothing is mounted.
+  func resendLensToDisplay() {
+    coordinator.resumeAttaching()  // the pinch may have detached the Display
+    currentRenderer?.repaint()
+  }
+
   /// Mount a renderer for the given flow. The supplied `vm` is the
   /// flow's view model; renderers downcast it on instantiation.
   ///

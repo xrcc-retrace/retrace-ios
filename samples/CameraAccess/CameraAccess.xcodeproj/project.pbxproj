@@ -10,6 +10,7 @@
 		00A94880A4B1C4451AED2355 /* LearnerTabView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD28474AAC05F5935FA6950B /* LearnerTabView.swift */; };
 		00D04E3E8A93D34ED1F586F5 /* RetraceGameEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 34A7431EBFABD8AA99ECF31C /* RetraceGameEngine.swift */; };
 		010A49AF9FE3FAC59022E7B5 /* TroubleshootPageHandler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CB64CBDB7E4E450E2FC736A /* TroubleshootPageHandler.swift */; };
+		028F4886B252279402960367 /* LocalNetworkPermission.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5A44820B5E25273D98A9D7E /* LocalNetworkPermission.swift */; };
 		03EF4AA19F049E154942BB51 /* BarcodeImageGenerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 886843909AB2A19759F64B87 /* BarcodeImageGenerator.swift */; };
 		047E4479A0A08E04B9794D56 /* CoachingStyleTile.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1974654B0A5928E8307DD25 /* CoachingStyleTile.swift */; };
 		053B4B9C87B317E867095D5D /* OnboardingTopBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8BEE4FFFBE6C1E581EE98588 /* OnboardingTopBar.swift */; };
@@ -21,6 +22,7 @@
 		0E2B467EAC3577ACBC15E8E8 /* CategoryChip.swift in Sources */ = {isa = PBXBuildFile; fileRef = C06C456A852E3B95EE5276D9 /* CategoryChip.swift */; };
 		101A444CBB10C735597FE767 /* HandLandmarkFrame.swift in Sources */ = {isa = PBXBuildFile; fileRef = 933E46879747BC2AFD132A25 /* HandLandmarkFrame.swift */; };
 		119D42E78B75D53754A4A181 /* LensIconMap.swift in Sources */ = {isa = PBXBuildFile; fileRef = 437743A4ADFFCF60B70D7B94 /* LensIconMap.swift */; };
+		11AD4F0CB4BBCB6123D5F260 /* ObjCExceptionCatcher.h in Headers */ = {isa = PBXBuildFile; fileRef = D9474BE9BBD4E81195B7256C /* ObjCExceptionCatcher.h */; };
 		137744BAB60D8E31A7CCEE5A /* GlassesRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = DB3C4A7CA7F3995DF4732B73 /* GlassesRuntime.swift */; };
 		172647F9B58E6746C65D138B /* ExpertLensRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3B5460C8FE5E2C31A28C638 /* ExpertLensRenderer.swift */; };
 		17A84A169EE05C8797CEA6A7 /* HandLandmarkerService.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE4B498EB4BCCE6A4FA91784 /* HandLandmarkerService.swift */; };
@@ -41,6 +43,7 @@
 		2B7D4E19923252347243DD1D /* lobby_music.mp3 in Resources */ = {isa = PBXBuildFile; fileRef = 26134CFF98D8620DE9C3EC6E /* lobby_music.mp3 */; };
 		2DEE4F9C91D58264940E1B6F /* CoachingStepPage.swift in Sources */ = {isa = PBXBuildFile; fileRef = D22E40719A5673ED40DD2C70 /* CoachingStepPage.swift */; };
 		2E1741C19690800198712A48 /* AskAISessionViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = FFD54648ACF188B689C54D6D /* AskAISessionViewModel.swift */; };
+		2FE543DF8E6BBA105C8E6EDA /* ObjCExceptionCatcher.m in Sources */ = {isa = PBXBuildFile; fileRef = 5B514C48A589A40789BA24CF /* ObjCExceptionCatcher.m */; };
 		30004966B311BB91876F063B /* PermissionRequiredSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6C264938B81217EF941CC0F9 /* PermissionRequiredSheet.swift */; };
 		30154EA485163A5A0F6EFA7B /* ExpertRecordingHUDViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = C9C849A9B99F92F1549ECD93 /* ExpertRecordingHUDViewModel.swift */; };
 		30BADC1B68D5C32FCEAE57DA /* IPhoneCoachingLayout.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A67325F7AF6CB6EC53E2F6D /* IPhoneCoachingLayout.swift */; };
@@ -144,6 +147,7 @@
 		8FFD60542E849D0D0035E446 /* RegistrationView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8FFD60532E849D0D0035E446 /* RegistrationView.swift */; };
 		8FFD60602E84A2F70035E446 /* MainAppView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8FFD605F2E84A2F70035E446 /* MainAppView.swift */; };
 		8FFD60612E84A2F70035E446 /* DebugMenuView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8FFD605E2E84A2F70035E446 /* DebugMenuView.swift */; };
+		943944308A2121A3A38377BC /* CameraAccess-Bridging-Header.h in Headers */ = {isa = PBXBuildFile; fileRef = B929493DB92CEA948F42D3BB /* CameraAccess-Bridging-Header.h */; };
 		944B4BBCAE19C6DFF7A25444 /* WorkflowListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46AF40C98BC7FE0C7AC6C759 /* WorkflowListView.swift */; };
 		98044D0E8478CC296295F45C /* tone_0.wav in Resources */ = {isa = PBXBuildFile; fileRef = DC194A7BB0AEFD3A9CCAEBF9 /* tone_0.wav */; };
 		98E14E85A3EE47E819FFC135 /* CoachingLensTrees.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20494D519E2AAA906D9AC359 /* CoachingLensTrees.swift */; };
@@ -227,6 +231,7 @@
 		E6DA451F2E79A63100E3F688 /* MockDeviceKitView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E6DA451A2E79A63100E3F688 /* MockDeviceKitView.swift */; };
 		E8D642F3BB36208AD340D3A7 /* SourceRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 11114E20BB447C6FDB832B10 /* SourceRow.swift */; };
 		E98F48FA90970832EBBCA908 /* CachedAsyncImage.swift in Sources */ = {isa = PBXBuildFile; fileRef = DEB0447F881367FC38E1DC03 /* CachedAsyncImage.swift */; };
+		EAB74BB592174B9E7AAD05B8 /* WiFiLinkMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5704692887ED7B08A3073A4 /* WiFiLinkMonitor.swift */; };
 		ECDCB09A8D7C6E5F8A7B6C5D /* PinchDragRecognizerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DDCEB1A9F8E7D6C5F8A7B6C4 /* PinchDragRecognizerTests.swift */; };
 		ED6B43EAA04A43251D511DA7 /* AskAILensSnapshot.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8A04A179B18A4BA3D3183C5 /* AskAILensSnapshot.swift */; };
 		EDB84E7B961EB7B6DF6AF651 /* StepProgressBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F8148589A75E2214DB6FF49 /* StepProgressBar.swift */; };
@@ -326,6 +331,7 @@
 		56C94D0BA0B1062FE20D5072 /* tone_8.wav */ = {isa = PBXFileReference; lastKnownFileType = audio.wav; name = tone_8.wav; path = CameraAccess/Resources/RetraceGameSounds/tone_8.wav; sourceTree = SOURCE_ROOT; };
 		58DA450F90FAFA24C86C043C /* TroubleshootConfirmHandler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TroubleshootConfirmHandler.swift; path = CameraAccess/Views/Troubleshoot/TroubleshootConfirmHandler.swift; sourceTree = SOURCE_ROOT; };
 		5B434A40A7AE1FB8130ACF93 /* LensSnapshot.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = LensSnapshot.swift; path = CameraAccess/Views/RayBanHUD/Native/LensSnapshot.swift; sourceTree = SOURCE_ROOT; };
+		5B514C48A589A40789BA24CF /* ObjCExceptionCatcher.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = ObjCExceptionCatcher.m; path = CameraAccess/Utils/ObjCExceptionCatcher.m; sourceTree = SOURCE_ROOT; };
 		5D424E4BA44D0156B45D29B0 /* CoachingSessionViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = CoachingSessionViewModel.swift; path = CameraAccess/ViewModels/CoachingSessionViewModel.swift; sourceTree = SOURCE_ROOT; };
 		5D68441B99AB7E102A0AB0B9 /* ExpertRecordingManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ExpertRecordingManager.swift; path = CameraAccess/Utils/ExpertRecordingManager.swift; sourceTree = SOURCE_ROOT; };
 		5E0A4467810688AEE1B5FE17 /* ProcedureDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ProcedureDetailView.swift; path = CameraAccess/Views/Expert/ProcedureDetailView.swift; sourceTree = SOURCE_ROOT; };
@@ -433,6 +439,7 @@
 		AEB54B9AA8B9A443B8BC59E0 /* NavigatorLensSnapshot.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = NavigatorLensSnapshot.swift; path = CameraAccess/Views/RayBanHUD/Native/NavigatorLensSnapshot.swift; sourceTree = SOURCE_ROOT; };
 		AF0E4908B8625D0CFFC73168 /* tone_6.wav */ = {isa = PBXFileReference; lastKnownFileType = audio.wav; name = tone_6.wav; path = CameraAccess/Resources/RetraceGameSounds/tone_6.wav; sourceTree = SOURCE_ROOT; };
 		B4A64085971063FCB657C64C /* ServerEndpoint.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ServerEndpoint.swift; path = CameraAccess/Services/ServerEndpoint.swift; sourceTree = SOURCE_ROOT; };
+		B929493DB92CEA948F42D3BB /* CameraAccess-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = "CameraAccess-Bridging-Header.h"; path = "CameraAccess/CameraAccess-Bridging-Header.h"; sourceTree = SOURCE_ROOT; };
 		BA98F7E6D5C4B3A2D6E5F4A4 /* HandLandmarkDebugOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = HandLandmarkDebugOverlay.swift; path = CameraAccess/Views/Learner/Coaching/HandLandmarkDebugOverlay.swift; sourceTree = SOURCE_ROOT; };
 		BAF64431B3ECB5AA67C38CC5 /* ExpertTipPageHandler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ExpertTipPageHandler.swift; path = CameraAccess/Views/Expert/HUD/Pages/ExpertTipPageHandler.swift; sourceTree = SOURCE_ROOT; };
 		BE1D442A9A67F344B46DEA9B /* AskAILensRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AskAILensRenderer.swift; path = CameraAccess/Views/RayBanHUD/Native/Renderers/AskAILensRenderer.swift; sourceTree = SOURCE_ROOT; };
@@ -453,9 +460,11 @@
 		D3D0404684668484C47956DE /* AskAILensTrees.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AskAILensTrees.swift; path = CameraAccess/Views/RayBanHUD/Native/Renderers/AskAILensTrees.swift; sourceTree = SOURCE_ROOT; };
 		D496455793E9E33B61DA9E0C /* MicroGestureRecognizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MicroGestureRecognizer.swift; path = CameraAccess/HandTracking/MicroGestureRecognizer.swift; sourceTree = SOURCE_ROOT; };
 		D4A34904963C8C783DD8C6E9 /* GameSoundPlayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = GameSoundPlayer.swift; path = CameraAccess/Services/GameSoundPlayer.swift; sourceTree = SOURCE_ROOT; };
+		D5A44820B5E25273D98A9D7E /* LocalNetworkPermission.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = LocalNetworkPermission.swift; path = CameraAccess/Services/LocalNetworkPermission.swift; sourceTree = SOURCE_ROOT; };
 		D5F0471C992400624FF476F8 /* OnboardingCoachingStyleView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = OnboardingCoachingStyleView.swift; path = CameraAccess/Views/Onboarding/Screens/OnboardingCoachingStyleView.swift; sourceTree = SOURCE_ROOT; };
 		D6BD4EEEA270A1F20B895BA5 /* CompletionFeedback.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = CompletionFeedback.swift; path = CameraAccess/Services/CompletionFeedback.swift; sourceTree = SOURCE_ROOT; };
 		D7014E92A26E9858AE17F0C3 /* OnboardingContainerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = OnboardingContainerView.swift; path = CameraAccess/Views/Onboarding/OnboardingContainerView.swift; sourceTree = SOURCE_ROOT; };
+		D9474BE9BBD4E81195B7256C /* ObjCExceptionCatcher.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = ObjCExceptionCatcher.h; path = CameraAccess/Utils/ObjCExceptionCatcher.h; sourceTree = SOURCE_ROOT; };
 		DB3C4A7CA7F3995DF4732B73 /* GlassesRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = GlassesRuntime.swift; path = CameraAccess/ViewModels/GlassesRuntime.swift; sourceTree = SOURCE_ROOT; };
 		DC194A7BB0AEFD3A9CCAEBF9 /* tone_0.wav */ = {isa = PBXFileReference; lastKnownFileType = audio.wav; name = tone_0.wav; path = CameraAccess/Resources/RetraceGameSounds/tone_0.wav; sourceTree = SOURCE_ROOT; };
 		DCFE420BBC04BE5574B2C3DD /* DiscoverViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = DiscoverViewModel.swift; path = CameraAccess/ViewModels/DiscoverViewModel.swift; sourceTree = SOURCE_ROOT; };
@@ -468,6 +477,7 @@
 		E1F5463EBDB459208BE6A297 /* ExpertLensTrees.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ExpertLensTrees.swift; path = CameraAccess/Views/RayBanHUD/Native/Renderers/ExpertLensTrees.swift; sourceTree = SOURCE_ROOT; };
 		E3B5460C8FE5E2C31A28C638 /* ExpertLensRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ExpertLensRenderer.swift; path = CameraAccess/Views/RayBanHUD/Native/Renderers/ExpertLensRenderer.swift; sourceTree = SOURCE_ROOT; };
 		E4032E6C4B7888AA4B354B6C /* GeminiLiveSessionBase.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = GeminiLiveSessionBase.swift; path = CameraAccess/ViewModels/GeminiLiveSessionBase.swift; sourceTree = SOURCE_ROOT; };
+		E5704692887ED7B08A3073A4 /* WiFiLinkMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = WiFiLinkMonitor.swift; path = CameraAccess/Services/WiFiLinkMonitor.swift; sourceTree = SOURCE_ROOT; };
 		E61B9285EA1004D1AEEBDE44 /* CoachingExitConfirmHandler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = CoachingExitConfirmHandler.swift; path = CameraAccess/Views/Learner/Coaching/CoachingExitConfirmHandler.swift; sourceTree = SOURCE_ROOT; };
 		E66CC00D2F3E05D900B07379 /* CameraAccessUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = CameraAccessUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		E66CC0182F3E1A9300B07379 /* plant.mp4 */ = {isa = PBXFileReference; lastKnownFileType = file; path = plant.mp4; sourceTree = "<group>"; };
@@ -722,6 +732,11 @@
 				412548E09E60BCEDA88E2C73 /* wrong.wav */,
 				A9DA4DB699AEDD7707C4D766 /* fanfare.wav */,
 				0AB04F479F36F39D6C6697D7 /* MicrophonePermissionCTA.swift */,
+				5B514C48A589A40789BA24CF /* ObjCExceptionCatcher.m */,
+				D9474BE9BBD4E81195B7256C /* ObjCExceptionCatcher.h */,
+				B929493DB92CEA948F42D3BB /* CameraAccess-Bridging-Header.h */,
+				D5A44820B5E25273D98A9D7E /* LocalNetworkPermission.swift */,
+				E5704692887ED7B08A3073A4 /* WiFiLinkMonitor.swift */,
 			);
 			sourceTree = "<group>";
 		};
@@ -867,6 +882,18 @@
 		};
 /* End PBXGroup section */
 
+/* Begin PBXHeadersBuildPhase section */
+		304846299E3CA289CEBD262F /* Headers */ = {
+			isa = PBXHeadersBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				11AD4F0CB4BBCB6123D5F260 /* ObjCExceptionCatcher.h in Headers */,
+				943944308A2121A3A38377BC /* CameraAccess-Bridging-Header.h in Headers */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXHeadersBuildPhase section */
+
 /* Begin PBXNativeTarget section */
 		8A8A8A8A8A8A8A8A8A8A8A8A /* CameraAccess */ = {
 			isa = PBXNativeTarget;
@@ -876,6 +903,7 @@
 				4A4A4A4A4A4A4A4A4A4A4A4A /* Frameworks */,
 				B2A1AFE725D64119AF3BBD78 /* Resources */,
 				0BCC73072FA1519C00B6E79D /* Patch MediaPipeTasksVision Info.plist */,
+				304846299E3CA289CEBD262F /* Headers */,
 			);
 			buildRules = (
 			);
@@ -1260,6 +1288,9 @@
 				137744BAB60D8E31A7CCEE5A /* GlassesRuntime.swift in Sources */,
 				68604C31959CF54A8B6748A5 /* GameSoundPlayer.swift in Sources */,
 				CF5541AD892A1C9E7B349359 /* MicrophonePermissionCTA.swift in Sources */,
+				2FE543DF8E6BBA105C8E6EDA /* ObjCExceptionCatcher.m in Sources */,
+				028F4886B252279402960367 /* LocalNetworkPermission.swift in Sources */,
+				EAB74BB592174B9E7AAD05B8 /* WiFiLinkMonitor.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -1312,6 +1343,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = com.xrccart.retrace.ios.v1;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
+				SWIFT_OBJC_BRIDGING_HEADER = "CameraAccess/CameraAccess-Bridging-Header.h";
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
@@ -1340,6 +1372,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = com.xrccart.retrace.ios.v1;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
+				SWIFT_OBJC_BRIDGING_HEADER = "CameraAccess/CameraAccess-Bridging-Header.h";
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
@@ -1626,7 +1659,7 @@
 			repositoryURL = "https://github.com/facebook/meta-wearables-dat-ios";
 			requirement = {
 				kind = exactVersion;
-				version = 0.7.0;
+				version = 0.8.0;
 			};
 		};
 /* End XCRemoteSwiftPackageReference section */

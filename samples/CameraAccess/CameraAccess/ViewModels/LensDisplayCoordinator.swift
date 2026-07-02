@@ -47,6 +47,13 @@ final class LensDisplayCoordinator: ObservableObject {
   /// to auto-present after a failed launch, mirroring the sample's UX.
   @Published private(set) var didFailToStartSession: Bool = false
 
+  /// A `capability.send(_:)` call didn't return (success or throw) within
+  /// `sendTimeout` — the Display link may be frozen. Unlike a thrown
+  /// `DisplayError` (which surfaces via `errorMessage`), the SDK gives no
+  /// signal at all when the link wedges, so this is a self-imposed watchdog
+  /// around `doSend`. Clears on the next send that completes normally.
+  @Published private(set) var lensUnresponsive: Bool = false
+
   /// The live Display capability. `nil` while detached or while starting.
   /// Exposed (read-only) so callers like `LensSession` can wire `onPlaybackEvent`
   /// for video → UI handoff after `send(VideoPlayer(...))`.
@@ -96,8 +103,15 @@ final class LensDisplayCoordinator: ObservableObject {
   /// unresponsive lens). Renderers fire `Task { await send(...) }` freely; we
   /// coalesce here. `queuedSend` holds the LATEST tree (latest-wins; stale
   /// frames drop), `sendDrainTask` is the lone serial drainer.
-  private var queuedSend: ((Display) async -> Void)?
+  private var queuedSend: ((Display) async -> Bool)?
   private var sendDrainTask: Task<Void, Never>?
+
+  /// MWDATDisplay times out sends spaced closer than ~0.28-0.30s (measured
+  /// device limit); the drainer enforces this floor between consecutive
+  /// `capability.send` calls so a burst can't shed its final — and therefore
+  /// most important — frame.
+  private static let minSendGapNanos: UInt64 = 350_000_000
+  private var lastSendFinishedAt: ContinuousClock.Instant?
 
   /// Cancellable for the manager's sessionErrors fan-out, when the
   /// manager path is active. Replaces the inline `sessionErrorTask`
@@ -129,6 +143,16 @@ final class LensDisplayCoordinator: ObservableObject {
   /// same "permanent for the current registration" rationale doesn't apply
   /// uniformly to those.
   private var attachUnavailableForCurrentRegistration: Bool = false
+
+  /// Debounce after a forced session invalidation. The renderers pump lazy
+  /// `send(_:)` ~8×/s, so after `handleSessionInvalidated` detaches, the very
+  /// next send would re-acquire within ~120ms — while the invalidated session's
+  /// WARP stack is still draining (`service_lost` churn observed ~1.3s past
+  /// teardown). A session created in that window comes up `.started` but with a
+  /// dead media path. Attach attempts before this instant are dropped; the
+  /// renderer cadence naturally retries once the window passes. Cleared by
+  /// `resumeAttaching()` so a legitimate new flow activation isn't delayed.
+  private var reattachBlockedUntil: Date = .distantPast
 
   init(wearables: WearablesInterface, sessionManager: DeviceSessionManager) {
     self.wearables = wearables
@@ -192,7 +216,7 @@ final class LensDisplayCoordinator: ObservableObject {
       // while a prior `doSend` is suspended in `capability.send`, so an inline
       // await would overlap two sends and wedge the link (see `queuedSend`).
       let sendableView = view
-      queuedSend = { [weak self] cap in await self?.doSend(sendableView, on: cap) }
+      queuedSend = { [weak self] cap in await self?.doSend(sendableView, on: cap) ?? false }
       if sendDrainTask == nil {
         sendDrainTask = Task { [weak self] in await self?.drainSends() }
       }
@@ -204,7 +228,7 @@ final class LensDisplayCoordinator: ObservableObject {
     let sendableView = view
     pendingAction = { [weak self] in
       guard let self, let cap = self.display else { return }
-      await self.doSend(sendableView, on: cap)
+      _ = await self.doSend(sendableView, on: cap)
     }
 
     if display == nil {
@@ -218,10 +242,36 @@ final class LensDisplayCoordinator: ObservableObject {
   /// (preserves the WARP-drain ordering — we never call `send` once the link is
   /// going away). Exits when the queue is empty or the link is gone, then nils
   /// itself so the next `send(_:)` restarts it.
+  ///
+  /// Two reliability rules on top of the serialization:
+  /// - Consecutive sends are spaced ≥ `minSendGapNanos` apart (the device
+  ///   times out faster-paced sends).
+  /// - A failed send with nothing newer queued is retried (budget: 2 per
+  ///   drain run, reset on success) — otherwise the lens sticks on a stale
+  ///   tree until the next unrelated state change.
   private func drainSends() async {
+    var retriesLeft = 2
     while let next = queuedSend, let cap = display, isConnected {
       queuedSend = nil
-      await next(cap)
+
+      if let last = lastSendFinishedAt {
+        let elapsed = last.duration(to: ContinuousClock.now)
+        let gap = Duration.nanoseconds(Self.minSendGapNanos)
+        if elapsed < gap {
+          try? await Task.sleep(for: gap - elapsed)
+        }
+      }
+
+      let ok = await next(cap)
+      lastSendFinishedAt = ContinuousClock.now
+
+      if ok {
+        retriesLeft = 2
+      } else if queuedSend == nil && retriesLeft > 0 {
+        retriesLeft -= 1
+        print("[LensDisplayCoordinator] send failed — retrying latest tree (\(retriesLeft) retries left)")
+        queuedSend = next
+      }
     }
     sendDrainTask = nil
   }
@@ -236,21 +286,71 @@ final class LensDisplayCoordinator: ObservableObject {
 
   /// Re-enable attaching — called from `LensSession.activate(_:vm:)` so any real
   /// activation clears a prior teardown's suppression.
-  func resumeAttaching() { suspendAttach = false }
+  func resumeAttaching() {
+    suspendAttach = false
+    reattachBlockedUntil = .distantPast
+  }
 
   // MARK: - Session Management
 
-  private func doSend(_ view: some DisplayableView, on capability: Display) async {
+  private enum SendOutcome {
+    case success
+    case failure(Error)
+    case timedOut
+  }
+
+  /// Sends normally complete in well under a second (the min-gap floor is
+  /// 0.35s); 3s is a generous budget that still catches a genuinely wedged
+  /// link within one demo-relevant beat.
+  private static let sendTimeout: TimeInterval = 3.0
+
+  @discardableResult
+  private func doSend(_ view: some DisplayableView, on capability: Display) async -> Bool {
     isSending = true
     defer { isSending = false }
 
-    do {
-      try await capability.send(view)
+    // Race the send against a timeout — the SDK gives no signal at all if
+    // the Display link is wedged (`capability.send` just never returns), so
+    // an unbounded `await` here would leave `lensUnresponsive` permanently
+    // false even while the lens is frozen. The losing task is left to
+    // finish in the background (see `lensUnresponsive` doc comment) rather
+    // than cancelled, since `Display.send` isn't a cancellation-safe API.
+    let outcome = await withTaskGroup(of: SendOutcome.self, returning: SendOutcome.self) { group in
+      group.addTask {
+        do {
+          try await capability.send(view)
+          return .success
+        } catch {
+          return .failure(error)
+        }
+      }
+      group.addTask {
+        try? await Task.sleep(nanoseconds: UInt64(Self.sendTimeout * 1_000_000_000))
+        return .timedOut
+      }
+      let first = await group.next() ?? .timedOut
+      group.cancelAll()
+      return first
+    }
+
+    switch outcome {
+    case .success:
+      lensUnresponsive = false
       print("[LensDisplayCoordinator] display.send ✓")
-    } catch {
+      return true
+    case .failure(let error):
+      // Errored, not hung — a distinct failure mode already covered by
+      // `errorMessage`, not the "frozen lens" signal.
+      lensUnresponsive = false
       print("[LensDisplayCoordinator] display.send threw → \(error)")
       let message = (error as? DisplayError)?.description ?? error.localizedDescription
       errorMessage = "\(String(describing: type(of: error))).\(error): \(message)"
+      return false
+    case .timedOut:
+      lensUnresponsive = true
+      errorMessage = "Lens isn't responding (no ack in \(Int(Self.sendTimeout))s)"
+      print("[LensDisplayCoordinator] display.send TIMED OUT after \(Self.sendTimeout)s — lens may be frozen")
+      return false
     }
   }
 
@@ -267,6 +367,9 @@ final class LensDisplayCoordinator: ObservableObject {
       print("[LensDisplayCoordinator] attach suppressed — terminal teardown in progress")
       return
     }
+    // Post-invalidation debounce — see `reattachBlockedUntil`. Silent drop:
+    // this guard is hit at the renderer's send cadence during the window.
+    guard Date() >= reattachBlockedUntil else { return }
     // Short-circuit if a prior attempt against the current registration
     // state already determined no display device is reachable / claimable.
     // Without this, a renderer pumping ~8 lazy `coordinator.send` calls
@@ -425,7 +528,10 @@ final class LensDisplayCoordinator: ObservableObject {
       }
 
       print("[LensDisplayCoordinator] capability.start() …")
-      await capability.start()
+      // 0.8: Display.start() is synchronous fire-and-forget; connection
+      // readiness is driven by the DisplayState listener above, never by
+      // start() returning.
+      capability.start()
       print("[LensDisplayCoordinator] capability.start() returned, state=\(capability.state)")
       display = capability
     } catch {
@@ -448,7 +554,9 @@ final class LensDisplayCoordinator: ObservableObject {
     displayStateContinuation = nil
     displayStateTask?.cancel()
     displayStateTask = nil
-    await display?.stop()
+    // 0.8: Display.stop() is synchronous; the lens lease release below is
+    // what actually waits (via the manager) for the session to wind down.
+    display?.stop()
     display = nil
 
     // The manager's session-error fan-out subscription for this attach.
@@ -485,7 +593,10 @@ final class LensDisplayCoordinator: ObservableObject {
   /// detach the display capability instead of pumping `send`s into a dead link.
   /// A subsequent renderer `send` will lazily re-attach via a fresh session.
   private func handleSessionInvalidated(_ reason: String) async {
-    print("[LensDisplayCoordinator] session invalidated → \(reason); detaching display")
+    print("[LensDisplayCoordinator] session invalidated → \(reason); detaching display, blocking re-attach 2s")
+    // Hold lazy re-attach past the dead session's WARP drain window so the
+    // replacement session isn't created on a half-drained stack.
+    reattachBlockedUntil = Date().addingTimeInterval(2.0)
     await detachFromDisplay()
   }
 }

@@ -8,8 +8,8 @@
 //   8.  TroubleshootIdentifyPage          (phase=.discovering)
 //   9.  TroubleshootDiagnosePage          (phase=.diagnosing, no narration)
 //   10. TroubleshootSearchingPage         (narration != nil — 5 sub-states)
-//   11. TroubleshootResolvedPage          (phase=.resolved, resolution=.matched/.generated)
-//   12. TroubleshootNoSolutionPage        (phase=.resolved, resolution=.noMatch)
+//   11. TroubleshootResolvedPage          (resolution=.matched/.generated)
+//   12. TroubleshootNoSolutionPage        (resolution=.noMatch)
 //   13. TroubleshootConfirmOverlay        (pendingConfirmation = true)
 //   14. End-diagnostic exit overlay        (showDismissConfirmation = true)
 //
@@ -74,6 +74,20 @@ enum TroubleshootLensTrees {
       return confirmOverlayTree(snapshot: s, callbacks: cb)
     }
 
+    // A landed resolution IS the handoff surface — show it the moment the
+    // search result exists, regardless of phase. `phase == .resolved` only
+    // arrives via the `handoff_to_learner` tool call, which Gemini may issue
+    // late or never; the resolution is our own verified state. (Matches the
+    // phone emulator's routing in TroubleshootSessionView.) The VM's hold
+    // tasks guarantee narration is nil once a resolution is applied, so the
+    // `.foundFix` success flash still gets its floor before this fires.
+    if let resolution = s.resolution {
+      if case .noMatch = resolution {
+        return noSolutionTree(callbacks: cb, isMuted: s.isMuted)
+      }
+      return resolvedTree(snapshot: s, callbacks: cb)
+    }
+
     // Searching narration overrides the diagnose page. Active during
     // `.diagnosing` (initial library search) and `.resolving` (web
     // search + synthesizing).
@@ -86,17 +100,11 @@ enum TroubleshootLensTrees {
       return identifyTree(callbacks: cb, isMuted: s.isMuted)
     case .diagnosing:
       return diagnoseTree(snapshot: s, callbacks: cb)
-    case .resolving:
-      // Phase is between library miss and web search — no narration set
-      // yet. Show a generic "Looking for a fix…" placeholder so the
-      // lens doesn't blank.
+    case .resolving, .resolved:
+      // Resolution not landed yet (it routes above when it has) — we're
+      // between library miss and web search with no narration set. Show a
+      // generic "Looking for a fix…" placeholder so the lens doesn't blank.
       return searchingTree(narration: .searchingLibrary, callbacks: cb, isMuted: s.isMuted, animFrame: s.searchAnimFrame)
-    case .resolved:
-      if case .noMatch = s.resolution {
-        return noSolutionTree(callbacks: cb, isMuted: s.isMuted)
-      } else {
-        return resolvedTree(snapshot: s, callbacks: cb)
-      }
     }
   }
 

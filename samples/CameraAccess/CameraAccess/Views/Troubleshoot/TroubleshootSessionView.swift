@@ -208,10 +208,21 @@ struct TroubleshootSessionView: View {
         HandGestureDebugStack(provider: HandGestureService.shared)
       }
 
-      // Non-blocking HFP warning (auto-clears when buffers resume).
-      if viewModel.micStalled {
-        VStack {
-          micStalledBanner
+      // Session-health banners: voice-socket errors, camera-branch death,
+      // mic stall. Top-anchored, non-blocking (voice keeps running under the
+      // camera banner). Mirrors CoachingSessionView's banner stack — this view
+      // previously surfaced NO error UI at all for Gemini/camera failures.
+      if isGeminiError || viewModel.cameraHealth != .ok || viewModel.micStalled {
+        VStack(spacing: Spacing.sm) {
+          if isGeminiError {
+            reconnectBanner
+          }
+          if viewModel.cameraHealth != .ok {
+            cameraHealthBanner
+          }
+          if viewModel.micStalled {
+            micStalledBanner
+          }
           Spacer()
         }
         .padding(.top, Spacing.section)
@@ -219,6 +230,8 @@ struct TroubleshootSessionView: View {
       }
     }
     .animation(.easeInOut(duration: 0.25), value: viewModel.micStalled)
+    .animation(.easeInOut(duration: 0.25), value: viewModel.cameraHealth)
+    .animation(.easeInOut(duration: 0.25), value: isGeminiError)
     .preferredColorScheme(.dark)
     .onAppear {
       // Double index-finger pinch ("back" gesture) → end-diagnostic
@@ -357,6 +370,15 @@ struct TroubleshootSessionView: View {
           viewModel.pendingDATHelperUpdate = false
         }
       )
+    }
+    // Camera-branch death — same surface as CoachingSessionView. Fires once
+    // per failure episode; the persistent cameraHealthBanner remains after
+    // dismissal as the voice-only indicator.
+    .alert("Camera lost", isPresented: $viewModel.showCameraLostAlert) {
+      Button("Retry") { viewModel.retryCameraBranch() }
+      Button("Continue voice-only", role: .cancel) {}
+    } message: {
+      Text("I can no longer see the product. Visual diagnosis is off until the camera reconnects.")
     }
   }
 
@@ -497,6 +519,68 @@ struct TroubleshootSessionView: View {
         .font(.retraceCallout)
         .foregroundColor(.textPrimary)
       Spacer(minLength: 0)
+    }
+    .padding(Spacing.md)
+    .glassPanel(cornerRadius: Radius.md)
+    .padding(.horizontal, Spacing.xl)
+  }
+
+  private var isGeminiError: Bool {
+    if case .error = viewModel.geminiConnectionState { return true }
+    return false
+  }
+
+  /// Voice-socket error banner — mirrors CoachingSessionView's. Reconnect
+  /// resumes the Gemini WebSocket (session-resumption handle when available).
+  private var reconnectBanner: some View {
+    HStack(spacing: Spacing.md) {
+      Image(systemName: "exclamationmark.triangle.fill")
+        .foregroundColor(.textPrimary)
+      Text("Voice session disconnected")
+        .font(.retraceCallout)
+        .foregroundColor(.textPrimary)
+      Spacer(minLength: 0)
+      Button {
+        viewModel.retryGemini()
+      } label: {
+        Text("Reconnect")
+          .font(.retraceFace(.semibold, size: 16))
+          .foregroundColor(.textPrimary)
+      }
+    }
+    .padding(Spacing.md)
+    .glassPanel(cornerRadius: Radius.md)
+    .padding(.horizontal, Spacing.xl)
+  }
+
+  /// Persistent camera-health banner — mirrors CoachingSessionView's.
+  /// `.reconnecting` while a user-initiated camera rebuild runs; `.failed`
+  /// when the camera branch is dead and the session is voice-only. Retry
+  /// rebuilds ONLY the camera branch, not the voice socket.
+  private var cameraHealthBanner: some View {
+    HStack(spacing: Spacing.md) {
+      if viewModel.cameraHealth == .reconnecting {
+        ProgressView()
+          .tint(.textPrimary)
+        Text("Reconnecting camera…")
+          .font(.retraceCallout)
+          .foregroundColor(.textPrimary)
+        Spacer(minLength: 0)
+      } else {
+        Image(systemName: "video.slash.fill")
+          .foregroundColor(.textPrimary)
+        Text("Camera lost — I can't see the product")
+          .font(.retraceCallout)
+          .foregroundColor(.textPrimary)
+        Spacer(minLength: 0)
+        Button {
+          viewModel.retryCameraBranch()
+        } label: {
+          Text("Retry")
+            .font(.retraceFace(.semibold, size: 16))
+            .foregroundColor(.textPrimary)
+        }
+      }
     }
     .padding(Spacing.md)
     .glassPanel(cornerRadius: Radius.md)

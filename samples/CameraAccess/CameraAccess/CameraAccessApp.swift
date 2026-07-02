@@ -35,6 +35,7 @@ struct CameraAccessApp: App {
   @StateObject private var lensDisplayCoordinator: LensDisplayCoordinator
   @StateObject private var lensSession: LensSession
   @StateObject private var glassesNavCoordinator: GlassesNavigationCoordinator
+  @ObservedObject private var localNetworkPermission = LocalNetworkPermission.shared
 
   init() {
     RetraceNavBarAppearance.install()
@@ -76,7 +77,9 @@ struct CameraAccessApp: App {
     #if DEBUG
     // Auto-configure MockDeviceKit when launched by XCUITests
     if arguments.contains("--ui-testing") {
-      let device = MockDeviceKit.shared.pairRaybanMeta()
+      // 0.8: pairGlasses(model:) replaces pairRaybanMeta(); only throws
+      // .notEnabled, which would be a test-harness misconfiguration.
+      let device = try! MockDeviceKit.shared.pairGlasses(model: .rayBanMeta)
 
       let cameraKit = device.services.camera
       Task {
@@ -85,8 +88,8 @@ struct CameraAccessApp: App {
         else {
           fatalError("Test resources not found - are you running a Release build?")
         }
-        await cameraKit.setCameraFeed(fileURL: videoURL)
-        await cameraKit.setCapturedImage(fileURL: imageURL)
+        cameraKit.setCameraFeed(fileURL: videoURL)
+        cameraKit.setCapturedImage(fileURL: imageURL)
 
         device.powerOn()
         device.don()
@@ -131,6 +134,20 @@ struct CameraAccessApp: App {
           }
         } message: {
           Text(wearablesViewModel.errorMessage)
+        }
+        // Trigger the iOS Local Network prompt on fresh installs and log the
+        // definitive grant state every launch. Denied = DAT 0.8 WiFi glasses
+        // video AND _retrace._tcp server discovery silently fall back/fail.
+        .task { await LocalNetworkPermission.shared.check(context: "app-launch") }
+        .alert("Local Network Access Needed", isPresented: $localNetworkPermission.showDeniedAlert) {
+          Button("Open Settings") {
+            if let url = URL(string: UIApplication.openSettingsURLString) {
+              UIApplication.shared.open(url)
+            }
+          }
+          Button("Not Now", role: .cancel) {}
+        } message: {
+          Text("Local Network access is off, so Retrace can't stream glasses video over Wi-Fi or find your server. Enable it in Settings → Privacy & Security → Local Network → Retrace.")
         }
         .overlay {
           RegistrationView(viewModel: wearablesViewModel)

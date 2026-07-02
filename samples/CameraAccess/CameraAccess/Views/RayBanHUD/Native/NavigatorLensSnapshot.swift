@@ -89,9 +89,11 @@ struct NavigatorLensSnapshot: Equatable {
   let stepBody: String         // truncated for the lens
   let stepIndex: Int           // 0-based page index into steps
   let stepPageCount: Int       // == stepCount; pager visible when > 1
-  /// True only when the detail procedure is video-sourced and has a source
-  /// recording — gates the "Watch full recording" pill (hidden for manual/web).
-  let hasRecording: Bool
+  /// True only when the CURRENT step resolves to a playable video clip —
+  /// gates the "Watch step reference" pill. False for manual/web steps
+  /// (they resolve to .image/.none) and for steps with failed/missing clips.
+  /// Recomputed as the user pages steps.
+  let hasStepClip: Bool
   /// Current step's reference image URL (manual procedures only, https only);
   /// nil for video/web or over a plain-http server. Swaps as the user pages steps.
   /// Non-nil → the "View reference image" toggle pill is shown.

@@ -60,11 +60,29 @@ final class GlassesNavigationCoordinator: ObservableObject {
   /// resume (via the `persistentAudio.$micStalled` subscription).
   enum AudioPipelineStatus: Equatable { case ok, micPermissionDenied, hfpNotFlowing }
 
+  /// Health of the active runtime's camera branch, mirrored from whichever VM
+  /// is hosted behind the standby (`GeminiLiveSessionBase.cameraHealth` for
+  /// coaching/troubleshoot, `StreamSessionViewModel.cameraConnectionLost` for
+  /// expert recording). Those VMs run invisibly behind the ditto screen, so
+  /// this is the only way their frame-starvation watchdog reaches the
+  /// phone-visible standby. See `observeCameraHealth(_:)`.
+  enum CameraPipelineStatus: Equatable { case ok, disconnected }
+
   @Published private(set) var phase: Phase = .idle
   @Published private(set) var runtimeMode: RuntimeMode = .none
 
   /// Observable audio-pipeline health for the HFP warning overlay (phone-side).
   @Published private(set) var audioPipelineStatus: AudioPipelineStatus = .ok
+
+  /// Observable camera-pipeline health for the standby's health banner.
+  @Published private(set) var cameraPipelineStatus: CameraPipelineStatus = .ok
+
+  /// A short "which step/phase am I on" label for the active runtime, shown
+  /// alongside the health banner so a demo operator can tell where a failure
+  /// happened (e.g. "Step 3 of 7", "Diagnose"). `nil` when the active runtime
+  /// has no step/phase concept (expert recording, Ask AI) or none is active.
+  /// See `observeStepLabel(_:)`.
+  @Published private(set) var currentStepLabel: String?
 
   /// The procedure to coach while `runtimeMode == .learnerCoaching`.
   @Published private(set) var coachingProcedure: ProcedureResponse?
@@ -100,6 +118,15 @@ final class GlassesNavigationCoordinator: ObservableObject {
   /// Combine subscription to `persistentAudio.$micStalled` for mid-session HFP
   /// loss → drives `audioPipelineStatus` while a glasses session is live.
   private var audioHealthCancellable: AnyCancellable?
+
+  /// Combine subscription installed by the active runtime host, mirroring its
+  /// VM's camera-health signal into `cameraPipelineStatus`. See
+  /// `observeCameraHealth(_:)`.
+  private var cameraHealthCancellable: AnyCancellable?
+
+  /// Combine subscription installed by the active runtime host, mirroring its
+  /// VM's current step/phase into `currentStepLabel`. See `observeStepLabel(_:)`.
+  private var stepLabelCancellable: AnyCancellable?
 
   /// Glasses-native persistent audio. Armed ONCE in `enterGlassesMode()` —
   /// before the navigator Display — and kept alive for the whole glasses
@@ -315,6 +342,36 @@ final class GlassesNavigationCoordinator: ObservableObject {
     return locked
   }
 
+  /// Resend the current lens to the glasses display (recover the HUD after an
+  /// accidental system back-gesture dismiss). Only meaningful while a glasses
+  /// session is live.
+  func resendLensToDisplay() {
+    guard phase == .active else { return }
+    lensSession?.resendLensToDisplay()
+  }
+
+  /// Called by the active runtime host on `.onAppear` to mirror its VM's
+  /// camera-health signal (`true` == camera branch down) into
+  /// `cameraPipelineStatus`, so the standby's health banner can see a failure
+  /// that's otherwise invisible behind the `Color.clear` host.
+  func observeCameraHealth<P: Publisher>(_ publisher: P) where P.Output == Bool, P.Failure == Never {
+    cameraHealthCancellable = publisher
+      .receive(on: DispatchQueue.main)
+      .sink { [weak self] disconnected in
+        self?.cameraPipelineStatus = disconnected ? .disconnected : .ok
+      }
+  }
+
+  /// Called by the active runtime host on `.onAppear` to mirror its VM's
+  /// current step/phase into `currentStepLabel`.
+  func observeStepLabel<P: Publisher>(_ publisher: P) where P.Output == String?, P.Failure == Never {
+    stepLabelCancellable = publisher
+      .receive(on: DispatchQueue.main)
+      .sink { [weak self] label in
+        self?.currentStepLabel = label
+      }
+  }
+
   /// Cancel from the gate, or "Take back on phone" from the standby → tear the
   /// lens navigator down (if it was active) and return the phone to normal.
   func exitGlassesMode() {
@@ -351,6 +408,10 @@ final class GlassesNavigationCoordinator: ObservableObject {
       }
       self.audioHealthCancellable = nil
       self.audioPipelineStatus = .ok
+      self.cameraHealthCancellable = nil
+      self.cameraPipelineStatus = .ok
+      self.stepLabelCancellable = nil
+      self.currentStepLabel = nil
       self.uploadCancellables.removeAll()
       self.runtimeMode = .none
       self.coachingProcedure = nil
@@ -375,6 +436,15 @@ final class GlassesNavigationCoordinator: ObservableObject {
   /// Expert recording uses the simplex `.recording` audio mode and is
   /// intentionally not routed through here.
   private func startAudioRuntime(_ mount: @escaping () -> Void) {
+    // Clear any health/step signal left over from a prior mode (e.g. a
+    // troubleshoot → coaching or Ask AI → coaching handoff) — the new host's
+    // `.onAppear` re-subscribes immediately, but without this the banner
+    // could briefly (or, if the new host never re-subscribes for some
+    // reason, indefinitely) show a stale failure from the mode just exited.
+    cameraHealthCancellable = nil
+    cameraPipelineStatus = .ok
+    stepLabelCancellable = nil
+    currentStepLabel = nil
     Task { @MainActor [weak self] in
       guard let self else { return }
       mount()
@@ -389,6 +459,12 @@ final class GlassesNavigationCoordinator: ObservableObject {
   func startExpertRecording() {
     guard phase == .active else { return }
     uploadService.reset()
+    // See the matching reset in `startAudioRuntime` — same rationale, this
+    // mode just isn't routed through that helper (simplex `.recording` audio).
+    cameraHealthCancellable = nil
+    cameraPipelineStatus = .ok
+    stepLabelCancellable = nil
+    currentStepLabel = nil
     runtimeMode = .expertRecording
   }
 
