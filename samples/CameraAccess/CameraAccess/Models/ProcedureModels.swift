@@ -19,6 +19,15 @@ struct OnlineSource: Codable, Identifiable, Hashable {
   var id: String { url }
 }
 
+/// One entry in the procedure's visual parts glossary. Extracted by Gemini
+/// from the expert video (and editable via `PUT /api/procedures/{id}`); the
+/// server embeds these into the Gemini Live coaching prompt so the coach can
+/// visually disambiguate parts ("is this the right piece?").
+struct ProcedurePart: Codable, Hashable {
+  var name: String
+  var appearance: String
+}
+
 struct ProcedureResponse: Codable, Identifiable, Equatable {
   let id: String
   let title: String
@@ -54,9 +63,12 @@ struct ProcedureResponse: Codable, Identifiable, Equatable {
   // image was uploaded. Optional for backward compatibility with
   // servers that predate the field.
   let referenceImageUrl: String?
+  // Visual parts glossary. Empty/nil for manual/web procedures, legacy
+  // rows, and servers that predate the field.
+  let parts: [ProcedurePart]?
 
   enum CodingKeys: String, CodingKey {
-    case id, title, description, steps, status, category, sources
+    case id, title, description, steps, status, category, sources, parts
     case totalDuration = "total_duration"
     case createdAt = "created_at"
     case errorMessage = "error_message"
@@ -84,6 +96,7 @@ struct ProcedureResponse: Codable, Identifiable, Equatable {
     sources = try c.decodeIfPresent([OnlineSource].self, forKey: .sources)
     sourceType = try c.decodeIfPresent(String.self, forKey: .sourceType)
     referenceImageUrl = try c.decodeIfPresent(String.self, forKey: .referenceImageUrl)
+    parts = try c.decodeIfPresent([ProcedurePart].self, forKey: .parts)
   }
 }
 
@@ -248,9 +261,12 @@ struct ProcedureUpdateRequest: Codable {
   var title: String?
   var description: String?
   var stepOrder: [Int]?
+  // Defaulted so existing call sites that don't touch the glossary
+  // keep compiling; nil = leave the server's parts unchanged.
+  var parts: [ProcedurePart]? = nil
 
   enum CodingKeys: String, CodingKey {
-    case title, description
+    case title, description, parts
     case stepOrder = "step_order"
   }
 }

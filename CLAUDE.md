@@ -271,7 +271,7 @@ samples/CameraAccess/
 │   ├── Models/
 │   │   ├── CaptureTransport.swift     # .glasses | .iPhone
 │   │   ├── DiagnosticModels.swift     # Codable mirrors of /api/troubleshoot (session, state, handoff, manual upload/status, candidate procedure, diagnostic log entry)
-│   │   └── ProcedureModels.swift      # Codable mirrors of server models (procedures, steps incl. visualVerifiability, session, voices, SessionRecord) + VerifyResponse (oracle verdict)
+│   │   └── ProcedureModels.swift      # Codable mirrors of server models (procedures, steps incl. visualVerifiability, ProcedurePart visual glossary, session, voices, SessionRecord) + VerifyResponse (oracle verdict)
 │   ├── Services/
 │   │   ├── BonjourDiscovery.swift     # NWBrowser for _retrace._tcp; caches serverBaseURL
 │   │   ├── ServerEndpoint.swift       # 4-mode backend resolver (.auto/.local/.cloud/.custom) + compiled-in cloud URL; mirrors result to UserDefaults["serverBaseURL"]

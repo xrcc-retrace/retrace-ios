@@ -9,6 +9,7 @@ struct ProcedureEditView: View {
   @State private var title: String
   @State private var description: String
   @State private var stepOrder: [ProcedureStepResponse]
+  @State private var parts: [EditablePart]
   @State private var isSaving = false
   @State private var errorMessage: String?
 
@@ -27,13 +28,19 @@ struct ProcedureEditView: View {
     self._title = State(initialValue: procedure.title)
     self._description = State(initialValue: procedure.description)
     self._stepOrder = State(initialValue: procedure.steps.sorted { $0.stepNumber < $1.stepNumber })
+    self._parts = State(initialValue: (procedure.parts ?? []).map(EditablePart.init))
   }
 
   private var hasChanges: Bool {
     title != procedure.title ||
     description != procedure.description ||
     stepOrder.map(\.stepNumber) != procedure.steps.sorted(by: { $0.stepNumber < $1.stepNumber }).map(\.stepNumber) ||
+    hasPartsChange ||
     (referenceImageEnabled && hasReferenceChange)
+  }
+
+  private var hasPartsChange: Bool {
+    parts.map(\.asPart) != (procedure.parts ?? [])
   }
 
   // MARK: - Reference image state
@@ -106,6 +113,10 @@ struct ProcedureEditView: View {
               )
           }
 
+          // Parts glossary (staged; committed on Save). What the AI coach
+          // uses to visually identify pieces during a Gemini Live session.
+          partsSection
+
           // Reference image (staged; committed on Save)
           if referenceImageEnabled {
             referenceImageSection
@@ -172,6 +183,64 @@ struct ProcedureEditView: View {
     }
     .referenceImagePicker(isPresented: $showImageSourceDialog) { image in
       refIntent = .replace(image)
+    }
+  }
+
+  // MARK: - Parts glossary section
+
+  @ViewBuilder
+  private var partsSection: some View {
+    VStack(alignment: .leading, spacing: Spacing.md) {
+      Text("PARTS")
+        .font(.retraceOverline)
+        .tracking(0.5)
+        .foregroundColor(.textSecondary)
+
+      Text("The AI coach uses these descriptions to visually identify pieces during a session.")
+        .font(.retraceSubheadline)
+        .foregroundColor(.textTertiary)
+
+      ForEach($parts) { $part in
+        VStack(alignment: .leading, spacing: Spacing.md) {
+          HStack(spacing: Spacing.lg) {
+            TextField("Part name", text: $part.name)
+              .font(.retraceFace(.semibold, size: 16))
+              .foregroundColor(.textPrimary)
+
+            Button(role: .destructive) {
+              parts.removeAll { $0.id == part.id }
+            } label: {
+              Image(systemName: "trash")
+                .font(.retraceCallout)
+                .foregroundColor(.semanticError)
+            }
+          }
+
+          TextEditor(text: $part.appearance)
+            .font(.retraceCallout)
+            .foregroundColor(.textPrimary)
+            .scrollContentBackground(.hidden)
+            .frame(minHeight: 60)
+        }
+        .padding(Spacing.lg)
+        .background(Color.surfaceRaised)
+        .cornerRadius(Radius.md)
+        .overlay(
+          RoundedRectangle(cornerRadius: Radius.md)
+            .stroke(Color.borderSubtle, lineWidth: 1)
+        )
+      }
+
+      Button {
+        parts.append(EditablePart(name: "", appearance: ""))
+      } label: {
+        HStack(spacing: Spacing.xs) {
+          Image(systemName: "plus.circle")
+          Text("Add part")
+        }
+        .font(.retraceCallout)
+        .foregroundColor(.appPrimary)
+      }
     }
   }
 
@@ -298,13 +367,19 @@ struct ProcedureEditView: View {
     let titleChanged = title != procedure.title
     let descChanged = description != procedure.description
     let orderChanged = stepOrder.map(\.stepNumber) != procedure.steps.sorted(by: { $0.stepNumber < $1.stepNumber }).map(\.stepNumber)
+    let partsChanged = hasPartsChange
 
     do {
-      if titleChanged || descChanged || orderChanged {
+      if titleChanged || descChanged || orderChanged || partsChanged {
+        // Drop rows with an empty name (a just-added blank card or a
+        // cleared-out entry counts as deleted).
+        let cleanedParts = parts.map(\.asPart)
+          .filter { !$0.name.trimmingCharacters(in: .whitespaces).isEmpty }
         let update = ProcedureUpdateRequest(
           title: titleChanged ? title : nil,
           description: descChanged ? description : nil,
-          stepOrder: orderChanged ? stepOrder.map(\.stepNumber) : nil
+          stepOrder: orderChanged ? stepOrder.map(\.stepNumber) : nil,
+          parts: partsChanged ? cleanedParts : nil
         )
         _ = try await api.updateProcedure(id: procedure.id, update: update)
       }
@@ -334,4 +409,28 @@ private enum RefImageIntent {
   case keep
   case replace(UIImage)
   case remove
+}
+
+/// Local editing wrapper for a `ProcedurePart` — gives each row a stable
+/// `UUID` identity so `ForEach` bindings survive add/remove, which the
+/// server model (keyed only by name/appearance) can't provide while both
+/// fields are mid-edit.
+private struct EditablePart: Identifiable {
+  let id = UUID()
+  var name: String
+  var appearance: String
+
+  init(name: String, appearance: String) {
+    self.name = name
+    self.appearance = appearance
+  }
+
+  init(_ part: ProcedurePart) {
+    self.name = part.name
+    self.appearance = part.appearance
+  }
+
+  var asPart: ProcedurePart {
+    ProcedurePart(name: name, appearance: appearance)
+  }
 }
