@@ -56,7 +56,7 @@ final class GlassesCoachingFrameSource: @unchecked Sendable {
   ///   2. Preview — 10 Hz throttled. Decode `videoFrame.makeUIImage()` here on
   ///      the caller's queue; the bridge closure hops the `@Published` preview
   ///      assignment onto MainActor.
-  ///   3. Gemini JPEG — 0.5 fps throttled (`minInterval`) plus an
+  ///   3. Gemini JPEG — 1 fps throttled (`minInterval`) plus an
   ///      `isEncodingFrame` re-entry guard so a slow WebSocket send can't pile
   ///      up encodes. JPEG bytes go straight from CVPixelBuffer through
   ///      `CIContext.jpegRepresentation(...)` — no UIImage round-trip, matching

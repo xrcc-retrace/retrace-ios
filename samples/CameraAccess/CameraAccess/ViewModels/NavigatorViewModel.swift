@@ -150,12 +150,13 @@ final class NavigatorViewModel: ObservableObject {
 
   func openLearner() {
     selectedCategory = "All"
-    // Re-read saved state before deciding the default tab — this store
-    // instance is long-lived (owned by the coordinator for the whole app
-    // session) and can be stale relative to saves made through the phone
-    // Learner tab's own `LocalProgressStore` instance.
+    // Re-read saved state so the Saved tab reflects saves made through the
+    // phone Learner tab's own `LocalProgressStore` instance (this store is
+    // long-lived, owned by the coordinator for the whole app session).
     progressStore.reload()
-    listTab = progressStore.savedProcedureIDs.isEmpty ? .all : .saved
+    // Always open on Saved — the learner's own workflows are the primary view;
+    // they tap "All" to browse the full library.
+    listTab = .saved
     screen = .learnerHub
     loadProcedures()
   }

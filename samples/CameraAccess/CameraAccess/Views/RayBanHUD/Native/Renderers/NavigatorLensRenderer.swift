@@ -89,15 +89,26 @@ final class NavigatorLensRenderer: LensRenderer {
 
     // The inline reference-image toggle is separate VM state (not in the
     // arity-full CombineLatest above), so it gets its own repaint sink.
+    // `.receive(on:)` is load-bearing: `@Published` emits in `willSet`, so a
+    // bare sink would run `scheduleSend()` BEFORE the property commits and
+    // re-project the OLD value — which `scheduleSend`'s dedup then suppresses,
+    // so the change wouldn't paint until the NEXT emission. Deferring to the
+    // main queue lets the projection read the committed value.
     viewModel.$showReferenceImage
+      .receive(on: DispatchQueue.main)
       .sink { [weak self] _ in
         self?.scheduleSend()
       }
       .store(in: &cancellables)
 
     // Saved/All tab selection — same reasoning (the CombineLatest3 above is
-    // already at arity), its own repaint sink.
+    // already at arity), its own repaint sink. `.receive(on:)` for the same
+    // `willSet` reason as `$showReferenceImage` above: without it the first tap
+    // projected the pre-commit `listTab`, got deduped, and only the SECOND tap
+    // painted the new list. (The `CombineLatest3` sink avoids this because
+    // `.throttle(scheduler:)` already reschedules off `willSet`.)
     viewModel.$listTab
+      .receive(on: DispatchQueue.main)
       .sink { [weak self] _ in
         self?.scheduleSend()
       }

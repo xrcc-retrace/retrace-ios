@@ -235,7 +235,7 @@ class GeminiLiveService: ObservableObject {
   }
 
   /// Send a single JPEG-encoded video frame to Gemini Live.
-  /// Call at a modest rate (≈0.5 fps) — Gemini Live is rate-limited on video input.
+  /// Call at a modest rate (≈1 fps, `videoMinInterval`) — Gemini Live is rate-limited on video input.
   /// Wire format: canonical `realtimeInput.video` blob (not the deprecated
   /// `mediaChunks` array form).
   func sendVideoFrame(_ jpegData: Data) async throws {

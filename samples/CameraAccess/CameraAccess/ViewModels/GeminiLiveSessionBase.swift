@@ -216,11 +216,6 @@ class GeminiLiveSessionBase: ObservableObject {
   /// `advance_step`. Set via `setReferenceClipPlaying(_:)` from the clip's
   /// start/terminal events; only the native-lens path drives it.
   var isClipPlaying = false
-  /// True while we've intentionally stopped the glasses camera `Stream` to free
-  /// the Bluetooth link during reference-clip playback. The stream state listener
-  /// AND the frame-starvation watchdog both check this so the resulting
-  /// `.stopped` / frame gap isn't treated as a camera failure.
-  var isCameraPausedForClip = false
 
   // MARK: - Push-to-talk (walkie-talkie) — demo mode only
 
@@ -338,12 +333,6 @@ class GeminiLiveSessionBase: ObservableObject {
   /// The stale frame stamp at probation entry — lets the recovery log print
   /// the exact survived gap length (the WiFi-migration measurement).
   private var videoStallProbationLastFrameAt: Date?
-
-  /// Starvation checks are skipped until this instant. Set on clip-resume so
-  /// the stream-restart ramp (~1-2s at 2fps, worse on a congested BT link)
-  /// can't instantly re-fire off the stale pre-pause stamp.
-  private var videoWatchdogGraceUntil: Date = .distantPast
-  private static let clipResumeFrameGrace: TimeInterval = 10.0
 
   /// Set by the camera setup Task when an unrecoverable setup-time error
   /// hits (failed `manager.acquire`, `addStream` returning nil, iPhone
@@ -1096,7 +1085,7 @@ class GeminiLiveSessionBase: ObservableObject {
     observeAudioIsAISpeaking(audio)
   }
 
-  /// Pause / resume the Gemini loop around native-lens reference-clip
+  /// Silence / un-silence the Gemini loop around native-lens reference-clip
   /// playback. Flips `isClipPlaying` (which all three send gates AND the
   /// inbound `onAudioData` handler read) and, on start, flushes any
   /// already-queued Gemini speech via `clearPlaybackBuffer`. Together those
@@ -1106,23 +1095,18 @@ class GeminiLiveSessionBase: ObservableObject {
   /// Driven only from the native-lens clip lifecycle (`CoachingLensRenderer`),
   /// paired with the clip's start (`onStarted`) and terminal (`onEnded`/
   /// `onError`) events so the gate can't latch open or closed.
+  ///
+  /// The glasses camera Stream is deliberately LEFT RUNNING during the clip:
+  /// on DAT 0.8 video rides the WiFi link, not the BT radio the clip's audio
+  /// uses, so there's no contention to relieve by stopping it. The send gates
+  /// (`!isClipPlaying`) already keep those frames from reaching Gemini, so the
+  /// model stays blind/silent without a stop→restart cycle.
   @MainActor
   func setReferenceClipPlaying(_ playing: Bool) {
     guard isClipPlaying != playing else { return }
     isClipPlaying = playing
     if playing {
       audioManager?.clearPlaybackBuffer(reason: "reference-clip-start")
-    }
-    // Also stop the glasses camera Stream during the clip so its frames stop
-    // contending for the Bluetooth link. Glasses-only — the pause/resume methods
-    // no-op without a glasses stream. Serialized via cameraLifecycleTask, so
-    // exiting the session mid-clip can't race them.
-    if glassesStream != nil {
-      if playing {
-        pauseGlassesCameraForClip()
-      } else {
-        resumeGlassesCameraForClip()
-      }
     }
   }
 
@@ -1287,12 +1271,6 @@ class GeminiLiveSessionBase: ObservableObject {
     firstFrameSeen = false
     cameraSetupFailed = false
     cameraStarvationSurfaced = false
-    videoWatchdogGraceUntil = .distantPast
-    // Stale-pause guard: if the previous stream died DURING a clip pause,
-    // `resumeGlassesCameraForClip` no-op'd (stream already nil) and the flag
-    // stayed true — which would permanently suppress the new attach's
-    // watchdog and state listener.
-    isCameraPausedForClip = false
     stopVideoWatchdog()
     if let pending = firstFrameContinuation {
       firstFrameContinuation = nil
@@ -1386,7 +1364,8 @@ class GeminiLiveSessionBase: ObservableObject {
           // frameRate 2 is the SDK's lowest valid value ({2,7,15,24,30});
           // it's a Gemini token/latency budget, not a bandwidth setting —
           // the videoMinInterval = 1.0s throttle drops every other frame so
-          // Gemini sees 1 fps net. Re-run the token math before raising it.
+          // Gemini sees 1 fps net. Going above 2 fps would require
+          // frameRate 7 here. Re-run the token math before raising either.
           // First-frame ramp-up at .high can reach ~10s; the 30s
           // awaitCameraReady ceiling covers it.
           //
@@ -1574,10 +1553,6 @@ class GeminiLiveSessionBase: ObservableObject {
           sawStreaming = false  // avoid re-firing on idempotent stops during teardown
           Task { @MainActor [weak self] in
             guard let self = self else { return }
-            // Intentional clip-pause stop (pauseGlassesCameraForClip) — not a
-            // real drop. The flag stays set through the whole stop→start cycle,
-            // so the restart's transient states are covered too.
-            guard !self.isCameraPausedForClip else { return }
             // A Stream-capability drop kills the camera, not the voice
             // socket — route to the camera failure sink (alert + banner +
             // camera-only retry) instead of the socket error state, whose
@@ -1689,13 +1664,10 @@ class GeminiLiveSessionBase: ObservableObject {
   @MainActor
   private func checkVideoStarvation() {
     guard videoWatchdogTask != nil, !cameraStarvationSurfaced else { return }
-    // Intentional clip-pause (`pauseGlassesCameraForClip`) stops the stream —
-    // a >5s frame gap during it is EXPECTED, not transport death. The state
-    // listener already honors this flag; the watchdog must too, or every
-    // reference clip longer than the stall threshold invalidates the session.
-    guard !isCameraPausedForClip else { return }
-    // Post-resume grace — the restart ramp would trip the stale stamp.
-    guard Date() >= videoWatchdogGraceUntil else { return }
+    // The camera now stays running through reference-clip playback (video is
+    // on WiFi, so there's no radio to free by stopping it). Frames keep
+    // arriving and are stamped upstream of the send gate, so the watchdog runs
+    // normally during a clip — a genuine link death mid-clip is still caught.
     guard geminiConnectionState == .connected || geminiConnectionState == .connecting else { return }
 
     let lastFrame = readLastVideoFrameAt()
@@ -1847,8 +1819,9 @@ class GeminiLiveSessionBase: ObservableObject {
     }
   }
 
-  /// iPhone-native video source. Throttled at the shared 0.5 fps / 0.5 quality
-  /// so the token budget math carries over from the glasses path. Returns
+  /// iPhone-native video source. Throttled at the shared `videoMinInterval` /
+  /// `videoJpegQuality` (1 fps / 0.85) so the token budget math carries over
+  /// from the glasses path. Returns
   /// `true` once the first sample buffer arrives from `AVCaptureSession`,
   /// `false` on permission denial / start failure / first-buffer timeout.
   /// Awaited by `startGeminiLiveSession` step 3 — same contract as the
@@ -1860,8 +1833,6 @@ class GeminiLiveSessionBase: ObservableObject {
     firstFrameSeen = false
     cameraSetupFailed = false
     cameraStarvationSurfaced = false
-    videoWatchdogGraceUntil = .distantPast
-    isCameraPausedForClip = false  // see setupCameraStream — stale-pause guard
     stopVideoWatchdog()
     if let pending = firstFrameContinuation {
       firstFrameContinuation = nil
@@ -2178,41 +2149,14 @@ class GeminiLiveSessionBase: ObservableObject {
   }
 
 
-  // MARK: - Camera pause during clip playback
-
-  /// Lightweight pause of the glasses camera `Stream` while a reference clip
-  /// plays on the lens. Stops the stream so its frames stop contending for the
-  /// Bluetooth link,
-  /// WITHOUT releasing the DeviceSessionManager lease, niling `glassesStream`,
-  /// or dropping the listener tokens — so `resumeGlassesCameraForClip()` can
-  /// restart the same warm `Stream` (no re-acquire / re-addStream). Chains on
-  /// `cameraLifecycleTask` so it can't race setup/teardown/resume. No-op when
-  /// no glasses stream is attached (iPhone / no-glasses transport).
-  func pauseGlassesCameraForClip() {
-    guard glassesStream != nil else { return }
-    let prior = cameraLifecycleTask
-    cameraLifecycleTask = Task { [weak self] in
-      await prior?.value
-      guard let self = self, let stream = self.glassesStream else { return }
-      // Set BEFORE stop() so the state listener treats the resulting `.stopped`
-      // as intentional rather than a dropped stream.
-      self.isCameraPausedForClip = true
-      print("[ClipCam] pausing glasses camera for clip (state=\(stream.state))")
-      // 0.8: stop() is synchronous and returns before the stream finishes
-      // draining. Wait (bounded) for `.stopped` so the clip's lens
-      // VideoPlayer doesn't start while camera frames still contend for the
-      // shared radio — the exact overlap this pause exists to avoid.
-      stream.stop()
-      await self.awaitStreamStopped(stream, timeout: 2.0)
-      print("[ClipCam] glasses camera paused (state=\(stream.state))")
-    }
-  }
+  // MARK: - Stream drain helper
 
   /// Bounded wait for a camera `Stream` to reach `.stopped` after the
   /// (0.8, synchronous) `stop()` call. Mirrors
   /// `StreamSessionViewModel.awaitDeviceSessionStopped` but against
   /// `Stream.statePublisher`. Times out silently — the caller only needs a
-  /// best-effort drain, not a guarantee.
+  /// best-effort drain, not a guarantee. Used by the camera-loan retire path
+  /// and the `stopCameraStream` teardown drain anchor.
   private func awaitStreamStopped(_ stream: MWDATCamera.Stream, timeout: TimeInterval) async {
     if stream.state == .stopped { return }
 
@@ -2245,34 +2189,8 @@ class GeminiLiveSessionBase: ObservableObject {
     }
     // Explicit unsubscribe (the token protocol exposes async cancel();
     // don't rely on deinit-based auto-removal keeping the closure off the
-    // shared Stream's publisher — this helper runs once per clip pause).
+    // shared Stream's publisher).
     await listenerToken.cancel()
-  }
-
-  /// Restart the glasses camera `Stream` paused by `pauseGlassesCameraForClip()`.
-  /// Reuses the retained stream + listener tokens. Since 0.8 `start()` is
-  /// synchronous fire-and-forget, so the restart ramp is covered entirely by
-  /// the re-stamp + `clipResumeFrameGrace` below; the pause flag clears only
-  /// after those are in place so a transient `.stopped` stays covered.
-  func resumeGlassesCameraForClip() {
-    guard glassesStream != nil else { return }
-    let prior = cameraLifecycleTask
-    cameraLifecycleTask = Task { [weak self] in
-      await prior?.value
-      guard let self = self, let stream = self.glassesStream else { return }
-      let startedAt = Date()
-      print("[ClipCam] resuming glasses camera (state=\(stream.state))")
-      stream.start()
-      // Re-stamp + grace BEFORE clearing the pause flag: the stamp is stale by
-      // the whole clip duration, so an unguarded watchdog tick between
-      // flag-clear and the first post-resume frame would instantly declare
-      // starvation. The grace covers the stream-restart ramp itself.
-      self.stampVideoFrame()
-      self.videoWatchdogGraceUntil = Date().addingTimeInterval(Self.clipResumeFrameGrace)
-      self.isCameraPausedForClip = false
-      let ms = Int(Date().timeIntervalSince(startedAt) * 1000)
-      print("[ClipCam] glasses camera resumed in \(ms)ms (state=\(stream.state))")
-    }
   }
 
   // MARK: - Tool call

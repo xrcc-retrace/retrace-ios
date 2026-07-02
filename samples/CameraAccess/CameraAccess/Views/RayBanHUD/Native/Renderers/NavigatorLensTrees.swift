@@ -206,7 +206,7 @@ enum NavigatorLensTrees {
       // Record is the HERO — the primary thing an expert comes here to do
       // (Browse procedures is the secondary path). Tall, big `.heading` text,
       // grown to dominate the view. First tappable → owns default focus.
-      recordHero(onTap: cb.onRecord)
+      primaryHero(icon: .videoCamera, label: "Record", grow: true, onTap: cb.onRecord)
 
       LensComponents.actionPill(icon: .eye, label: "Browse procedures", onTap: cb.onBrowse)
       LensComponents.smallIconButton(icon: .arrowLeft, onTap: cb.onBack)
@@ -214,25 +214,39 @@ enum NavigatorLensTrees {
     .padding(12)
   }
 
-  /// The prominent Record hero on the Expert hub — a tall centered `.card` with a
-  /// filled camera glyph to the LEFT of big `.heading` "Record" text in a `.row`,
-  /// `.flexGrow(1)` so it expands to fill the hub's free vertical space and
-  /// dominates the view. (The Learner hub had an analogous Ask-AI hero; that was
-  /// replaced with a compact two-button header — see `headerButton`.)
-  private static func recordHero(onTap: @escaping @Sendable () -> Void) -> FlexBox {
-    FlexBox(
+  /// A large, primary "hero" action button for the native lens: a filled glyph
+  /// to the LEFT of big `.heading` text in a `.card` `.row`, with generous
+  /// padding so it reads as the page's forward-path CTA. Per DESIGN.md, primary
+  /// emphasis on the lens comes from icon + heading size (never a color fill,
+  /// which the DSL can't do anyway). Used for the page's single recommended
+  /// next action — Record (Expert hub), Start coaching (Learner detail), Start
+  /// Troubleshoot (Troubleshoot intro).
+  ///
+  /// `grow: true` adds `.flexGrow(1)` so the hero expands to fill the free
+  /// vertical space and dominate the view — use it when the hero is the last
+  /// content element (Expert hub, Troubleshoot intro). `grow: false` keeps it
+  /// content-sized so it stays prominent without opening a gap above sibling
+  /// pills that follow it (Learner detail, which has "Watch reference" pills
+  /// below the CTA).
+  private static func primaryHero(
+    icon: IconName,
+    label: String,
+    grow: Bool = false,
+    onTap: @escaping @Sendable () -> Void
+  ) -> FlexBox {
+    var hero = FlexBox(
       direction: MWDATDisplay.Direction.row,
       spacing: 10,
       alignment: .center,
       crossAlignment: .center
     ) {
-      Icon(name: .videoCamera, style: .filled)
-      Text("Record", style: .heading, color: .primary)
+      Icon(name: icon, style: .filled)
+      Text(label, style: .heading, color: .primary)
     }
     .padding(28)
     .background(.card)
-    .flexGrow(1)
-    .onTap(onTap)
+    if grow { hero = hero.flexGrow(1) }
+    return hero.onTap(onTap)
   }
 
   // MARK: - Browse list
@@ -487,9 +501,11 @@ enum NavigatorLensTrees {
     }
   }
 
-  /// One tab chip. Active = leading checkmark + `.primary` text; inactive =
-  /// `.secondary` text, no checkmark (the DSL `Background` enum has no
-  /// accent/fill state to lean on instead — same idiom as `filterCell`).
+  /// One tab chip. Selected = leading checkmark Icon + `.primary` label;
+  /// unselected = no icon + dim `.secondary` label. The dim state is purely a
+  /// visual cue — it does NOT cause the old first-tap-does-nothing bug, which
+  /// was the `$listTab` sink projecting stale pre-`willSet` state (fixed with
+  /// `.receive(on:)` in NavigatorLensRenderer).
   private static func listTabChip(
     label: String,
     tab: NavigatorLensSnapshot.ListTab,
@@ -685,8 +701,10 @@ enum NavigatorLensTrees {
             onNext: cb.onNextStep
           )
         }
-        // "Start coaching" is the primary action → first pill (default focus).
-        LensComponents.actionPill(icon: .triangleRightCircle, label: "Start coaching", onTap: cb.onStartCoaching)
+        // "Start coaching" is the primary action → hero button, first tappable
+        // (default focus). `grow: false` so it stays content-sized and doesn't
+        // open a gap above the "Watch reference" pills that follow it.
+        primaryHero(icon: .triangleRightCircle, label: "Start coaching", onTap: cb.onStartCoaching)
         if s.hasStepClip {
           LensComponents.actionPill(icon: .videoCamera, label: "Watch step reference", onTap: cb.onWatchStepReference)
         }
@@ -737,7 +755,10 @@ enum NavigatorLensTrees {
         troubleshootStepBox(title: "Find a fix", caption: "Library or web manuals")
       }
 
-      LensComponents.actionPill(icon: .triangleRightCircle, label: "Start Troubleshoot", onTap: cb.onStartTroubleshoot)
+      // Start Troubleshoot is the primary action → hero button. `grow: true`
+      // (it's the last content element) so it fills the space below the intro
+      // step boxes and dominates as the recommended next action.
+      primaryHero(icon: .triangleRightCircle, label: "Start Troubleshoot", grow: true, onTap: cb.onStartTroubleshoot)
       LensComponents.smallIconButton(icon: .arrowLeft, onTap: cb.onBack)
     }
     .padding(12)
