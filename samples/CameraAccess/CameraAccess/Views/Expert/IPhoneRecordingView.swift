@@ -326,7 +326,7 @@ private struct GlassesRecordingEngine: View {
     }
     .onDisappear {
       lensSession.deactivate()
-      Task { await viewModel.teardown() }
+      viewModel.teardown()  // sync fire-and-forget; stashes its own teardown Task
     }
     .alert("Error", isPresented: $viewModel.showError) {
       if viewModel.cameraConnectionLost {

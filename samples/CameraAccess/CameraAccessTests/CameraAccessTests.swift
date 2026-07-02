@@ -17,15 +17,15 @@ import XCTest
 @MainActor
 class ViewModelIntegrationTests: XCTestCase {
 
-  private var mockDevice: MockRaybanMeta?
-  private var cameraKit: MockCameraKit?
+  private var mockDevice: (any MockGlasses)?
+  private var cameraKit: (any MockCameraKit)?
 
   override func setUp() async throws {
     try await super.setUp()
     try? Wearables.configure()
 
     // Pair mock device and set up camera kit
-    let pairedMockDevice = MockDeviceKit.shared.pairRaybanMeta()
+    let pairedMockDevice = try MockDeviceKit.shared.pairGlasses(model: .rayBanMeta)
     mockDevice = pairedMockDevice
     cameraKit = pairedMockDevice.services.camera
 
@@ -62,7 +62,7 @@ class ViewModelIntegrationTests: XCTestCase {
     }
 
     // Setup camera feed
-    await camera.setCameraFeed(fileURL: videoURL)
+    camera.setCameraFeed(fileURL: videoURL)
 
     let viewModel = StreamSessionViewModel(
       wearables: Wearables.shared,
@@ -115,8 +115,8 @@ class ViewModelIntegrationTests: XCTestCase {
     }
 
     // Setup camera feed
-    await camera.setCameraFeed(fileURL: videoURL)
-    await camera.setCapturedImage(fileURL: imageURL)
+    camera.setCameraFeed(fileURL: videoURL)
+    camera.setCapturedImage(fileURL: imageURL)
 
     let viewModel = StreamSessionViewModel(
       wearables: Wearables.shared,

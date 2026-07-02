@@ -46,8 +46,9 @@ struct NavigatorLensCallbacks {
   let onSelectCategory: @Sendable (String) -> Void
   let onSelectListTab: @Sendable (NavigatorLensSnapshot.ListTab) -> Void
   let onStartCoaching: @Sendable () -> Void
-  /// Play the full source recording full-screen on the lens (video procedures only).
-  let onWatchRecording: @Sendable () -> Void
+  /// Play the CURRENT step's reference clip full-screen on the lens (video-clip
+  /// steps only). Retargets as the user pages steps.
+  let onWatchStepReference: @Sendable () -> Void
   /// Toggle the inline per-step reference image (manual procedures only).
   let onToggleReferenceImage: @Sendable () -> Void
   /// Troubleshoot-mode intent.
@@ -348,8 +349,8 @@ enum NavigatorLensTrees {
             onNext: cb.onNextStep
           )
         }
-        if s.hasRecording {
-          LensComponents.actionPill(icon: .videoCamera, label: "Watch full recording", onTap: cb.onWatchRecording)
+        if s.hasStepClip {
+          LensComponents.actionPill(icon: .videoCamera, label: "Watch step reference", onTap: cb.onWatchStepReference)
         }
         if s.referenceImageURL != nil {
           LensComponents.actionPill(
@@ -686,8 +687,8 @@ enum NavigatorLensTrees {
         }
         // "Start coaching" is the primary action → first pill (default focus).
         LensComponents.actionPill(icon: .triangleRightCircle, label: "Start coaching", onTap: cb.onStartCoaching)
-        if s.hasRecording {
-          LensComponents.actionPill(icon: .videoCamera, label: "Watch full recording", onTap: cb.onWatchRecording)
+        if s.hasStepClip {
+          LensComponents.actionPill(icon: .videoCamera, label: "Watch step reference", onTap: cb.onWatchStepReference)
         }
         if s.referenceImageURL != nil {
           LensComponents.actionPill(

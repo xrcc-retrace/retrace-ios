@@ -19,12 +19,14 @@
 import Combine
 import MWDATCore
 import SwiftUI
+import UIKit
 
 struct GlassesSessionStandbyView: View {
   @ObservedObject var coordinator: GlassesNavigationCoordinator
   @ObservedObject private var navigatorVM: NavigatorViewModel
   let wearables: WearablesInterface
   @EnvironmentObject private var sessionManager: DeviceSessionManager
+  @EnvironmentObject private var lensCoordinator: LensDisplayCoordinator
 
   init(coordinator: GlassesNavigationCoordinator, wearables: WearablesInterface) {
     self._coordinator = ObservedObject(wrappedValue: coordinator)
@@ -34,10 +36,19 @@ struct GlassesSessionStandbyView: View {
 
   var body: some View {
     standby
-      // Non-blocking HFP warning: the glasses mic pipeline is broken. Auto-clears
-      // when `audioPipelineStatus` returns to `.ok` (buffers resume).
-      .overlay(alignment: .top) { audioWarningBanner }
+      // Top overlay: the re-send pill (always) stacked above the non-blocking HFP
+      // warning (only when the mic pipeline is broken; auto-clears on recovery).
+      // Both live in one VStack so they never overlap.
+      .overlay(alignment: .top) {
+        VStack(spacing: Spacing.md) {
+          resendLensToDisplayPill
+          sessionHealthBanner
+        }
+        .padding(.top, Spacing.md)
+      }
       .animation(.easeInOut(duration: 0.25), value: coordinator.audioPipelineStatus)
+      .animation(.easeInOut(duration: 0.25), value: coordinator.cameraPipelineStatus)
+      .animation(.easeInOut(duration: 0.25), value: lensCoordinator.lensUnresponsive)
       // Invisible runtime hosts. Present only while their runtime is active;
       // render nothing — they keep the heavy VM alive and drive the lens.
       .background {
@@ -72,23 +83,53 @@ struct GlassesSessionStandbyView: View {
       }
   }
 
-  // MARK: - HFP audio-failure warning (phone-only, auto-recovering)
+  // MARK: - Session health banner (audio / camera / lens, phone-only, auto-recovering)
+
+  /// True while ANY of the three glasses-session failure modes are active —
+  /// audio (HFP), camera (frame starvation), or lens (Display link frozen).
+  /// Each source clears independently, so the banner shrinks/grows row by row
+  /// as issues resolve rather than as an all-or-nothing block.
+  private var hasActiveHealthIssue: Bool {
+    coordinator.audioPipelineStatus != .ok
+      || coordinator.cameraPipelineStatus != .ok
+      || lensCoordinator.lensUnresponsive
+  }
+
+  /// "MODE · Step 3 of 7" (or just "MODE" when the active runtime has no
+  /// step/phase concept) — so whoever's reading the banner can immediately
+  /// tell WHERE the failure happened, not just that one did.
+  private var healthBannerContext: String {
+    guard let step = coordinator.currentStepLabel else { return mirrorStatus.mode }
+    return "\(mirrorStatus.mode) · \(step)"
+  }
 
   @ViewBuilder
-  private var audioWarningBanner: some View {
-    if coordinator.audioPipelineStatus != .ok {
-      VStack(alignment: .leading, spacing: Spacing.sm) {
-        HStack(spacing: Spacing.md) {
-          Image(systemName: "waveform.slash")
-            .foregroundColor(.textPrimary)
-          Text("Audio pipeline disconnected")
-            .font(.retraceFace(.semibold, size: 16))
-            .foregroundColor(.textPrimary)
+  private var sessionHealthBanner: some View {
+    if hasActiveHealthIssue {
+      VStack(alignment: .leading, spacing: Spacing.md) {
+        Text(healthBannerContext)
+          .font(.inter(.bold, size: 12))
+          .tracking(1.5)
+          .foregroundColor(.textSecondary.opacity(0.7))
+
+        if coordinator.audioPipelineStatus != .ok {
+          healthRow(icon: "waveform.slash", title: "Audio pipeline disconnected", detail: audioWarningDetail)
         }
-        Text(audioWarningDetail)
-          .font(.inter(.regular, size: 14))
-          .foregroundColor(.textSecondary.opacity(0.85))
-          .fixedSize(horizontal: false, vertical: true)
+        if coordinator.cameraPipelineStatus != .ok {
+          healthRow(
+            icon: "video.slash.fill",
+            title: "Camera feed lost",
+            detail: "Frame starvation detected — the glasses can't see. This clears automatically if the feed recovers."
+          )
+        }
+        if lensCoordinator.lensUnresponsive {
+          healthRow(
+            icon: "eyeglasses",
+            title: "Lens isn't responding",
+            detail: "The on-glasses display may be frozen — taps and voice won't reach it until you reset."
+          )
+        }
+
         Button {
           coordinator.exitGlassesMode()
         } label: {
@@ -106,8 +147,50 @@ struct GlassesSessionStandbyView: View {
       .padding(Spacing.lg)
       .glassPanel(cornerRadius: Radius.lg)
       .padding(.horizontal, Spacing.screenPadding)
-      .padding(.top, Spacing.section)
       .transition(.move(edge: .top).combined(with: .opacity))
+    }
+  }
+
+  @ViewBuilder
+  private func healthRow(icon: String, title: String, detail: String) -> some View {
+    VStack(alignment: .leading, spacing: Spacing.sm) {
+      HStack(spacing: Spacing.md) {
+        Image(systemName: icon)
+          .foregroundColor(.textPrimary)
+        Text(title)
+          .font(.retraceFace(.semibold, size: 16))
+          .foregroundColor(.textPrimary)
+      }
+      Text(detail)
+        .font(.inter(.regular, size: 14))
+        .foregroundColor(.textSecondary.opacity(0.85))
+        .fixedSize(horizontal: false, vertical: true)
+    }
+  }
+
+  // MARK: - Re-display last lens (recover from accidental dismiss)
+
+  /// A top pill that both NAMES the current glasses location and RE-SENDS the
+  /// last-shown lens when tapped. The system "back" gesture (middle-finger pinch)
+  /// dismisses the on-glasses HUD without ending the session — camera, Gemini, and
+  /// audio keep running — so this repaints the lens instead of forcing a full exit.
+  private var resendLensToDisplayPill: some View {
+    Button {
+      UIImpactFeedbackGenerator(style: .light).impactOccurred()
+      coordinator.resendLensToDisplay()
+    } label: {
+      HStack(spacing: Spacing.sm) {
+        Image(systemName: "arrow.clockwise")
+          .font(.system(size: 13, weight: .bold))
+        Text("Resend lens to display · \(mirrorStatus.mode)")
+          .font(.inter(.bold, size: 13))
+          .tracking(1)
+          .lineLimit(1)
+      }
+      .foregroundColor(.appPrimary)
+      .padding(.horizontal, Spacing.md + 2)
+      .padding(.vertical, Spacing.sm)
+      .background(Capsule().fill(Color.appPrimary.opacity(0.16)))
     }
   }
 
@@ -302,6 +385,7 @@ private struct GlassesRecordingHost: View {
       }
       .onAppear {
         coordinator.activeRuntime = viewModel
+        coordinator.observeCameraHealth(viewModel.$cameraConnectionLost.eraseToAnyPublisher())
         let vm = viewModel
         let context = ExpertLensContext(
           recordingManager: vm.recordingManager,
@@ -332,7 +416,7 @@ private struct GlassesRecordingHost: View {
         lensSession.activate(.expert, vm: context)
       }
       .onDisappear {
-        Task { await viewModel.teardown() }
+        viewModel.teardown()  // sync fire-and-forget; stashes its own teardown Task
       }
   }
 }
@@ -377,6 +461,10 @@ private struct GlassesCoachingHost: View {
     Color.clear
       .onAppear {
         coordinator.activeRuntime = viewModel
+        coordinator.observeCameraHealth(viewModel.$cameraHealth.map { $0 == .failed }.eraseToAnyPublisher())
+        coordinator.observeStepLabel(viewModel.$currentStepIndex
+          .map { idx -> String? in "Step \(idx + 1) of \(procedure.steps.count)" }
+          .eraseToAnyPublisher())
         viewModel.onExitConfirmed = { [weak coordinator] in
           coordinator?.exitCoaching()
         }
@@ -440,6 +528,12 @@ private struct GlassesTroubleshootHost: View {
       }
       .onAppear {
         coordinator.activeRuntime = viewModel
+        coordinator.observeCameraHealth(viewModel.$cameraHealth.map { $0 == .failed }.eraseToAnyPublisher())
+        coordinator.observeStepLabel(viewModel.$phase
+          .map { phase -> String? in
+            DiagnosticPhaseBar.segments[DiagnosticPhaseBar.phaseIndex(phase)].label
+          }
+          .eraseToAnyPublisher())
         let vm = viewModel
         vm.onExitConfirmed = { [weak coordinator] in
           coordinator?.exitTroubleshoot()

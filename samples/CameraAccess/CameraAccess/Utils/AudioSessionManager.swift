@@ -152,6 +152,21 @@ class AudioSessionManager: ObservableObject {
   /// warmup). Reset by `stopCapture()`.
   private var didConfigureSession = false
 
+  /// Bounded poll armed when an engine restart was deferred because the input
+  /// format hadn't settled (rate 0 mid-route-flux). Usually the settle posts
+  /// another route/config change that restarts naturally, but the field shows
+  /// cases with no follow-up notification — this task is the backstop so the
+  /// mic doesn't stay dead for the rest of the session. Nil when idle.
+  private var deferredRestartTask: Task<Void, Never>?
+
+  /// True between AVAudioSession interruption `.began` and `.ended` (phone
+  /// lock, incoming call, Siri). While set, `restartEngineAfterStopIfNeeded`
+  /// defers — restarting the engine graph against an interrupted (deactivated)
+  /// session is what raised the fatal `AVAudioEngineGraph::_Connect`
+  /// NSException in TestFlight build 1.0(9). Cleared on `.ended` (which then
+  /// triggers the deferred restart) and in `stopCapture()`.
+  private var isAudioSessionInterrupted = false
+
   /// Pending waiter for `awaitHFPRouteReady(_:)` — the event-driven
   /// replacement for the fixed HFP warmup sleep. Resolved `true` by
   /// `handleRouteChange` the instant the glasses BT HFP route comes up with
@@ -237,6 +252,18 @@ class AudioSessionManager: ObservableObject {
       selector: #selector(handleEngineConfigurationChange),
       name: .AVAudioEngineConfigurationChange,
       object: engine
+    )
+
+    // Interruptions (phone lock, incoming call, Siri) stop the engine AND
+    // deactivate the session. Without this observer the config-change
+    // restart path fires blindly mid-interruption and the engine-graph
+    // reconnect raises an uncatchable NSException (the TestFlight crash);
+    // it also left the mic dead after unlock because nothing resumed it.
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleInterruption),
+      name: AVAudioSession.interruptionNotification,
+      object: nil
     )
   }
 
@@ -670,9 +697,9 @@ class AudioSessionManager: ObservableObject {
         let isBTHFPInput = AVAudioSession.sharedInstance().currentRoute.inputs
           .contains { $0.portType == .bluetoothHFP }
         let demoRoute = (capturedMode == .coachingPhoneOnly) && Self.routeAudioToMacForDemo
-        try node.setVoiceProcessingEnabled(!isBTHFPInput && !demoRoute)
+        try Self.safeSetVoiceProcessing(node, enabled: !isBTHFPInput && !demoRoute)
       } else {
-        try node.setVoiceProcessingEnabled(false)
+        try Self.safeSetVoiceProcessing(node, enabled: false)
       }
     } catch {
       print("[AudioSession] prewarm: setVoiceProcessingEnabled failed: \(error)")
@@ -719,9 +746,9 @@ class AudioSessionManager: ObservableObject {
             let isBTHFPInput = AVAudioSession.sharedInstance().currentRoute.inputs
               .contains { $0.portType == .bluetoothHFP }
             let demoRoute = (capturedMode == .coachingPhoneOnly) && Self.routeAudioToMacForDemo
-            try inputNode.setVoiceProcessingEnabled(!isBTHFPInput && !demoRoute)
+            try Self.safeSetVoiceProcessing(inputNode, enabled: !isBTHFPInput && !demoRoute)
           } else {
-            try inputNode.setVoiceProcessingEnabled(false)
+            try Self.safeSetVoiceProcessing(inputNode, enabled: false)
           }
         } catch {
           print("[AudioSession] ⚠ setVoiceProcessingEnabled failed: \(error)")
@@ -830,7 +857,7 @@ class AudioSessionManager: ObservableObject {
         // retry is trying to recover from.
         let isBTHFPInput = AVAudioSession.sharedInstance().currentRoute.inputs.contains { $0.portType == .bluetoothHFP }
         let shouldUseVPIO = (capturedMode == .coaching || capturedMode == .coachingPhoneOnly) && !demoRoute && !isBTHFPInput
-        try inputNode.setVoiceProcessingEnabled(shouldUseVPIO)
+        try Self.safeSetVoiceProcessing(inputNode, enabled: shouldUseVPIO)
       } catch {
         print("[AudioSession] retry: setVoiceProcessingEnabled failed: \(error)")
       }
@@ -1016,6 +1043,57 @@ class AudioSessionManager: ObservableObject {
     }
   }
 
+  /// `setVoiceProcessingEnabled` forces a full engine-graph teardown +
+  /// reconnect; during route flux that reconnect can raise an Objective-C
+  /// NSException (`AVAudioEngineGraph::_Connect`) that Swift's do/catch CANNOT
+  /// catch — the TestFlight build 1.0(9) crash. Every VPIO toggle in this file
+  /// must go through here: the ObjC catcher converts a raised NSException into
+  /// a thrown Swift error, and the equality early-out skips no-op toggles
+  /// (which still rebuild the graph and carry the same throw risk for nothing).
+  nonisolated private static func safeSetVoiceProcessing(
+    _ node: AVAudioInputNode, enabled: Bool
+  ) throws {
+    guard node.isVoiceProcessingEnabled != enabled else {
+      print("[AudioSession] VPIO toggle skipped — already enabled=\(enabled) (no-op graph rebuild avoided)")
+      return
+    }
+    print("[AudioSession] VPIO toggle attempt → enabled=\(enabled) | \(vpioContextSnapshot(node))")
+    var swiftError: Error?
+    do {
+      try ObjCExceptionCatcher.catchException {
+        do { try node.setVoiceProcessingEnabled(enabled) }
+        catch { swiftError = error }
+      }
+    } catch {
+      // This exact NSException was the fatal TestFlight 1.0(9) crash
+      // (AVAudioEngineGraph::_Connect). Now it's caught — log the full
+      // context so a recurrence is diagnosable from one console paste.
+      print("[AudioSession] 🚨 CAUGHT ObjC NSException from setVoiceProcessingEnabled(\(enabled)) "
+        + "— this WAS the TestFlight crash. \(error) | \(vpioContextSnapshot(node))")
+      throw error
+    }
+    if let swiftError {
+      print("[AudioSession] VPIO toggle threw Swift error: \(swiftError) | \(vpioContextSnapshot(node))")
+      throw swiftError
+    }
+    print("[AudioSession] VPIO toggle succeeded → enabled=\(enabled)")
+  }
+
+  /// One-line route/format/session snapshot for the VPIO toggle logs — the
+  /// state that decides whether the engine-graph reconnect is safe. Static
+  /// so the nonisolated/detached call sites can use it (AVAudioSession APIs
+  /// are documented thread-safe).
+  nonisolated private static func vpioContextSnapshot(_ node: AVAudioInputNode) -> String {
+    let session = AVAudioSession.sharedInstance()
+    let fmt = node.inputFormat(forBus: 0)
+    let route = session.currentRoute
+    let inputs = route.inputs.map { "\($0.portName)(\($0.portType.rawValue))" }.joined(separator: ",")
+    let outputs = route.outputs.map { "\($0.portName)(\($0.portType.rawValue))" }.joined(separator: ",")
+    return "vpio=\(node.isVoiceProcessingEnabled), inFmt=\(fmt.sampleRate)Hz/\(fmt.channelCount)ch, "
+      + "cat=\(session.category.rawValue)/\(session.mode.rawValue), "
+      + "inputs=[\(inputs)], outputs=[\(outputs)], otherAudio=\(session.isOtherAudioPlaying)"
+  }
+
   /// Enable hardware voice processing (AEC/NS/AGC) only when it's safe for the
   /// current input route. VPIO is incompatible with the Display glasses' BT-HFP
   /// route — `engine.start()` returns success but the input unit fails to
@@ -1034,18 +1112,21 @@ class AudioSessionManager: ObservableObject {
       let demoRoute = (mode == .coachingPhoneOnly) && Self.routeAudioToMacForDemo
       let shouldUseVPIO = !isBTHFPInput && !demoRoute
       do {
-        try inputNode.setVoiceProcessingEnabled(shouldUseVPIO)
+        try Self.safeSetVoiceProcessing(inputNode, enabled: shouldUseVPIO)
         if !shouldUseVPIO {
           print("[AudioSession] VPIO disabled (BT-HFP input or Mac-route demo) — avoids Display-glasses HFP incompatibility / keeps demo output on the Mac route")
         }
       } catch {
+        // The frame that was fatal in TestFlight 1.0(9) — dump everything.
         print("[AudioSession] ⚠ Failed to set voice processing enabled=\(shouldUseVPIO): \(error)")
+        print(dumpAudioDiagnostics())
       }
     } else {
       do {
-        try inputNode.setVoiceProcessingEnabled(false)
+        try Self.safeSetVoiceProcessing(inputNode, enabled: false)
       } catch {
         print("[AudioSession] ⚠ Failed to disable voice processing: \(error)")
+        print(dumpAudioDiagnostics())
       }
     }
   }
@@ -1064,6 +1145,66 @@ class AudioSessionManager: ObservableObject {
     }
   }
 
+  /// Poll for the input format settling after a deferred restart: 8 × 500 ms.
+  /// Idempotent — a second deferral while a poll is in flight is a no-op.
+  /// Ends early the moment the engine is back (a notification-driven restart
+  /// won the race) or capture stopped. On give-up, dumps full diagnostics.
+  private func scheduleDeferredRestartRetry(reason: String) {
+    guard deferredRestartTask == nil else { return }
+    deferredRestartTask = Task { @MainActor [weak self] in
+      for attempt in 1...8 {
+        try? await Task.sleep(nanoseconds: 500_000_000)  // 500 ms
+        guard let self, !Task.isCancelled else { return }
+        guard self.isCapturing, !self.engine.isRunning else {
+          self.deferredRestartTask = nil
+          return
+        }
+        if self.ensureValidInputFormat(), !self.isAudioSessionInterrupted {
+          self.deferredRestartTask = nil
+          print("[AudioSession] deferred restart retry #\(attempt) — input format settled, restarting")
+          self.restartEngineAfterStopIfNeeded(reason: "\(reason)+retry\(attempt)")
+          return
+        }
+      }
+      guard let self else { return }
+      self.deferredRestartTask = nil
+      print("[AudioSession] ⚠ deferred restart gave up after 8 retries (4s) — input format never settled")
+      print(self.dumpAudioDiagnostics())
+    }
+  }
+
+  @objc private func handleInterruption(notification: Notification) {
+    guard let info = notification.userInfo,
+          let typeValue = info[AVAudioSessionInterruptionTypeKey] as? UInt,
+          let type = AVAudioSession.InterruptionType(rawValue: typeValue)
+    else { return }
+    let optionsValue = info[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+    let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
+
+    Task { @MainActor in
+      switch type {
+      case .began:
+        // iOS already stopped the engine; just remember we're interrupted so
+        // the restart path defers instead of reconnecting a dead graph.
+        self.isAudioSessionInterrupted = true
+        print("[AudioSession] interruption began (isCapturing=\(self.isCapturing))")
+      case .ended:
+        self.isAudioSessionInterrupted = false
+        print("[AudioSession] interruption ended (shouldResume=\(options.contains(.shouldResume)), isCapturing=\(self.isCapturing))")
+        guard options.contains(.shouldResume), self.isCapturing else { return }
+        // Re-activate before restarting — the interruption deactivated us.
+        do {
+          try AVAudioSession.sharedInstance().setActive(true)
+        } catch {
+          print("[AudioSession] ⚠ re-activation after interruption failed: \(error)")
+        }
+        self.restartEngineAfterStopIfNeeded(reason: "interruptionEnded")
+      @unknown default:
+        break
+      }
+    }
+  }
+
   /// Restart the engine after it self-stopped while we're still meant to be
   /// capturing (the post-`engine.start()` HFP configuration change). No-op if we
   /// aren't capturing or the engine is already running. Shared by the
@@ -1072,6 +1213,26 @@ class AudioSessionManager: ObservableObject {
   /// that fires for a given stop.
   private func restartEngineAfterStopIfNeeded(reason: String) {
     guard isCapturing, !engine.isRunning else { return }
+
+    // Defer while an interruption is active (phone lock, call, Siri) — the
+    // session is deactivated and any engine-graph work can raise the fatal
+    // reconnect NSException. `handleInterruption(.ended)` re-enters here.
+    guard !isAudioSessionInterrupted else {
+      print("[AudioSession] restart after \(reason) deferred — audio session interrupted")
+      return
+    }
+
+    // Mid-route-flux the input chain can be degenerate (rate 0). Toggling
+    // VPIO or starting the engine against it raises the same fatal
+    // graph-reconnect NSException. Defer and poll: the settle usually posts
+    // another route/config change that re-enters here, but not always (seen
+    // in the field: AURemoteIO '!pri' failure with no follow-up notification,
+    // leaving the mic dead) — so a bounded retry re-checks on its own.
+    guard ensureValidInputFormat() else {
+      print("[AudioSession] restart after \(reason) deferred — input format not settled")
+      scheduleDeferredRestartRetry(reason: reason)
+      return
+    }
 
     // Never re-enable VPIO on the BT-HFP route — that is what self-stops the
     // engine in the first place.
@@ -1145,6 +1306,9 @@ class AudioSessionManager: ObservableObject {
     isCapturing = false
     isAISpeaking = false
     micStalled = false   // not capturing → no stall warning
+    isAudioSessionInterrupted = false  // stale flag must not block the next session
+    deferredRestartTask?.cancel()      // a pending restart poll must not outlive the session
+    deferredRestartTask = nil
     scheduledBufferCount = 0
     onAudioBuffer = nil  // drop any capture handler so trailing taps can't fire
     onAudioBufferSecondary = nil

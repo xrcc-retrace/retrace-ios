@@ -68,6 +68,12 @@ final class CoachingLensRenderer: LensRenderer {
     cancellables.removeAll()
   }
 
+  /// Recover the HUD after a system back-gesture dismiss. No dedupe cache here —
+  /// `scheduleSend()` always sends — so just re-project and re-send.
+  func repaint() {
+    scheduleSend()
+  }
+
   // MARK: - Subscription wiring
 
   /// Combine pipeline that re-renders on any relevant @Published change.

@@ -7,18 +7,23 @@ import SwiftUI
 struct DiagnosticPhaseBar: View {
   let phase: DiagnosticPhase
 
-  private struct Segment {
+  struct Segment {
     let icon: String
     let label: String
   }
 
-  private static let segments: [Segment] = [
+  /// Exposed (internal, not private) so other glasses-first surfaces — e.g.
+  /// `GlassesNavigationCoordinator.observeStepLabel` — can reuse the same
+  /// "Identify" / "Diagnose" / "Find a fix" copy instead of duplicating it.
+  static let segments: [Segment] = [
     Segment(icon: "camera.viewfinder", label: "Identify"),
     Segment(icon: "magnifyingglass",   label: "Diagnose"),
     Segment(icon: "globe",             label: "Find a fix"),
   ]
 
-  private var activeIndex: Int {
+  /// Which `segments` index a given phase maps to. Static + internal for the
+  /// same reuse reason as `segments`.
+  static func phaseIndex(_ phase: DiagnosticPhase) -> Int {
     switch phase {
     case .discovering: return 0
     case .diagnosing:  return 1
@@ -26,6 +31,8 @@ struct DiagnosticPhaseBar: View {
     case .resolved:    return 2
     }
   }
+
+  private var activeIndex: Int { Self.phaseIndex(phase) }
 
   var body: some View {
     VStack(spacing: Spacing.xs) {

@@ -315,6 +315,16 @@ struct CoachingSessionView: View {
         }
       )
     }
+    // Camera-branch death (startup stall, frame starvation, stream drop,
+    // session invalidation). Fires once per failure episode; the persistent
+    // cameraHealthBanner remains after dismissal as the voice-only indicator.
+    // Mirrors the expert path's starvation alert (IPhoneRecordingView).
+    .alert("Camera lost", isPresented: $viewModel.showCameraLostAlert) {
+      Button("Retry") { viewModel.retryCameraBranch() }
+      Button("Continue voice-only", role: .cancel) {}
+    } message: {
+      Text("The coach can no longer see what you're doing. Visual step checking is off until the camera reconnects.")
+    }
   }
 
   private func resolveInterfaceOrientation() -> UIInterfaceOrientation {
@@ -345,6 +355,10 @@ struct CoachingSessionView: View {
 
         if isGeminiError {
           reconnectBanner
+        }
+
+        if viewModel.cameraHealth != .ok {
+          cameraHealthBanner
         }
 
         if viewModel.micStalled {
@@ -383,6 +397,42 @@ struct CoachingSessionView: View {
     .glassPanel(cornerRadius: Radius.md)
     .padding(.horizontal, Spacing.xl)
     .padding(.bottom, Spacing.sm)
+  }
+
+  /// Persistent camera-health banner. `.reconnecting` while a user-initiated
+  /// camera rebuild runs; `.failed` when the camera branch is dead and the
+  /// session is running voice-only — stays up (not dismissable) so the user
+  /// always knows Gemini can't see. Retry rebuilds ONLY the camera branch.
+  private var cameraHealthBanner: some View {
+    HStack(spacing: Spacing.md) {
+      if viewModel.cameraHealth == .reconnecting {
+        ProgressView()
+          .tint(.textPrimary)
+        Text("Reconnecting camera…")
+          .font(.retraceCallout)
+          .foregroundColor(.textPrimary)
+        Spacer()
+      } else {
+        Image(systemName: "video.slash.fill")
+          .foregroundColor(.textPrimary)
+        Text("Camera lost — the coach can't see your work")
+          .font(.retraceCallout)
+          .foregroundColor(.textPrimary)
+        Spacer()
+        Button {
+          viewModel.retryCameraBranch()
+        } label: {
+          Text("Retry")
+            .font(.retraceFace(.semibold, size: 16))
+            .foregroundColor(.textPrimary)
+        }
+      }
+    }
+    .padding(Spacing.md)
+    .glassPanel(cornerRadius: Radius.md)
+    .padding(.horizontal, Spacing.xl)
+    .padding(.bottom, Spacing.sm)
+    .animation(.easeInOut(duration: 0.25), value: viewModel.cameraHealth)
   }
 
   /// Non-blocking notice that the mic pipeline isn't delivering audio (BT-HFP

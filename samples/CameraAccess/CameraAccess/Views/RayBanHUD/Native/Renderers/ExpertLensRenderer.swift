@@ -116,6 +116,13 @@ final class ExpertLensRenderer: LensRenderer {
     stopCountdownTask = nil
   }
 
+  /// Recover the HUD after a system back-gesture dismiss: clear the dedupe cache
+  /// (an unchanged snapshot would otherwise be suppressed) and re-send.
+  func repaint() {
+    lastSentSnapshot = nil
+    scheduleSend()
+  }
+
   // MARK: - Subscription wiring
 
   /// CombineLatest over the published signals the lens cares about:

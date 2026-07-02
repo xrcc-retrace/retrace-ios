@@ -45,7 +45,10 @@ final class TroubleshootLensRenderer: LensRenderer {
   private var searchAnimFrame = 0
   /// Frame cadence — ~8 fps. Smooth enough for a gentle slide, cheap on the
   /// BT Display link.
-  private let searchAnimTickNanos: UInt64 = 120_000_000
+  /// ≥ the MWDATDisplay minimum send spacing (~0.3s) so the airplane loop
+  /// can't saturate the link and time out the frame that matters (the
+  /// searching → resolved transition).
+  private let searchAnimTickNanos: UInt64 = 400_000_000
 
   // MARK: - Subscriptions
 
@@ -66,6 +69,12 @@ final class TroubleshootLensRenderer: LensRenderer {
     searchAnimTask?.cancel()
     searchAnimTask = nil
     searchAnimFrame = 0
+  }
+
+  /// Recover the HUD after a system back-gesture dismiss. No dedupe cache here —
+  /// `scheduleSend()` always sends — so just re-project and re-send.
+  func repaint() {
+    scheduleSend()
   }
 
   // MARK: - Subscription wiring

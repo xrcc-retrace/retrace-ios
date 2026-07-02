@@ -113,6 +113,20 @@ class GeminiLiveSessionBase: ObservableObject {
   /// device, so this condition can't arise there.
   @Published private(set) var glassesLensUnavailable = false
 
+  /// Health of the camera branch (glasses Stream or iPhone capture),
+  /// independent of the Gemini voice socket. `.failed` means the camera died
+  /// (startup stall, mid-session frame starvation, stream drop, session
+  /// invalidation) and the session is running voice-only until the user
+  /// retries. Drives the camera banner + alert in Coaching/Troubleshoot.
+  /// `geminiConnectionState.error` now means voice-socket problems ONLY.
+  enum CameraHealth: Equatable { case ok, reconnecting, failed }
+  @Published private(set) var cameraHealth: CameraHealth = .ok
+
+  /// One-shot trigger for the blocking "camera lost" alert. Fired once per
+  /// failure episode by `handleCameraBranchFailure`; the persistent banner is
+  /// driven by `cameraHealth` and survives the alert's dismissal.
+  @Published var showCameraLostAlert = false
+
   /// Mirrors `AudioSessionManager.micStalled` for THIS session's audio manager
   /// (own or borrowed). Drives a non-blocking "audio pipeline broken" banner in
   /// the phone coaching/troubleshoot views; auto-clears when buffers resume. The
@@ -204,7 +218,8 @@ class GeminiLiveSessionBase: ObservableObject {
   var isClipPlaying = false
   /// True while we've intentionally stopped the glasses camera `Stream` to free
   /// the Bluetooth link during reference-clip playback. The stream state listener
-  /// checks this so the resulting `.stopped` isn't surfaced as "Glasses stream dropped."
+  /// AND the frame-starvation watchdog both check this so the resulting
+  /// `.stopped` / frame gap isn't treated as a camera failure.
   var isCameraPausedForClip = false
 
   // MARK: - Push-to-talk (walkie-talkie) — demo mode only
@@ -312,6 +327,23 @@ class GeminiLiveSessionBase: ObservableObject {
   private var cameraStarvationSurfaced = false
   /// Tolerated gap before declaring the video transport dead.
   private static let videoStallThreshold: TimeInterval = 5.0
+  /// Hard ceiling for a mid-session frame gap. DAT 0.8 migrates video onto a
+  /// WiFi Direct/SoftAP link seconds after stream start (and on bandwidth
+  /// jumps); frames PAUSE during that multi-second join. A >5s gap is
+  /// therefore "possibly migrating", not "dead" — the watchdog holds
+  /// teardown (probation, `.reconnecting` UI) until this ceiling.
+  private static let videoStallHardThreshold: TimeInterval = 30.0
+  /// Non-nil while in the soft-stall probation window (gap >5s, <30s).
+  private var videoStallProbationStartedAt: Date?
+  /// The stale frame stamp at probation entry — lets the recovery log print
+  /// the exact survived gap length (the WiFi-migration measurement).
+  private var videoStallProbationLastFrameAt: Date?
+
+  /// Starvation checks are skipped until this instant. Set on clip-resume so
+  /// the stream-restart ramp (~1-2s at 2fps, worse on a congested BT link)
+  /// can't instantly re-fire off the stale pre-pause stamp.
+  private var videoWatchdogGraceUntil: Date = .distantPast
+  private static let clipResumeFrameGrace: TimeInterval = 10.0
 
   /// Set by the camera setup Task when an unrecoverable setup-time error
   /// hits (failed `manager.acquire`, `addStream` returning nil, iPhone
@@ -764,6 +796,9 @@ class GeminiLiveSessionBase: ObservableObject {
     // Native lens stays gated until audio + camera are confirmed up (see
     // `isReadyForNativeLens`). Reset here so a restart re-arms the gate.
     isReadyForNativeLens = false
+    // Fresh session, fresh camera-failure episode.
+    cameraHealth = .ok
+    showCameraLostAlert = false
     // 0. DAT camera permission gate (glasses transport only). Per the
     //    DAT 0.7 contract, devices don't appear in `wearables.devices`
     //    until `Permission.camera` is granted via Meta AI — so without
@@ -1130,6 +1165,8 @@ class GeminiLiveSessionBase: ObservableObject {
     voiceStatus = "Ended"
     geminiConnectionState = .disconnected
     isReadyForNativeLens = false
+    cameraHealth = .ok
+    showCameraLostAlert = false
 
     didEndSession()
   }
@@ -1174,7 +1211,18 @@ class GeminiLiveSessionBase: ObservableObject {
         ok = await self.setupIPhoneCameraStream()
       }
       if !ok {
-        print("[GeminiLive] Camera/lens branch did not come up — continuing voice-only (visual verification + lens HUD unavailable)")
+        // Startup stall: setup failed outright, or the stream came up at the
+        // control level but never delivered a frame within the 30s ceiling —
+        // the "started-but-dead media path" zombie (WARP receiver never
+        // activated / RTP depacketizer missing stream info). Silently
+        // continuing voice-only here used to pin the zombie under our lease
+        // forever; the failure sink invalidates it (unpinning it for the next
+        // acquire) and surfaces the alert + banner so the user knows Gemini
+        // can't see and can retry.
+        print("[GeminiLive] Camera/lens branch did not come up — surfacing camera failure (voice continues)")
+        self.handleCameraBranchFailure(
+          reason: self.cameraSetupFailed
+            ? "camera setup failed" : "no first frame within 30s of stream start")
       }
     }
   }
@@ -1239,6 +1287,12 @@ class GeminiLiveSessionBase: ObservableObject {
     firstFrameSeen = false
     cameraSetupFailed = false
     cameraStarvationSurfaced = false
+    videoWatchdogGraceUntil = .distantPast
+    // Stale-pause guard: if the previous stream died DURING a clip pause,
+    // `resumeGlassesCameraForClip` no-op'd (stream already nil) and the flag
+    // stayed true — which would permanently suppress the new attach's
+    // watchdog and state listener.
+    isCameraPausedForClip = false
     stopVideoWatchdog()
     if let pending = firstFrameContinuation {
       firstFrameContinuation = nil
@@ -1259,6 +1313,7 @@ class GeminiLiveSessionBase: ObservableObject {
 
       let session: DeviceSession
       let stream: MWDATCamera.Stream
+      var adoptedFromLoan = false
 
       do {
         // The session is shared with any other active consumer (e.g. lens)
@@ -1284,6 +1339,13 @@ class GeminiLiveSessionBase: ObservableObject {
           // peripheral is paired, the filterless selector will probe it
           // and log "Unknown error: 436 — No known channel matching peer
           // …". Console noise only, no functional regression.
+          // Log the cached Local Network grant state (DAT 0.8's WiFi video
+          // lease dies silently when denied). Deliberately NOT an active
+          // probe: probing publishes + browses Bonjour with P2P enabled,
+          // which would contend with the SDK's own WiFi link negotiation
+          // happening right now. The active probe runs at app launch.
+          Task { @MainActor in LocalNetworkPermission.shared.logStatus(context: "glasses-session-start") }
+
           let prefersDisplay = manager.hasDisplayCapableDevice
           let req: DeviceSessionManager.DeviceRequirements = prefersDisplay ? .requiresDisplay : .any
           print("[GeminiLive] acquire requirements=\(req) (hasDisplay=\(manager.hasDisplayCapableDevice))")
@@ -1309,37 +1371,74 @@ class GeminiLiveSessionBase: ObservableObject {
             print("[GeminiLive]   lens will render: \(lensWillRender) \(lensWillRender ? "(glasses display)" : "(phone emulator only)")")
             print("[GeminiLive] ═════════════════════════════════════════════")
           }
-          // Glasses-path fidelity bump (2026-06-14): request .medium
-          // resolution at the SDK's lowest valid frame rate (2 fps).
-          // Per `mwdat-ios:camera-streaming`, valid frameRate values are
-          // {2, 7, 15, 24, 30} — 1 fps is not exposed by DAT 0.7. The iOS
-          // `videoMinInterval = 1.0s` throttle below drops every other DAT
-          // frame so Gemini sees 1 fps net. The skill is explicit:
-          // "Request lower settings for higher visual quality per frame"
-          // — dropping fps while keeping resolution modest gives the BT
-          // pipe bandwidth headroom to send each frame less-compressed.
+          // ⚠️ Resolution .high (720×1280) is LOAD-BEARING for the DAT 0.8
+          // WiFi video transport — do NOT lower it for quality/token
+          // reasons. Empirically verified 2026-07-01: with .medium the
+          // stream intermittently starves after ~1 frame (Stream.state
+          // stuck .streaming, no error, never recovers); with .high it
+          // streams reliably. Matches MWDATCamera's own classification —
+          // streams "require medium (BTC) or high (WiFi) bandwidth link":
+          // a .medium stream is BT-class and gets stranded at the BT→WiFi
+          // link boundary, while .high is WiFi-class from bring-up.
+          // Also required: the Meta AI app's per-glasses "allow WiFi
+          // connection" permission (glasses settings — undocumented).
           //
-          // Why .medium and not .high: .high (720×1280) on Vanguard
-          // delayed the first frame past the 8s `awaitCameraReady`
-          // ceiling. .medium (504×896) at 2 fps still raises per-frame
-          // fidelity over the prior .low/24fps config without that
-          // first-frame ramp-up cost. The iOS-side `awaitCameraReady`
-          // ceiling is bumped to 30s as well for defense in depth.
+          // frameRate 2 is the SDK's lowest valid value ({2,7,15,24,30});
+          // it's a Gemini token/latency budget, not a bandwidth setting —
+          // the videoMinInterval = 1.0s throttle drops every other frame so
+          // Gemini sees 1 fps net. Re-run the token math before raising it.
+          // First-frame ramp-up at .high can reach ~10s; the 30s
+          // awaitCameraReady ceiling covers it.
           //
           // Phone preview will display 2 fps (matches the DAT emit rate).
-          let config = StreamConfiguration(
-            videoCodec: .raw,
-            resolution: .medium,
-            frameRate: 2
-          )
-          guard let s = try acquired.addStream(config: config) else {
-            print("[GeminiLive] Could not attach stream capability to the device session")
-            await manager.release(consumerLabel: "gemini-live")
-            await MainActor.run { self.cameraSetupFailed = true }
-            return
+          // Camera loan (troubleshoot→coaching handoff): a donor VM left its
+          // Stream running and its "gemini-live" lease held — the acquire
+          // above just refreshed that same label-keyed lease. Adopt the live
+          // stream instead of addStream+start: keeps the WiFi link + camera
+          // alive across the handoff, and stopping + re-adding a Stream
+          // back-to-back on a shared DeviceSession lands the successor on a
+          // half-drained WARP pipe (one frame, then starvation).
+          var loanedStream: MWDATCamera.Stream?
+          if let loan = await MainActor.run(body: { Self.claimCameraLoan() }) {
+            if loan.session.deviceId == acquired.deviceId, loan.stream.state == .streaming {
+              print("[GeminiLive] adopted live camera stream from handoff (state=\(loan.stream.state)) — skipping addStream/start")
+              loanedStream = loan.stream
+            } else {
+              // Stale loan: session replaced between deposit and claim, or the
+              // loaned stream is no longer streaming (abandoned handoff, died
+              // while parked). Adopting a dead stream = instant starvation —
+              // best-effort stop and attach a fresh stream below.
+              print("[GeminiLive] camera loan unusable (device loan=\(loan.session.deviceId) acquired=\(acquired.deviceId), streamState=\(loan.stream.state)) — retiring loan, attaching fresh stream")
+              loan.stream.stop()
+              // Drain anchor: stop→addStream back-to-back on a shared session
+              // lands the successor on a half-drained WARP pipe (one frame,
+              // then starvation) — the exact invariant stopCameraStream
+              // protects everywhere else. Wait for .stopped + settle before
+              // the fresh addStream below.
+              await self.awaitStreamStopped(loan.stream, timeout: 2.0)
+              try? await Task.sleep(nanoseconds: 300_000_000)
+            }
           }
-          session = acquired
-          stream = s
+
+          if let adopted = loanedStream {
+            session = acquired
+            stream = adopted
+            adoptedFromLoan = true
+          } else {
+            let config = StreamConfiguration(
+              videoCodec: .raw,
+              resolution: .high,
+              frameRate: 2
+            )
+            guard let s = try acquired.addStream(config: config) else {
+              print("[GeminiLive] Could not attach stream capability to the device session")
+              await manager.release(consumerLabel: "gemini-live")
+              await MainActor.run { self.cameraSetupFailed = true }
+              return
+            }
+            session = acquired
+            stream = s
+          }
           // Lens HUD readiness: the shared DeviceSession is now `.started`
           // and the Stream capability is attached — that's all the native
           // lens needs to `addDisplay()` and render (it draws from coaching
@@ -1479,12 +1578,14 @@ class GeminiLiveSessionBase: ObservableObject {
             // real drop. The flag stays set through the whole stop→start cycle,
             // so the restart's transient states are covered too.
             guard !self.isCameraPausedForClip else { return }
-            // Don't stomp a more specific error already surfaced by
-            // handleCameraSessionError (which fires from the manager's
-            // errorStream and has typed context like .datAppUpdateRequired).
-            // Only flip if we still believed we were connected.
+            // A Stream-capability drop kills the camera, not the voice
+            // socket — route to the camera failure sink (alert + banner +
+            // camera-only retry) instead of the socket error state, whose
+            // Reconnect can't fix a dead camera. Only while we still
+            // believed the session was live (exit races land here after
+            // teardown flips the state).
             if self.geminiConnectionState == .connected || self.geminiConnectionState == .connecting {
-              self.geminiConnectionState = .error("Glasses stream dropped. Tap to retry.")
+              self.handleCameraBranchFailure(reason: "stream dropped (.streaming → .stopped)")
             }
           }
         }
@@ -1502,6 +1603,7 @@ class GeminiLiveSessionBase: ObservableObject {
         frameCountDiag &+= 1
         if frameCountDiag == 1 {
           print("[GeminiLive] First glasses frame received ✓ ")
+          WiFiLinkMonitor.shared.logSnapshot(context: "first-frame")
           Task { @MainActor [weak self] in
             guard let self = self else { return }
             if let pending = self.firstFrameContinuation {
@@ -1518,11 +1620,24 @@ class GeminiLiveSessionBase: ObservableObject {
         source?.submit(videoFrame)
       }
 
-      // The manager delivers a `.started` session by this point
-      // (`manager.acquire` awaits started internally). Now kick the stream.
-      print("[GeminiLive] stream.start() → … (currentState=\(stream.state))")
-      await stream.start()
-      print("[GeminiLive] stream.start() returned (state=\(stream.state))")
+      if adoptedFromLoan {
+        // Loaned stream is already streaming — no start(). Stamp liveness so
+        // the watchdog doesn't inherit a stale timestamp from before the
+        // listeners re-attached; the first-frame wait resolves on the next
+        // 2 fps frame (≤500 ms).
+        print("[GeminiLive] loaned stream already live (state=\(stream.state)) — start() skipped")
+        self.stampVideoFrame()
+        WiFiLinkMonitor.shared.start(context: "gemini-live camera stream (adopted)")
+      } else {
+        // The manager delivers a `.started` session by this point
+        // (`manager.acquire` awaits started internally). Now kick the stream.
+        // 0.8: start() is synchronous fire-and-forget — readiness is proven by
+        // the first-frame wait below, never by start() returning.
+        print("[GeminiLive] stream.start() → … (currentState=\(stream.state))")
+        stream.start()
+        print("[GeminiLive] stream.start() returned (state=\(stream.state))")
+        WiFiLinkMonitor.shared.start(context: "gemini-live camera stream")
+      }
     }
 
     // Wait for the setup task to complete (or its early-return failure
@@ -1553,6 +1668,7 @@ class GeminiLiveSessionBase: ObservableObject {
   @MainActor
   func armVideoWatchdog() {
     guard videoWatchdogTask == nil else { return }
+    clearVideoStallProbation()
     stampVideoFrame()  // seed so the first tick isn't an instant false positive
     videoWatchdogTask = Task { [weak self] in
       while !Task.isCancelled {
@@ -1567,52 +1683,140 @@ class GeminiLiveSessionBase: ObservableObject {
   func stopVideoWatchdog() {
     videoWatchdogTask?.cancel()
     videoWatchdogTask = nil
+    clearVideoStallProbation()
   }
 
   @MainActor
   private func checkVideoStarvation() {
     guard videoWatchdogTask != nil, !cameraStarvationSurfaced else { return }
+    // Intentional clip-pause (`pauseGlassesCameraForClip`) stops the stream —
+    // a >5s frame gap during it is EXPECTED, not transport death. The state
+    // listener already honors this flag; the watchdog must too, or every
+    // reference clip longer than the stall threshold invalidates the session.
+    guard !isCameraPausedForClip else { return }
+    // Post-resume grace — the restart ramp would trip the stale stamp.
+    guard Date() >= videoWatchdogGraceUntil else { return }
     guard geminiConnectionState == .connected || geminiConnectionState == .connecting else { return }
-    if Date().timeIntervalSince(readLastVideoFrameAt()) > Self.videoStallThreshold {
+
+    let lastFrame = readLastVideoFrameAt()
+    let gap = Date().timeIntervalSince(lastFrame)
+
+    if gap <= Self.videoStallThreshold {
+      // Healthy — or just recovered from a soft stall. The survived-gap log
+      // is the measurement that tells us how long the WiFi link migration
+      // actually takes; keep it precise.
+      if videoStallProbationStartedAt != nil {
+        let survived = lastFrame.timeIntervalSince(videoStallProbationLastFrameAt ?? lastFrame)
+        clearVideoStallProbation()
+        print(String(format: "[GeminiLive] ✓ frames resumed after %.1fs gap (WiFi link migration survived)", survived))
+        WiFiLinkMonitor.shared.logSnapshot(context: "frame-gap-recovered")
+        if cameraHealth == .reconnecting { cameraHealth = .ok }
+      }
+      return
+    }
+
+    if videoStallProbationStartedAt == nil {
+      // Soft stage: hold teardown — this may be the SDK migrating video onto
+      // the WiFi Direct link, which pauses frames for seconds. Voice keeps
+      // running; the banner shows "Reconnecting camera…".
+      videoStallProbationStartedAt = Date()
+      videoStallProbationLastFrameAt = lastFrame
+      print("[GeminiLive] ⚠️ frame gap >\(Int(Self.videoStallThreshold))s — possible WiFi link migration; holding teardown up to \(Int(Self.videoStallHardThreshold))s")
+      WiFiLinkMonitor.shared.logSnapshot(context: "frame-gap-soft")
+      if cameraHealth == .ok { cameraHealth = .reconnecting }
+      return
+    }
+
+    if gap > Self.videoStallHardThreshold {
       handleVideoStarvation()
     }
   }
 
-  /// Frames stopped and the SDK never surfaced it. Force-drop the shared
-  /// glasses session and surface a Retry card (no silent auto-retry).
+  @MainActor
+  private func clearVideoStallProbation() {
+    videoStallProbationStartedAt = nil
+    videoStallProbationLastFrameAt = nil
+  }
+
+  /// Frames stopped mid-session past the hard ceiling — the transport is
+  /// genuinely dead, not migrating.
   @MainActor
   private func handleVideoStarvation() {
     guard !cameraStarvationSurfaced else { return }
-    cameraStarvationSurfaced = true
     print("[GeminiLive] ⚠️ video frame starvation — camera transport appears dead")
-    stopVideoWatchdog()
-    // Glasses transport holds a shared DeviceSession whose WARP stack is dead;
-    // force the manager to drop it (bypassing any sibling lease) so Retry
-    // rebuilds a fresh createSession. The iPhone path holds no manager session
-    // (deviceSession == nil) — nothing to invalidate, just surface Retry.
-    if deviceSession != nil {
-      sessionManager.invalidate(reason: "coaching glasses camera frame starvation")
-    }
-    surfaceCameraLost()
+    WiFiLinkMonitor.shared.logSnapshot(context: "frame-starvation")
+    clearVideoStallProbation()
+    // Probation set `.reconnecting`; handleCameraBranchFailure's one-episode
+    // guard requires `.ok`, so hand the transition back before escalating.
+    if cameraHealth == .reconnecting { cameraHealth = .ok }
+    handleCameraBranchFailure(reason: "frame starvation (no frames for \(Int(Self.videoStallHardThreshold))s)")
   }
 
   /// A sibling consumer (lens / expert) force-invalidated the shared session.
-  /// Our held `DeviceSession` is now a corpse — surface Retry. Guarded so our
-  /// own `invalidate` echo (we just surfaced) doesn't double-fire.
+  /// Our held `DeviceSession` is now a corpse. Guarded so our own `invalidate`
+  /// echo (we just surfaced) doesn't double-fire.
   @MainActor
   private func handleSessionInvalidated(_ reason: String) {
     print("[GeminiLive] session invalidated externally → \(reason)")
     guard !cameraStarvationSurfaced else { return }
-    cameraStarvationSurfaced = true
-    stopVideoWatchdog()
-    surfaceCameraLost()
+    handleCameraBranchFailure(
+      reason: "session invalidated externally: \(reason)", alreadyInvalidated: true)
   }
 
+  /// Single sink for every camera-branch death: startup stall (no first frame),
+  /// mid-session frame starvation, stream `.streaming → .stopped`, sibling
+  /// invalidation, and terminal `DeviceSessionError`s. Invalidates the shared
+  /// session (glasses only — the iPhone path holds no manager session) so the
+  /// zombie can't be reused by the next acquire, then surfaces a blocking alert
+  /// plus the persistent camera banner. No silent auto-retry: recovery is
+  /// user-initiated via `retryCameraBranch()`. Voice is untouched — the Gemini
+  /// socket keeps running and the session continues voice-only.
   @MainActor
-  private func surfaceCameraLost() {
-    if geminiConnectionState == .connected || geminiConnectionState == .connecting {
-      geminiConnectionState = .error("Lost glasses camera. Tap to retry.")
+  private func handleCameraBranchFailure(reason: String, alreadyInvalidated: Bool = false) {
+    // The DAT-helper-update case has its own dedicated recovery sheet with a
+    // specific user action; don't stack the generic camera alert on top.
+    guard !pendingDATHelperUpdate else { return }
+    // One episode at a time: a failure detected while we're already failed or
+    // mid-retry must not re-invalidate or re-alert (e.g. the stream-state
+    // listener echoing the teardown our own invalidate just caused).
+    guard cameraHealth == .ok else { return }
+    print("[GeminiLive] camera branch failure: \(reason)")
+    cameraStarvationSurfaced = true
+    stopVideoWatchdog()
+    if !alreadyInvalidated, deviceSession != nil {
+      sessionManager.invalidate(reason: "gemini-live camera branch failure: \(reason)")
     }
+    cameraHealth = .failed
+    showCameraLostAlert = true
+  }
+
+  /// User tapped Retry on the camera-lost alert or banner. Rebuilds ONLY the
+  /// camera branch on the live voice session.
+  func retryCameraBranch() {
+    guard cameraHealth == .failed else { return }
+    cameraHealth = .reconnecting
+    Task { [weak self] in await self?.restartCameraBranch() }
+  }
+
+  /// Tear down and rebuild the camera branch (glasses Stream or iPhone
+  /// capture) without touching the Gemini socket or audio. Serializes on
+  /// `cameraLifecycleTask` via `stopCameraStream`/`setupCameraStream`; the
+  /// WARP-drain wait after an invalidate is the manager's post-forced-teardown
+  /// settle, not an ad-hoc sleep here. A successful rebuild re-flips
+  /// `isReadyForNativeLens` and re-arms the watchdog on first frame.
+  @MainActor
+  private func restartCameraBranch() async {
+    stopCameraStream()
+    await awaitCameraTeardown()
+    let ok: Bool
+    switch transport {
+    case .glasses: ok = await setupCameraStream()
+    case .iPhone: ok = await setupIPhoneCameraStream()
+    }
+    print("[GeminiLive] camera branch restart → \(ok ? "recovered" : "failed again")")
+    // Restart failure maps straight to .failed — it never re-enters
+    // handleCameraBranchFailure, so there is no invalidate/alert loop.
+    cameraHealth = ok ? .ok : .failed
   }
 
   @MainActor
@@ -1627,17 +1831,18 @@ class GeminiLiveSessionBase: ObservableObject {
     case .datAppOnTheGlassesUpdateRequired:
       pendingDATHelperUpdate = true
     default:
-      // Mid-session BT/thermal/peakPowerShutdown / generic session
-      // failures get surfaced on the connection-state channel so the
-      // UI flips from "Listening…" to an error card with Retry. Per
-      // `mwdat-ios:session-lifecycle` the session reaches a terminal
-      // `.stopped` after these — we don't try to resume, the user
-      // taps Retry which kicks a fresh `startGeminiLiveSession`.
-      // Only flip if we were previously connected — avoids stomping
-      // a more specific error already surfaced upstream (e.g. the
-      // camera-setup failure message above).
+      // Mid-session BT/thermal/peakPowerShutdown / generic session failures
+      // kill the DAT session (camera + lens), not the Gemini socket or the
+      // HFP mic — route to the camera failure sink so the user gets the
+      // camera alert + banner with a camera-only Retry. Per
+      // `mwdat-ios:session-lifecycle` the session reaches terminal `.stopped`
+      // after these; the manager's own `.stopped` observer runs the teardown,
+      // so no extra invalidate from us (`alreadyInvalidated: true`). Only
+      // while we still believed the session was live — avoids surfacing on
+      // errors echoing an intentional exit.
       if geminiConnectionState == .connected || geminiConnectionState == .connecting {
-        geminiConnectionState = .error("Glasses session dropped. Tap to retry.")
+        handleCameraBranchFailure(
+          reason: "DeviceSessionError: \(error)", alreadyInvalidated: true)
       }
     }
   }
@@ -1655,6 +1860,8 @@ class GeminiLiveSessionBase: ObservableObject {
     firstFrameSeen = false
     cameraSetupFailed = false
     cameraStarvationSurfaced = false
+    videoWatchdogGraceUntil = .distantPast
+    isCameraPausedForClip = false  // see setupCameraStream — stale-pause guard
     stopVideoWatchdog()
     if let pending = firstFrameContinuation {
       firstFrameContinuation = nil
@@ -1826,7 +2033,17 @@ class GeminiLiveSessionBase: ObservableObject {
       self.stopVideoWatchdog()
 
       if let session = self.glassesStream {
-        await session.stop()
+        // 0.8: Stream.stop() is synchronous. Anchor on the stream actually
+        // reaching .stopped plus a short settle: the SDK reports .stopped
+        // before its WARP threads exit, and a successor Stream attached to
+        // the same shared DeviceSession during that drain window comes up
+        // poisoned (one frame → starvation). Protects retryCameraBranch,
+        // rapid exit/re-enter, and the glasses-first handoff (all of which
+        // funnel through awaitCameraTeardown before re-attaching).
+        session.stop()
+        await self.awaitStreamStopped(session, timeout: 2.0)
+        try? await Task.sleep(nanoseconds: 300_000_000)  // WARP drain settle
+        WiFiLinkMonitor.shared.stop(context: "gemini-live teardown")
       }
       self.glassesStream = nil
 
@@ -1862,6 +2079,91 @@ class GeminiLiveSessionBase: ObservableObject {
     await cameraLifecycleTask?.value
   }
 
+  // MARK: - Camera loan (troubleshoot→coaching handoff)
+
+  /// A live glasses camera branch left running by a donor VM across the
+  /// troubleshoot→coaching handoff. The Stream keeps streaming and the
+  /// donor's `"gemini-live"` DSM lease stays held — the claimant's
+  /// `acquire("gemini-live")` refreshes that same label-keyed lease, and the
+  /// claimant adopts the Stream instead of addStream+start. This keeps the
+  /// WiFi link lease + camera alive across the handoff (no LED blink, no
+  /// re-join) and avoids stop→re-add on a shared DeviceSession: the SDK
+  /// reports `.stopped` before its WARP threads exit, and a successor
+  /// attaches to a half-drained pipe (one frame, then starvation).
+  struct CameraLoan {
+    let stream: MWDATCamera.Stream
+    let session: DeviceSession
+    let depositedAt: Date
+  }
+
+  @MainActor private static var pendingCameraLoan: CameraLoan?
+  @MainActor private static var cameraLoanSweepTask: Task<Void, Never>?
+
+  /// Claim the pending loan (cancels the unclaimed-loan sweep). Called by
+  /// the successor VM's `setupCameraStream()`.
+  @MainActor static func claimCameraLoan() -> CameraLoan? {
+    guard let loan = pendingCameraLoan else { return nil }
+    pendingCameraLoan = nil
+    cameraLoanSweepTask?.cancel()
+    cameraLoanSweepTask = nil
+    return loan
+  }
+
+  /// If the coaching VM never mounts (user bails mid-transition), the loaned
+  /// stream must not keep the camera running forever: stop it and drop the
+  /// transferred lease.
+  @MainActor private static func armCameraLoanSweep(sessionManager: DeviceSessionManager) {
+    cameraLoanSweepTask?.cancel()
+    cameraLoanSweepTask = Task { @MainActor in
+      try? await Task.sleep(nanoseconds: 15_000_000_000)
+      guard !Task.isCancelled, let loan = pendingCameraLoan else { return }
+      pendingCameraLoan = nil
+      cameraLoanSweepTask = nil
+      print("[GeminiLive] camera loan unclaimed after 15s — stopping loaned stream, releasing lease")
+      loan.stream.stop()
+      try? await Task.sleep(nanoseconds: 1_000_000_000)  // drain grace
+      await sessionManager.release(consumerLabel: "gemini-live")
+    }
+  }
+
+  /// Donor side: detach this VM's listeners but leave the Stream running and
+  /// the `"gemini-live"` lease held, depositing both for the successor VM.
+  /// Returns false when there's nothing loanable (iPhone transport, no live
+  /// stream, camera already failed) — caller must fall back to a full
+  /// `stopCameraStream()` teardown. Chains on `cameraLifecycleTask` so it
+  /// can't race an in-flight setup/stop/pause.
+  func loanCameraForHandoff() async -> Bool {
+    guard transport == .glasses, cameraHealth == .ok else { return false }
+    let prior = cameraLifecycleTask
+    let loanTask = Task<Bool, Never> { [self] in
+      await prior?.value
+      guard let stream = self.glassesStream, let session = self.deviceSession else { return false }
+
+      // Detach OUR observers; the stream itself keeps flowing for the
+      // successor. Mirrors stopCameraStream's token-first ordering.
+      self.videoFrameListenerToken = nil
+      self.stateListenerToken = nil
+      self.sessionErrorsCancellable?.cancel()
+      self.sessionErrorsCancellable = nil
+      self.sessionInvalidatedCancellable?.cancel()
+      self.sessionInvalidatedCancellable = nil
+      self.stopVideoWatchdog()
+      self.glassesCoachingSource = nil
+      self.glassesPreviewFrame = nil
+      self.glassesStream = nil
+      self.deviceSession = nil
+
+      await MainActor.run {
+        Self.pendingCameraLoan = CameraLoan(stream: stream, session: session, depositedAt: Date())
+        Self.armCameraLoanSweep(sessionManager: self.sessionManager)
+      }
+      print("[GeminiLive] camera loaned for handoff (state=\(stream.state)) — stream + gemini-live lease stay live")
+      return true
+    }
+    cameraLifecycleTask = Task { _ = await loanTask.value }
+    return await loanTask.value
+  }
+
   // MARK: - GlassesRuntime
 
   /// Default full teardown for a Gemini Live runtime (conforms `GlassesRuntime`,
@@ -1874,6 +2176,7 @@ class GeminiLiveSessionBase: ObservableObject {
     stopCameraStream()
     await awaitCameraTeardown()
   }
+
 
   // MARK: - Camera pause during clip playback
 
@@ -1895,15 +2198,62 @@ class GeminiLiveSessionBase: ObservableObject {
       // as intentional rather than a dropped stream.
       self.isCameraPausedForClip = true
       print("[ClipCam] pausing glasses camera for clip (state=\(stream.state))")
-      await stream.stop()
+      // 0.8: stop() is synchronous and returns before the stream finishes
+      // draining. Wait (bounded) for `.stopped` so the clip's lens
+      // VideoPlayer doesn't start while camera frames still contend for the
+      // shared radio — the exact overlap this pause exists to avoid.
+      stream.stop()
+      await self.awaitStreamStopped(stream, timeout: 2.0)
       print("[ClipCam] glasses camera paused (state=\(stream.state))")
     }
   }
 
+  /// Bounded wait for a camera `Stream` to reach `.stopped` after the
+  /// (0.8, synchronous) `stop()` call. Mirrors
+  /// `StreamSessionViewModel.awaitDeviceSessionStopped` but against
+  /// `Stream.statePublisher`. Times out silently — the caller only needs a
+  /// best-effort drain, not a guarantee.
+  private func awaitStreamStopped(_ stream: MWDATCamera.Stream, timeout: TimeInterval) async {
+    if stream.state == .stopped { return }
+
+    let (states, continuation) = AsyncStream<StreamState>.makeStream()
+    let listenerToken = stream.statePublisher.listen { state in
+      continuation.yield(state)
+    }
+
+    if stream.state == .stopped {
+      continuation.finish()
+      await listenerToken.cancel()
+      return
+    }
+
+    _ = await withTaskGroup(of: Bool.self, returning: Bool.self) { group in
+      group.addTask {
+        for await state in states {
+          if state == .stopped { return true }
+        }
+        return false
+      }
+      group.addTask {
+        try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+        return false
+      }
+      let first = await group.next() ?? false
+      group.cancelAll()
+      continuation.finish()
+      return first
+    }
+    // Explicit unsubscribe (the token protocol exposes async cancel();
+    // don't rely on deinit-based auto-removal keeping the closure off the
+    // shared Stream's publisher — this helper runs once per clip pause).
+    await listenerToken.cancel()
+  }
+
   /// Restart the glasses camera `Stream` paused by `pauseGlassesCameraForClip()`.
-  /// Reuses the retained stream + listener tokens. Clears the intentional-pause
-  /// flag only AFTER `start()` returns so any transient `.stopped` during the
-  /// restart ramp stays covered.
+  /// Reuses the retained stream + listener tokens. Since 0.8 `start()` is
+  /// synchronous fire-and-forget, so the restart ramp is covered entirely by
+  /// the re-stamp + `clipResumeFrameGrace` below; the pause flag clears only
+  /// after those are in place so a transient `.stopped` stays covered.
   func resumeGlassesCameraForClip() {
     guard glassesStream != nil else { return }
     let prior = cameraLifecycleTask
@@ -1912,7 +2262,13 @@ class GeminiLiveSessionBase: ObservableObject {
       guard let self = self, let stream = self.glassesStream else { return }
       let startedAt = Date()
       print("[ClipCam] resuming glasses camera (state=\(stream.state))")
-      await stream.start()
+      stream.start()
+      // Re-stamp + grace BEFORE clearing the pause flag: the stamp is stale by
+      // the whole clip duration, so an unguarded watchdog tick between
+      // flag-clear and the first post-resume frame would instantly declare
+      // starvation. The grace covers the stream-restart ramp itself.
+      self.stampVideoFrame()
+      self.videoWatchdogGraceUntil = Date().addingTimeInterval(Self.clipResumeFrameGrace)
       self.isCameraPausedForClip = false
       let ms = Int(Date().timeIntervalSince(startedAt) * 1000)
       print("[ClipCam] glasses camera resumed in \(ms)ms (state=\(stream.state))")

@@ -57,17 +57,44 @@
 		     and no transitions fire). Required for any lens rendering. -->
 		<key>DAMEnabled</key>
 		<true/>
+		<!-- Experiment: the 0.8 binary carries an spdlog file logger
+		     (ARCSpdlogFileLogHandler → MetaWearablesDAT.log) plus "Logging"
+		     and "LogLevel" key strings, but no public configure API. If this
+		     dict is honored, the console prints "MWDAT Logger initialized
+		     with ARCSpdlogFileLogHandler" at launch and the SDK's link-layer
+		     join trace lands in the app container. Harmless if ignored. -->
+		<key>Logging</key>
+		<dict>
+			<key>LogLevel</key>
+			<string>debug</string>
+		</dict>
 	</dict>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>Needed to connect to Meta AI Glasses</string>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_retrace._tcp</string>
+		<!-- DAT 0.8 WiFi video transport opt-in: `_bonjour._tcp` lets the SDK
+		     discover the glasses over the local network; without it the SDK
+		     silently stays on Bluetooth Classic. History: removed (BT pin)
+		     after field captures showed video starving with NO observable
+		     WiFi join; RE-ADDED 2026-07-01 after finding the likely root
+		     cause of those dead joins — the Meta AI app has a per-glasses
+		     "allow WiFi connection" permission in glasses settings that had
+		     never been enabled. That glasses-side gate is a hard prerequisite
+		     for the SoftAP join (undocumented; matches Meta's repo discussion
+		     #37 "user flow similar to how Meta AI does downloads"). If video
+		     starves again WITH the Meta AI toggle on, remove this entry to
+		     re-pin BT. -->
+		<string>_bonjour._tcp</string>
+		<!-- LocalNetworkPermission probe (self-published + self-discovered
+		     to detect the Local Network grant; iOS has no query API). -->
+		<string>_retrace-lnp._tcp</string>
 	</array>
 	<key>NSCameraUsageDescription</key>
 	<string>Retrace uses your iPhone camera to record procedures and to let the AI coach see your work when you choose the iPhone capture mode.</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Retrace needs local network access to discover the server on your Wi-Fi network.</string>
+	<string>Retrace needs local network access to discover the server on your Wi-Fi network and to stream video from your glasses over Wi-Fi.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Retrace needs microphone access to record narration during expert recordings and to hear you during AI coaching sessions.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>

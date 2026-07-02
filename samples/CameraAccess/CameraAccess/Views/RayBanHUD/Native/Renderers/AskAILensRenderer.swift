@@ -31,6 +31,12 @@ final class AskAILensRenderer: LensRenderer {
     cancellables.removeAll()
   }
 
+  /// Recover the HUD after a system back-gesture dismiss. No dedupe cache here —
+  /// `scheduleSend()` always sends — so just re-project and re-send.
+  func repaint() {
+    scheduleSend()
+  }
+
   private func subscribe() {
     Publishers.CombineLatest3(
       viewModel.$searchState,

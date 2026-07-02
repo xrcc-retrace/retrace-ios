@@ -176,6 +176,15 @@ final class DeviceSessionManager: ObservableObject {
   /// `tryOpenChannel`). Heuristic mitigation for an SDK-internal lifecycle gap.
   private var recentlyToreDown: Bool = false
 
+  /// Companion to `recentlyToreDown`: true when the teardown was a FORCED one
+  /// (`invalidate` / `resetForFreshSession`) rather than an orderly observer
+  /// teardown. Forced teardowns kill a WARP stack mid-use, and its
+  /// `service_lost`/`service_not_found` DCTEvent churn has been observed to
+  /// continue ~1.3s past `.stopped` — a session created inside that window
+  /// comes up `.started` but with a dead media path (the "stillborn zombie").
+  /// `acquire()` consumes this to widen the drain settle for that case.
+  private var lastTeardownWasForced: Bool = false
+
   /// Identity of a session force-dropped by `invalidate(reason:)`. The
   /// serialized teardown nils `deviceSession` only after the async stop drains,
   /// so for the synchronous window in between this lets `acquire()`'s `.started`
@@ -559,8 +568,13 @@ final class DeviceSessionManager: ObservableObject {
       // no SDK signal for "WARP fully drained" beyond `.stopped`.
       if recentlyToreDown {
         recentlyToreDown = false
-        log("acquire(\(consumerLabel)) → settle 300ms after recent teardown (WARP drain)")
-        try? await Task.sleep(nanoseconds: 300_000_000)
+        // Forced teardowns (invalidate/reset) need a wider settle: their WARP
+        // churn outlives `.stopped` by ~1.3s observed, and 300ms was short
+        // enough to produce a `.started`-but-dead replacement session.
+        let settleNanos: UInt64 = lastTeardownWasForced ? 2_000_000_000 : 300_000_000
+        log("acquire(\(consumerLabel)) → settle \(settleNanos / 1_000_000)ms after recent \(lastTeardownWasForced ? "forced" : "") teardown (WARP drain)")
+        lastTeardownWasForced = false
+        try? await Task.sleep(nanoseconds: settleNanos)
       }
 
       log("acquire(\(consumerLabel), req=\(requirements)) → createSession + start")
@@ -660,7 +674,7 @@ final class DeviceSessionManager: ObservableObject {
       invalidatedSessionID = ObjectIdentifier(session)
     }
     leases.removeAll()
-    teardownActiveSession(reason: "invalidate: \(reason)")
+    teardownActiveSession(reason: "invalidate: \(reason)", forced: true)
     sessionInvalidated.send(reason)
   }
 
@@ -686,7 +700,7 @@ final class DeviceSessionManager: ObservableObject {
     sessionInvalidated.send(reason)
     // Force the serialized stop (arms the 300ms WARP-drain settle), then await it
     // so HFP arming can't begin until the shared radio is actually released.
-    teardownActiveSession(reason: "resetForFreshSession: \(reason)")
+    teardownActiveSession(reason: "resetForFreshSession: \(reason)", forced: true)
     await lifecycleTask?.value
   }
 
@@ -699,10 +713,11 @@ final class DeviceSessionManager: ObservableObject {
   /// terminal `.stopped` — closing the window that produced two live WARP
   /// stacks. Fire-and-forget (the observers can't await): the serialization
   /// guarantee comes from `acquire()` awaiting `lifecycleTask`, not from here.
-  private func teardownActiveSession(reason: String) {
+  private func teardownActiveSession(reason: String, forced: Bool = false) {
     guard let session = deviceSession else { return }
     log("teardownActiveSession(\(reason))")
     recentlyToreDown = true
+    if forced { lastTeardownWasForced = true }
     let prior = lifecycleTask
     let task = Task { [weak self] in
       await prior?.value
@@ -1008,6 +1023,13 @@ final class DeviceSessionManager: ObservableObject {
       let token = device.addLinkStateListener { [weak self] state in
         Task { @MainActor [weak self] in
           guard let self else { return }
+          // [WIFI]-tagged so one console search covers the whole WiFi-link
+          // diagnosis trail. A connecting/disconnected transition inside a
+          // camera frame gap timestamps the DAT link renegotiation from the
+          // app side (the SDK's WiFi join itself is silent to us).
+          if self.deviceLinkState[deviceId] != state {
+            print("[WIFI] device linkState → \(state) (device=\(deviceId))")
+          }
           self.deviceLinkState[deviceId] = state
           self.recomputeConnectivity()
         }

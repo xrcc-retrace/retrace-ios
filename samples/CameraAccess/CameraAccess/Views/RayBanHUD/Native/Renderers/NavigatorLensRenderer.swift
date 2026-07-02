@@ -46,6 +46,14 @@ final class NavigatorLensRenderer: LensRenderer {
     cancellables.removeAll()
   }
 
+  /// Recover the HUD after a system back-gesture dismiss: clear the dedupe cache
+  /// (an unchanged snapshot would otherwise be suppressed) and re-send the current
+  /// screen. Same body as `repaintAfterClip()`.
+  func repaint() {
+    lastSentSnapshot = nil
+    scheduleSend()
+  }
+
   // MARK: - Subscription
 
   private func subscribe() {
@@ -162,15 +170,17 @@ final class NavigatorLensRenderer: LensRenderer {
     let sp = steps.isEmpty ? 0 : min(max(0, viewModel.stepPage), steps.count - 1)
     let step = steps.indices.contains(sp) ? steps[sp] : nil
 
-    // "Watch full recording" is only offered for video-sourced procedures that
-    // carry a real source file — manual/web procedures have per-step images, not
-    // a full recording, so the pill is hidden for them.
+    // "Watch step reference" is only offered when the CURRENT step resolves to
+    // a playable video clip — manual/web steps resolve to .image/.none, and
+    // failed/missing clips resolve to .none, so the pill is hidden for them.
     let detail = viewModel.detail
-    let hasRecording = (detail?.sourceType ?? "video").lowercased() == "video"
-        && !(detail?.sourceVideo?.isEmpty ?? true)
+    let hasStepClip: Bool = {
+      if case .video = resolveStepReferenceMedia() { return true }
+      return false
+    }()
 
     // Manual procedures show the current step's page image inline (video steps
-    // resolve to .video → nil here, they use the "Watch full recording" pill).
+    // resolve to .video → nil here, they use the "Watch step reference" pill).
     // Gated on https because the lens Image(uri:) loader is https-only — over a
     // plain-http server we omit it so the card shows text instead of a blank box.
     let referenceImageURL: String? = {
@@ -188,7 +198,7 @@ final class NavigatorLensRenderer: LensRenderer {
     switch viewModel.screen {
     case .procedureDetail, .learnerProcedureDetail:
       let scheme = ServerEndpoint.shared.resolvedBaseURL.hasPrefix("https://") ? "https" : "http"
-      let diag = "step=\(step?.stepNumber ?? -1) sourceType=\(detail?.sourceType ?? "nil") scheme=\(scheme) hasRecording=\(hasRecording) img=\(referenceImageURL ?? "nil")"
+      let diag = "step=\(step?.stepNumber ?? -1) sourceType=\(detail?.sourceType ?? "nil") scheme=\(scheme) hasStepClip=\(hasStepClip) img=\(referenceImageURL ?? "nil")"
       if diag != lastImageDiag {
         lastImageDiag = diag
         print("[Navigator] detail \(diag)")
@@ -221,7 +231,7 @@ final class NavigatorLensRenderer: LensRenderer {
       stepBody: LensComponents.truncate(step?.description ?? "", max: 160),
       stepIndex: sp,
       stepPageCount: steps.count,
-      hasRecording: hasRecording,
+      hasStepClip: hasStepClip,
       referenceImageURL: referenceImageURL,
       isReferenceImageOpen: viewModel.showReferenceImage,
       gamePhase: gamePhase,
@@ -282,7 +292,7 @@ final class NavigatorLensRenderer: LensRenderer {
         Task { @MainActor in viewModel?.selectListTab(tab == .saved ? .saved : .all) }
       },
       onStartCoaching:   { [weak viewModel] in Task { @MainActor in viewModel?.startCoachingFromDetail() } },
-      onWatchRecording:  { [weak self] in Task { @MainActor in self?.watchRecording() } },
+      onWatchStepReference: { [weak self] in Task { @MainActor in self?.playStepReference() } },
       onToggleReferenceImage: { [weak viewModel] in Task { @MainActor in viewModel?.toggleReferenceImage() } },
       onStartTroubleshoot: { [weak viewModel] in Task { @MainActor in viewModel?.startTroubleshoot() } },
       onOpenGame:        { [weak viewModel] in Task { @MainActor in viewModel?.openGame() } },
@@ -291,37 +301,51 @@ final class NavigatorLensRenderer: LensRenderer {
     )
   }
 
-  // MARK: - Watch full recording
+  // MARK: - Watch step reference
 
-  /// Play the procedure's FULL source recording full-screen on the lens, reusing
+  /// Resolve the CURRENT step's reference media from its authoritative
+  /// `clip_url` + the procedure's `source_type`, appending `?profile=lens` to
+  /// the `.video` case so the glasses stream the small bitrate-capped variant.
+  /// Mirror of `CoachingLensRenderer.resolveReferenceMedia()` — per-step clips
+  /// are bounded and small, so first frame is consistently fast on the lens
+  /// regardless of how long the full recording is (which stays phone-only).
+  private func resolveStepReferenceMedia() -> StepReferenceMedia {
+    let steps = viewModel.detail?.steps ?? []
+    guard !steps.isEmpty else { return .none }
+    let sp = min(max(0, viewModel.stepPage), steps.count - 1)
+    let media = steps[sp].referenceMedia(
+      sourceType: viewModel.detail?.sourceType,
+      baseURL: ServerEndpoint.shared.resolvedBaseURL
+    )
+    guard case .video(let url) = media,
+          var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+    else { return media }
+    components.queryItems = (components.queryItems ?? []) + [URLQueryItem(name: "profile", value: "lens")]
+    return components.url.map { .video($0) } ?? media
+  }
+
+  /// Play the CURRENT step's reference clip full-screen on the lens, reusing
   /// the reference-clip playback path (smooth `?profile=lens` variant + watchdog).
-  /// On finish / stop it repaints the procedure-detail (steps) view.
-  private func watchRecording() {
-    guard let detail = viewModel.detail else {
-      print("[Navigator] watchRecording skipped — no detail loaded"); return
+  /// Retargets automatically as the user pages steps — the clip URL is resolved
+  /// from the VM at tap time. On finish / stop it repaints the step page.
+  private func playStepReference() {
+    guard case .video(let url) = resolveStepReferenceMedia() else {
+      print("[Navigator] playStepReference skipped — current step has no video clip"); return
     }
-    guard let filename = detail.sourceVideo, !filename.isEmpty else {
-      print("[Navigator] watchRecording skipped — no source_video on \(detail.id)"); return
-    }
-    guard (detail.sourceType ?? "video").lowercased() == "video" else {
-      print("[Navigator] watchRecording skipped — sourceType=\(detail.sourceType ?? "nil"), not a recording"); return
-    }
-    guard var uri = LensImageURL.uploadURL(filename: filename) else {
-      print("[Navigator] watchRecording skipped — could not build upload URL (empty server base?)"); return
-    }
-    // Request the bitrate-capped variant so the full recording streams smoothly
-    // over the Bluetooth Display link (matches how step clips resolve).
-    uri += (uri.contains("?") ? "&" : "?") + "profile=lens"
+    let steps = viewModel.detail?.steps ?? []
+    let sp = steps.isEmpty ? 0 : min(max(0, viewModel.stepPage), steps.count - 1)
+    let duration: TimeInterval? = steps.indices.contains(sp)
+      ? { let d = steps[sp].timestampEnd - steps[sp].timestampStart; return d > 0 ? d : nil }()
+      : nil
 
-    let duration = detail.totalDuration
-    print("[Navigator] watchRecording → \(uri) (expectedDuration=\(duration)s)")
+    print("[Navigator] playStepReference step=\(sp + 1) → \(url.absoluteString) (expectedDuration=\(duration.map { String($0) } ?? "nil")s)")
     Task { [weak self] in
       await self?.lensSession?.presentReferenceClip(
-        uri: uri,
-        expectedDuration: duration > 0 ? duration : nil,
-        onStarted: { print("[Navigator] full-recording playback started") },
-        onEnded: { [weak self] in print("[Navigator] full-recording ended/stopped — returning to steps"); self?.repaintAfterClip() },
-        onError: { [weak self] reason in print("[Navigator] full-recording error: \(reason)"); self?.repaintAfterClip() }
+        uri: url.absoluteString,
+        expectedDuration: duration,
+        onStarted: { print("[Navigator] step-reference playback started") },
+        onEnded: { [weak self] in print("[Navigator] step-reference ended/stopped — returning to steps"); self?.repaintAfterClip() },
+        onError: { [weak self] reason in print("[Navigator] step-reference error: \(reason)"); self?.repaintAfterClip() }
       )
     }
   }

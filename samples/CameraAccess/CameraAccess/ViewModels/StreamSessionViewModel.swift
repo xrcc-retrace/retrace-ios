@@ -170,6 +170,16 @@ class StreamSessionViewModel: ObservableObject, GlassesRuntime {
 
   /// Tolerated gap before declaring the stream dead.
   private static let frameStallThreshold: TimeInterval = 5.0
+  /// Hard ceiling for a mid-stream frame gap. DAT 0.8 migrates video onto a
+  /// WiFi Direct/SoftAP link (multi-second join, frames pause) at stream
+  /// start and on bandwidth jumps — e.g. record start. A >5s gap is
+  /// "possibly migrating", not "dead"; hold teardown until this ceiling.
+  private static let frameStallHardThreshold: TimeInterval = 30.0
+  /// Non-nil while in the soft-stall probation window (gap >5s, <30s).
+  private var frameStallProbationStartedAt: Date?
+  /// Frame stamp at probation entry — the recovery log prints the exact
+  /// survived gap (the WiFi-migration measurement).
+  private var frameStallProbationLastFrameAt: Date?
   /// Window after `start()` for the first frame to arrive (matches the
   /// 0.5–10 s first-frame latency the coaching path already tolerates).
   private static let firstFrameGrace: TimeInterval = 10.0
@@ -352,9 +362,9 @@ class StreamSessionViewModel: ObservableObject, GlassesRuntime {
     return (Int(_latestFrameDimsW), Int(_latestFrameDimsH))
   }
 
-  // The core DAT SDK Stream capability — handles all streaming operations.
-  // In 0.7 `Stream` is a Capability attached to a DeviceSession and has no
-  // public initializer (renamed from 0.6's `StreamSession`). We create the
+  // The core DAT SDK Stream — handles all streaming operations.
+  // Since 0.8 `Stream` is managed directly via `DeviceSession.addStream` and
+  // has no public initializer. We create the
   // session lazily in `startSession()` so a missing eligible device at
   // construction time doesn't kill the VM — instead we can report it when
   // the user actually taps "Start streaming". Qualified as MWDATCamera.Stream
@@ -623,17 +633,16 @@ class StreamSessionViewModel: ObservableObject, GlassesRuntime {
     let liveDims = readLatestFrameDims()
     let size: (width: Int, height: Int) = {
       if let live = liveDims {
-        // We now request `.medium` from the SDK so the live dims
-        // should be a stable 504×896 from preview through recording.
-        // We still source from live dims as a defensive belt — if the
-        // SDK ever degrades framerate AND further reduces resolution
-        // under extreme pressure, the writer will adapt.
-        print("[Glasses] startRecording sizing writer to live dims \(live.width)x\(live.height) (SDK requested .medium 504x896)")
+        // We request `.high` (720×1280, over the WiFi lease) but always
+        // size the writer from live dims — if the SDK degraded to `.medium`
+        // (504×896) before record start, the writer adapts. Only a
+        // MID-recording degrade (dims change after sizing) still breaks.
+        print("[Glasses] startRecording sizing writer to live dims \(live.width)x\(live.height) (SDK requested .high 720x1280)")
         return live
       }
-      print("[Glasses] startRecording falling back to 504x896 (no live frame seen yet)")
-      // Fallback matches what we requested from the SDK (.medium).
-      return (504, 896)
+      print("[Glasses] startRecording falling back to 720x1280 (no live frame seen yet)")
+      // Fallback matches what we requested from the SDK (.high).
+      return (720, 1280)
     }()
 
     // Reset diagnostic counters per recording so the 2s log windows
@@ -826,7 +835,10 @@ class StreamSessionViewModel: ObservableObject, GlassesRuntime {
       _ = self  // strong capture — keeps the VM alive through teardown
       _ = sessionToStop  // retained until release completes
       print("[Glasses] teardown → stopping streamSession")
-      await streamToStop?.stop()
+      // 0.8: Stream.stop() is synchronous fire-and-forget; the manager.release
+      // below waits for DeviceSession .stopped, which anchors the ordering.
+      streamToStop?.stop()
+      WiFiLinkMonitor.shared.stop(context: "expert teardown")
       // Manager owns DeviceSession lifecycle; just release our lease.
       // If another consumer (lens) holds the session, the manager keeps
       // it alive. If we were last, the manager calls .stop() and waits
@@ -942,11 +954,10 @@ class StreamSessionViewModel: ObservableObject, GlassesRuntime {
         return
       }
 
-      // Lock to `.medium` (504×896) instead of `.high` (720×1280) — see
-      // long-form rationale just below.
+      // `.high` (720×1280) — see long-form rationale just below.
       let streamConfig = StreamConfiguration(
         videoCodec: .raw,
-        resolution: .medium,
+        resolution: .high,
         frameRate: 30)
 
       let session: DeviceSession
@@ -970,7 +981,7 @@ class StreamSessionViewModel: ObservableObject, GlassesRuntime {
           print("[Glasses] startSession() → manager.acquire('expert', req=\(req)) (hasDisplay=\(manager.hasDisplayCapableDevice))")
           let acquired = try await manager.acquire(consumerLabel: "expert", requirements: req)
           print("[Glasses] manager.acquire ✓ (state=\(acquired.state))")
-          print("[Glasses] addStream(config: codec=raw, resolution=.medium, fps=30) → …")
+          print("[Glasses] addStream(config: codec=raw, resolution=.high, fps=30) → …")
           guard let s = try acquired.addStream(config: streamConfig) else {
             print("[Glasses] addStream ✗ returned nil — releasing session and bailing")
             await manager.release(consumerLabel: "expert")
@@ -995,19 +1006,25 @@ class StreamSessionViewModel: ObservableObject, GlassesRuntime {
         }
       }
 
-      // Rationale for `.medium` resolution:
+      // ⚠️ `.high` is LOAD-BEARING for the DAT 0.8 WiFi video transport —
+      // do NOT lower it back to `.medium` (2026-07-01, empirically
+      // verified): with .medium the stream intermittently starves after
+      // ~1 frame (Stream.state stuck .streaming, no error, never
+      // recovers); with .high it streams reliably. Matches MWDATCamera's
+      // own classification — streams "require medium (BTC) or high (WiFi)
+      // bandwidth link": .medium is BT-class and gets stranded at the
+      // BT→WiFi link boundary, .high is WiFi-class from bring-up. Also
+      // required: the Meta AI app's per-glasses "allow WiFi connection"
+      // permission (glasses settings — undocumented).
       //
-      // Background: the BT/WiFi link to the glasses can sustain `.high`
-      // ONLY while audio isn't competing for bandwidth (i.e. preview-
-      // only). The moment recording starts, audio session activation
-      // grabs HFP, bandwidth halves, and DAT auto-degrades to `.medium`
-      // mid-recording. The AVAssetWriter — already sized at 720×1280
-      // from the preview-time dims — then rejects every degraded
-      // 504×896 frame with "Cannot Encode Media" and the recording
-      // produces 0 video frames. So we request `.medium` up-front; the
-      // writer is sized 504×896 the whole time and frames always match.
-      // We "give up" the brief `.high` preview moment to gain
-      // deterministic recording.
+      // BT-era history of the old `.medium` lock (0.7): recording start
+      // grabbed HFP, BT bandwidth halved, DAT auto-degraded .high→.medium
+      // mid-recording, and an AVAssetWriter sized 720×1280 rejected every
+      // 504×896 frame ("Cannot Encode Media", 0-frame recordings).
+      // Mitigation still in place: the writer sizes itself from LIVE frame
+      // dims at record start, so a pre-recording degrade is absorbed. Only
+      // a MID-recording degrade (dims change after the writer is sized)
+      // still breaks — on WiFi that scenario hasn't been observed.
 
       deviceSession = session
       streamSession = stream
@@ -1017,13 +1034,15 @@ class StreamSessionViewModel: ObservableObject, GlassesRuntime {
       print("[Glasses] startSession() → reusing existing streamSession")
     }
     print("[Glasses] streamSession.start() → …")
-    await streamSession?.start()
+    streamSession?.start()
     print("[Glasses] streamSession.start() ✓")
+    WiFiLinkMonitor.shared.start(context: "expert recording stream")
 
-    // Arm the frame-starvation watchdog. `start()` only confirms the SDK
-    // accepted the start — not that frames flow — and a WARP transport death
-    // never surfaces on errorStream/statePublisher, so frame starvation is the
-    // only signal that the camera died.
+    // Arm the frame-starvation watchdog. Since 0.8 `start()` is synchronous
+    // fire-and-forget — it doesn't even confirm the SDK accepted the start,
+    // let alone that frames flow — and a WARP transport death never surfaces
+    // on errorStream/statePublisher, so frame starvation is the only signal
+    // that the camera died.
     startFrameWatchdog()
   }
 
@@ -1269,6 +1288,7 @@ class StreamSessionViewModel: ObservableObject, GlassesRuntime {
   /// Arm the watchdog. Called after `streamSession.start()` returns.
   private func startFrameWatchdog() {
     frameWatchdogTask?.cancel()
+    clearFrameStallProbation()
     streamStartedAt = Date()
     lastFrameAt = .distantPast  // no frame yet this stream
     frameWatchdogTask = Task { [weak self] in
@@ -1295,10 +1315,40 @@ class StreamSessionViewModel: ObservableObject, GlassesRuntime {
       }
       return
     }
-    // Mid-stream stall: frames were flowing, then stopped.
-    if now.timeIntervalSince(lastFrameAt) > Self.frameStallThreshold {
-      handleCameraStarvation(reason: "no frames for \(Int(Self.frameStallThreshold))s")
+    // Mid-stream stall: frames were flowing, then stopped. Two-stage: a >5s
+    // gap may be the SDK migrating video onto the WiFi Direct link (frames
+    // pause during the join) — hold teardown and only declare death at 30s.
+    let gap = now.timeIntervalSince(lastFrameAt)
+
+    if gap <= Self.frameStallThreshold {
+      if frameStallProbationStartedAt != nil {
+        let survived = lastFrameAt.timeIntervalSince(frameStallProbationLastFrameAt ?? lastFrameAt)
+        clearFrameStallProbation()
+        print(String(format: "[Glasses] ✓ frames resumed after %.1fs gap (WiFi link migration survived)", survived))
+        WiFiLinkMonitor.shared.logSnapshot(context: "expert-frame-gap-recovered")
+      }
+      return
     }
+
+    if frameStallProbationStartedAt == nil {
+      // Do NOT stop the recording, invalidate, or set cameraConnectionLost —
+      // a survived gap renders as a frozen segment in the file, which beats
+      // a dead session. The health banner never fires for survived gaps.
+      frameStallProbationStartedAt = now
+      frameStallProbationLastFrameAt = lastFrameAt
+      print("[Glasses] ⚠️ frame gap >\(Int(Self.frameStallThreshold))s — possible WiFi link migration; holding teardown up to \(Int(Self.frameStallHardThreshold))s")
+      WiFiLinkMonitor.shared.logSnapshot(context: "expert-frame-gap-soft")
+      return
+    }
+
+    if gap > Self.frameStallHardThreshold {
+      handleCameraStarvation(reason: "no frames for \(Int(Self.frameStallHardThreshold))s")
+    }
+  }
+
+  private func clearFrameStallProbation() {
+    frameStallProbationStartedAt = nil
+    frameStallProbationLastFrameAt = nil
   }
 
   /// The transport is dead but the SDK never surfaced it. Force-drop the shared
@@ -1308,6 +1358,7 @@ class StreamSessionViewModel: ObservableObject, GlassesRuntime {
     print("[Glasses] ⚠️ camera frame starvation — \(reason); invalidating shared session")
     cameraConnectionLost = true
     stopFrameWatchdog()
+    clearFrameStallProbation()
 
     // If a recording was in flight it's been capturing nothing — finalize it
     // (it'll report failure and clean up its temp file) so no writer dangles.
@@ -1352,7 +1403,7 @@ class StreamSessionViewModel: ObservableObject, GlassesRuntime {
     errorListenerToken = nil
     photoDataListenerToken = nil
 
-    await streamSession?.stop()
+    streamSession?.stop()
     if let session = deviceSession {
       session.stop()
       // CRITICAL: `stop()` only flips the state machine to `.stopping`
@@ -1432,6 +1483,12 @@ class StreamSessionViewModel: ObservableObject, GlassesRuntime {
       return "The hinges on the glasses were closed. Please open the hinges and try again."
     case .thermalCritical:
       return "Device is overheating. Streaming has been paused to protect the device."
+    case .thermalEmergency:
+      return "Device is critically overheating. Let the glasses cool down before streaming again."
+    case .peakPowerShutdown:
+      return "The glasses shut down streaming to protect the battery. Try again in a moment."
+    case .batteryCritical:
+      return "Glasses battery is critically low. Charge the glasses to keep streaming."
     @unknown default:
       return "An unknown streaming error occurred."
     }

@@ -595,6 +595,10 @@ class CoachingSessionViewModel: GeminiLiveSessionBase {
   /// `error` injects a `[CORRECTION]` turn without touching step state.
   private func runOraclePoll() async {
     guard activeMonitoring, canSendHeartbeatNow() else { return }
+    // Dead camera branch → `lastFrameJPEG` is frozen at the last delivered
+    // frame. Shipping it would have the oracle judging a stale image every
+    // tick — a false [ADVANCE] waiting to happen. Skip until recovery.
+    guard cameraHealth == .ok else { return }
     guard let sessionId, let frame = lastFrameJPEG else { return }
 
     let resp: VerifyResponse

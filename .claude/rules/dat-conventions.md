@@ -18,7 +18,7 @@ For everything about how the Meta DAT iOS SDK itself works — modules, types, n
 | `mwdat-ios:debugging` | Common failure modes, Developer Mode, version matrix |
 | `mwdat-ios:sample-app-guide` | End-to-end example structure |
 
-These are pinned at 0.7.0 and are the authoritative reference. Do not re-derive Meta's patterns inline in our docs — point at the skill and let it own the canonical version.
+The app is on SDK **0.8.0**; the locally installed plugin marketplace may lag a version — cross-check version-sensitive claims against the SDK changelog. Do not re-derive Meta's patterns inline in our docs — point at the skill and let it own the canonical version.
 
 ---
 
@@ -57,3 +57,7 @@ Both deep-link to `wearables.openDATGlassesAppUpdate()`. Mirror this pattern for
 ### 4. Add new Swift files to the Xcode project
 
 The main `CameraAccess` target uses traditional `PBXGroup` — new `.swift` files are not compiled until registered in `project.pbxproj`. Use the registration script in `retrace-ios/CLAUDE.md` after every file creation.
+
+### 5. `Stream`/`Display` `start()`/`stop()` are synchronous (since 0.8)
+
+Never treat their return as readiness or completion — they're fire-and-forget. Readiness comes from `statePublisher` transitions or first-frame proof (frame watchdogs). Stop-completion ordering is anchored on `DeviceSessionManager.release` (awaits DeviceSession `.stopped`) or a bounded `statePublisher → .stopped` wait (`GeminiLiveSessionBase.awaitStreamStopped`). Leftover `await`s on these calls compile as warnings ("no 'async' operations occur within 'await'"), not errors — don't rely on the compiler to catch them.

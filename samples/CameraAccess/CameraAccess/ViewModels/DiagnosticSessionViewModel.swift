@@ -140,6 +140,15 @@ class DiagnosticSessionViewModel: GeminiLiveSessionBase {
   /// `.synthesizing` and `.foundFix` narration substages.
   private var webSearchPollTask: Task<Void, Never>?
 
+  /// Server-state watchdog, alive only while `pendingConfirmation` is true.
+  /// The overlay is normally dismissed by the `confirm_identification` tool
+  /// result (or by a search tool appearing in flight — see the
+  /// `pendingToolCallNames` sink), but if that signal is lost the server
+  /// phase is authoritative: `confirm_identification`'s handler advances it
+  /// past `discovering`, so any later phase means the overlay is stale.
+  private var confirmWatchdogTask: Task<Void, Never>?
+  private static let confirmWatchdogIntervalNanos: UInt64 = 1_500_000_000
+
   /// Forward-only ratchet so a late poll can't rewind the surface.
   /// `searching_web < synthesizing < {complete | no_fix_found | error}`.
   private var lastPolledPhase: String?
@@ -235,6 +244,20 @@ class DiagnosticSessionViewModel: GeminiLiveSessionBase {
           self.searchStage = nil
         }
 
+        let searchActive = activeNames.contains("search_procedures")
+          || activeNames.contains("web_search_for_fix")
+
+        // A search in flight implies the identification was accepted. After
+        // a verbal "yes, that's the one" Gemini often skips the
+        // confirm_identification tool call and goes straight to searching —
+        // without this, `pendingConfirmation` stays true and the confirm
+        // overlay outranks every later surface (searching, resolved, Start).
+        if searchActive && self.pendingConfirmation {
+          self.pendingConfirmation = false
+          self.cancelConfirmWatchdog()
+          if self.phase == .discovering { self.phase = .diagnosing }
+        }
+
         // Narration. A fresh search_procedures call (e.g. retry after a
         // manual upload) cancels any in-flight libraryMissed hold and
         // rewinds the surface. We also clear any stale `resolution`
@@ -247,8 +270,6 @@ class DiagnosticSessionViewModel: GeminiLiveSessionBase {
         // re-appearing in flight is a duplicate Gemini re-issue, not a user
         // retry — leave the shown result intact and don't rewind to
         // "searching". The raw `searchStage` mirror above still tracks it.
-        let searchActive = activeNames.contains("search_procedures")
-          || activeNames.contains("web_search_for_fix")
         if searchActive && self.isResolvedSurfaceLocked {
           // Duplicate in-flight search; ignore for the narration surface.
         } else if activeNames.contains("search_procedures") {
@@ -299,6 +320,7 @@ class DiagnosticSessionViewModel: GeminiLiveSessionBase {
     handoffInFlight = false
     handoffError = nil
     pendingConfirmation = false
+    cancelConfirmWatchdog()
     searchStage = nil
     searchNarration = nil
     libraryMissHoldTask?.cancel()
@@ -329,6 +351,7 @@ class DiagnosticSessionViewModel: GeminiLiveSessionBase {
   func requestReIdentify() {
     identifiedProduct = nil
     pendingConfirmation = false
+    cancelConfirmWatchdog()
     Task {
       try? await geminiService?.sendClientTextTurn(
         "That's not the right tool. Try a different identification."
@@ -384,6 +407,7 @@ class DiagnosticSessionViewModel: GeminiLiveSessionBase {
     resolvedFloorTask = nil
     pendingResolution = nil
     cancelWebSearchProgressPolling()
+    cancelConfirmWatchdog()
     stopCameraStream()
     stopGeminiLiveSession()
   }
@@ -418,9 +442,25 @@ class DiagnosticSessionViewModel: GeminiLiveSessionBase {
         activeMonitoring: activeMonitoring,
         voice: voice
       )
-      // Learner VM will open its own fresh socket; tear down ours.
-      stopCameraStream()
+      // Learner VM will open its own fresh socket, but the camera branch is
+      // LOANED: the Stream keeps running and the "gemini-live" lease stays
+      // held, so the coaching VM adopts the live stream instead of re-adding
+      // one to the shared DeviceSession. Keeps the WiFi video link + camera
+      // alive across the handoff (no LED blink, no SoftAP re-join) and
+      // avoids the half-drained-WARP-pipe stop→re-add hazard.
+      let loaned = await loanCameraForHandoff()
       stopGeminiLiveSession()
+      if !loaned {
+        // iPhone transport or unhealthy camera: full teardown, and await it
+        // so a successor addStream can't race the old Stream's WARP drain.
+        stopCameraStream()
+        await awaitCameraTeardown()
+      }
+      // Mark ended so TroubleshootSessionView.onDisappear → endSession() is
+      // a no-op. A second teardown there would stop the loaned stream and
+      // release the lease mid-transfer (it was also the source of the
+      // duplicate release(gemini-live) logs).
+      sessionDidEnd = true
       handoffInFlight = false
       return response
     } catch {
@@ -536,6 +576,38 @@ class DiagnosticSessionViewModel: GeminiLiveSessionBase {
     webSearchPollTask?.cancel()
     webSearchPollTask = nil
     lastPolledPhase = nil
+  }
+
+  // MARK: - Confirm-overlay watchdog
+
+  /// Poll server phase while the confirm overlay is up; dismiss the overlay
+  /// as soon as the server has moved past `discovering`. Exits on first
+  /// advance — one-shot repair, not a general reconcile loop.
+  private func startConfirmWatchdog() {
+    confirmWatchdogTask?.cancel()
+    confirmWatchdogTask = Task { @MainActor [weak self] in
+      let api = ProcedureAPIService()
+      while !Task.isCancelled {
+        try? await Task.sleep(nanoseconds: Self.confirmWatchdogIntervalNanos)
+        guard let self, !Task.isCancelled, self.pendingConfirmation else { return }
+        guard let sid = self.sessionId else { continue }
+        let state = try? await api.fetchDiagnosticState(sessionId: sid)
+        // Re-check after the await — the overlay may have been dismissed
+        // (tool result / search dispatch) while the fetch was in flight.
+        guard !Task.isCancelled, self.pendingConfirmation else { return }
+        if let state, state.phase != "discovering" {
+          self.pendingConfirmation = false
+          if self.phase == .discovering { self.phase = .diagnosing }
+          self.confirmWatchdogTask = nil
+          return
+        }
+      }
+    }
+  }
+
+  private func cancelConfirmWatchdog() {
+    confirmWatchdogTask?.cancel()
+    confirmWatchdogTask = nil
   }
 
   /// Map server `web_search_progress.phase` onto `searchNarration` with a
@@ -663,12 +735,14 @@ class DiagnosticSessionViewModel: GeminiLiveSessionBase {
         )
         identifiedProduct = prod
         pendingConfirmation = true
+        startConfirmWatchdog()
       }
 
     case "confirm_identification":
       // Server has advanced phase to DIAGNOSING; mirror it locally and
       // dismiss the confirmation overlay.
       pendingConfirmation = false
+      cancelConfirmWatchdog()
       phase = .diagnosing
 
     case "search_procedures":
