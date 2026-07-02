@@ -44,6 +44,7 @@ struct NavigatorLensCallbacks {
   let onAskAI: @Sendable () -> Void
   let onOpenFilter: @Sendable () -> Void
   let onSelectCategory: @Sendable (String) -> Void
+  let onSelectListTab: @Sendable (NavigatorLensSnapshot.ListTab) -> Void
   let onStartCoaching: @Sendable () -> Void
   /// Play the CURRENT step's reference clip full-screen on the lens (video-clip
   /// steps only). Retargets as the user pages steps.
@@ -130,9 +131,11 @@ enum NavigatorLensTrees {
       // vertical space evenly so they fill the screen; generous padding gives
       // thick, easy-to-hit targets. Static `.card` rows (not DSL Button) per
       // `feedback_lens_button_no_animation` — and a Button can't fill height.
+      // Troubleshoot is FIRST (→ default focus): it's the highest-intent entry
+      // point on the lens.
+      tallModeRow(icon: .exclamationTriangle, label: "Troubleshoot", onTap: cb.onTroubleshoot)
       tallModeRow(icon: .videoCamera, label: "Expert", onTap: cb.onExpert)
       tallModeRow(icon: .eye, label: "Learner", onTap: cb.onLearner)
-      tallModeRow(icon: .exclamationTriangle, label: "Troubleshoot", onTap: cb.onTroubleshoot)
 
       // Hidden easter-egg: a small, compact sparkle that opens the "Retrace"
       // mini-game. `.alignSelf(.center)` keeps it sized to its icon (not a
@@ -211,10 +214,11 @@ enum NavigatorLensTrees {
     .padding(12)
   }
 
-  /// The prominent Record hero on the Expert hub — the Expert-side analog of
-  /// `askAIHero`. Same recipe: a tall centered `.card` with a filled camera glyph
-  /// to the LEFT of big `.heading` "Record" text in a `.row`, `.flexGrow(1)` so it
-  /// expands to fill the hub's free vertical space and dominates the view.
+  /// The prominent Record hero on the Expert hub — a tall centered `.card` with a
+  /// filled camera glyph to the LEFT of big `.heading` "Record" text in a `.row`,
+  /// `.flexGrow(1)` so it expands to fill the hub's free vertical space and
+  /// dominates the view. (The Learner hub had an analogous Ask-AI hero; that was
+  /// replaced with a compact two-button header — see `headerButton`.)
   private static func recordHero(onTap: @escaping @Sendable () -> Void) -> FlexBox {
     FlexBox(
       direction: MWDATDisplay.Direction.row,
@@ -362,7 +366,7 @@ enum NavigatorLensTrees {
     .padding(12)
   }
 
-  // MARK: - Learner hub (Ask AI + filter pill + procedure list)
+  // MARK: - Learner hub (Ask AI + Filter buttons, Saved/All tabs, procedure list)
 
   private static func learnerHubTree(
     snapshot s: NavigatorLensSnapshot,
@@ -376,18 +380,28 @@ enum NavigatorLensTrees {
     ) {
       LensComponents.phaseChip("LEARNER MODE").alignSelf(.center)
 
-      // Ask AI is the HERO — the primary way learners find a procedure (the
-      // list below is secondary). Tall, big `.heading` text, grown to dominate
-      // the view. First tappable → owns default focus.
-      askAIHero(onTap: cb.onAskAI)
+      // Ask AI + Filter as two equal-width buttons side by side — a cleaner
+      // header than the old full-height Ask-AI hero + separate filter pill.
+      // Ask AI is FIRST → keeps default focus (it's still the primary way
+      // learners find a procedure).
+      FlexBox(
+        direction: MWDATDisplay.Direction.row,
+        spacing: 8,
+        alignment: .start,
+        crossAlignment: .stretch
+      ) {
+        headerButton(icon: .starCircleTriangleAi, label: "Ask AI", onTap: cb.onAskAI)
+        headerButton(
+          icon: .slidersHorizontal,
+          label: s.selectedCategory == "All" ? "Filter" : "Filter: \(s.selectedCategory)",
+          onTap: cb.onOpenFilter
+        )
+      }
 
-      // One readable filter pill → dedicated FILTERS screen (the 8-chip strip
-      // overflowed the 600px viewport unreadably).
-      LensComponents.actionPill(
-        icon: .slidersHorizontal,
-        label: s.selectedCategory == "All" ? "Filter" : "Filter: \(s.selectedCategory)",
-        onTap: cb.onOpenFilter
-      )
+      // Saved / All tabs — Saved first. The DSL background has no accent/fill
+      // state, so "active" is signaled by a leading checkmark + `.primary`
+      // text (same idiom as `filterCell`).
+      listTabsRow(activeTab: s.listTab, onSelect: cb.onSelectListTab)
 
       if s.isLoadingList {
         LensComponents.cardPanel(padding: 14) {
@@ -399,11 +413,7 @@ enum NavigatorLensTrees {
         }
       } else if s.listRows.isEmpty {
         LensComponents.cardPanel(padding: 14) {
-          Text(
-            s.selectedCategory == "All" ? "No procedures yet" : "Nothing in this category",
-            style: .body,
-            color: .secondary
-          )
+          Text(learnerEmptyMessage(s), style: .body, color: .secondary)
         }
       } else {
         // Procedure list + a full-height escape rail on the right. Swiping RIGHT
@@ -437,27 +447,79 @@ enum NavigatorLensTrees {
     .padding(12)
   }
 
-  /// The prominent Ask-AI hero on the Learner hub. A tall centered `.card` with a
-  /// filled AI glyph to the LEFT of big `.heading` "Ask AI" text — a `.row` so the
-  /// icon+label read as one centered group (main-axis `alignment: .center` centers
-  /// the pair horizontally; `crossAlignment: .center` aligns the icon vertically
-  /// with the text). `.flexGrow(1)` lets it expand to fill the hub's free vertical
-  /// space so it dominates the view (the procedure list is the secondary path).
-  /// `.heading` is the largest text style the DSL offers.
-  private static func askAIHero(onTap: @escaping @Sendable () -> Void) -> FlexBox {
+  /// One of the two equal-width Learner-hub header buttons (Ask AI / Filter).
+  /// `.flexGrow(1)` splits the row evenly; `.body` icon+label (not `.heading`)
+  /// keeps these compact — the hero treatment moved out in favor of a cleaner
+  /// two-button header.
+  private static func headerButton(
+    icon: IconName,
+    label: String,
+    onTap: @escaping @Sendable () -> Void
+  ) -> FlexBox {
     FlexBox(
       direction: MWDATDisplay.Direction.row,
-      spacing: 10,
+      spacing: 6,
       alignment: .center,
       crossAlignment: .center
     ) {
-      Icon(name: .starCircleTriangleAi, style: .filled)
-      Text("Ask AI", style: .heading, color: .primary)
+      Icon(name: icon, style: .outline)
+      Text(label, style: .body, color: .primary)
     }
-    .padding(28)
+    .padding(12)
     .background(.card)
     .flexGrow(1)
     .onTap(onTap)
+  }
+
+  /// Saved / All tab row — two equal-width chips, Saved first.
+  private static func listTabsRow(
+    activeTab: NavigatorLensSnapshot.ListTab,
+    onSelect: @escaping @Sendable (NavigatorLensSnapshot.ListTab) -> Void
+  ) -> FlexBox {
+    FlexBox(
+      direction: MWDATDisplay.Direction.row,
+      spacing: 8,
+      alignment: .start,
+      crossAlignment: .stretch
+    ) {
+      listTabChip(label: "Saved", tab: .saved, activeTab: activeTab, onSelect: onSelect)
+      listTabChip(label: "All", tab: .all, activeTab: activeTab, onSelect: onSelect)
+    }
+  }
+
+  /// One tab chip. Active = leading checkmark + `.primary` text; inactive =
+  /// `.secondary` text, no checkmark (the DSL `Background` enum has no
+  /// accent/fill state to lean on instead — same idiom as `filterCell`).
+  private static func listTabChip(
+    label: String,
+    tab: NavigatorLensSnapshot.ListTab,
+    activeTab: NavigatorLensSnapshot.ListTab,
+    onSelect: @escaping @Sendable (NavigatorLensSnapshot.ListTab) -> Void
+  ) -> FlexBox {
+    let isActive = tab == activeTab
+    return FlexBox(
+      direction: MWDATDisplay.Direction.row,
+      spacing: 6,
+      alignment: .center,
+      crossAlignment: .center
+    ) {
+      if isActive {
+        Icon(name: .checkmark, style: .filled)
+      }
+      Text(label, style: .meta, color: isActive ? .primary : .secondary)
+    }
+    .padding(EdgeInsets(top: 10, bottom: 10, leading: 12, trailing: 12))
+    .background(.card)
+    .flexGrow(1)
+    .onTap { onSelect(tab) }
+  }
+
+  /// Empty-list message for the Learner hub — differentiates "no saved
+  /// workflows" from the category-filter empty states so switching to an
+  /// empty Saved tab doesn't read as "no procedures on the server at all".
+  private static func learnerEmptyMessage(_ s: NavigatorLensSnapshot) -> String {
+    if s.listTab == .saved { return "No saved workflows yet" }
+    return s.selectedCategory == "All" ? "No procedures yet" : "Nothing in this category"
   }
 
   /// A single full-height `.card` pill down the right of the procedure list —
@@ -623,6 +685,8 @@ enum NavigatorLensTrees {
             onNext: cb.onNextStep
           )
         }
+        // "Start coaching" is the primary action → first pill (default focus).
+        LensComponents.actionPill(icon: .triangleRightCircle, label: "Start coaching", onTap: cb.onStartCoaching)
         if s.hasStepClip {
           LensComponents.actionPill(icon: .videoCamera, label: "Watch step reference", onTap: cb.onWatchStepReference)
         }
@@ -633,7 +697,6 @@ enum NavigatorLensTrees {
             onTap: cb.onToggleReferenceImage
           )
         }
-        LensComponents.actionPill(icon: .triangleRightCircle, label: "Start coaching", onTap: cb.onStartCoaching)
       }
 
       LensComponents.smallIconButton(icon: .arrowLeft, onTap: cb.onBack)

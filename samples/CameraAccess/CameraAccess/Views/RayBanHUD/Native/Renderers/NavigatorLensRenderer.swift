@@ -94,6 +94,14 @@ final class NavigatorLensRenderer: LensRenderer {
         self?.scheduleSend()
       }
       .store(in: &cancellables)
+
+    // Saved/All tab selection — same reasoning (the CombineLatest3 above is
+    // already at arity), its own repaint sink.
+    viewModel.$listTab
+      .sink { [weak self] _ in
+        self?.scheduleSend()
+      }
+      .store(in: &cancellables)
   }
 
   // MARK: - Snapshot projection
@@ -207,6 +215,8 @@ final class NavigatorLensRenderer: LensRenderer {
       listRows: rows,
       listPage: page,
       listPageCount: pageCount,
+      listTab: viewModel.listTab == .saved ? .saved : .all,
+      savedCount: viewModel.savedProcedures.count,
       categories: NavigatorViewModel.learnerCategories,
       selectedCategory: viewModel.selectedCategory,
       isLoadingDetail: viewModel.isLoadingDetail,
@@ -215,7 +225,10 @@ final class NavigatorLensRenderer: LensRenderer {
       stepNumber: step?.stepNumber ?? 0,
       stepCount: steps.count,
       stepTitle: step?.title ?? "",
-      stepBody: LensComponents.truncate(step?.description ?? "", max: 200),
+      // Truncated ~20% shorter than the original cap so the action pills
+      // below the step card stay on-screen instead of getting pushed off the
+      // 600px viewport (shared by both learner and expert detail screens).
+      stepBody: LensComponents.truncate(step?.description ?? "", max: 160),
       stepIndex: sp,
       stepPageCount: steps.count,
       hasStepClip: hasStepClip,
@@ -275,6 +288,9 @@ final class NavigatorLensRenderer: LensRenderer {
       onAskAI:           { [weak viewModel] in Task { @MainActor in viewModel?.askAI() } },
       onOpenFilter:      { [weak viewModel] in Task { @MainActor in viewModel?.openLearnerFilter() } },
       onSelectCategory:  { [weak viewModel] c in Task { @MainActor in viewModel?.selectCategory(c) } },
+      onSelectListTab:   { [weak viewModel] tab in
+        Task { @MainActor in viewModel?.selectListTab(tab == .saved ? .saved : .all) }
+      },
       onStartCoaching:   { [weak viewModel] in Task { @MainActor in viewModel?.startCoachingFromDetail() } },
       onWatchStepReference: { [weak self] in Task { @MainActor in self?.playStepReference() } },
       onToggleReferenceImage: { [weak viewModel] in Task { @MainActor in viewModel?.toggleReferenceImage() } },

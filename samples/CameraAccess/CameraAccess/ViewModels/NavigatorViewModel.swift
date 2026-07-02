@@ -49,6 +49,11 @@ final class NavigatorViewModel: ObservableObject {
     case retraceGame
   }
 
+  /// Which slice of the Learner list is showing — saved workflows or the
+  /// full library. Saved is the default landing tab when the learner has
+  /// anything saved (see `openLearner()`).
+  enum ListTab { case saved, all }
+
   /// Rows per paged list page on the lens (≈5 fits the 600×600 viewport).
   static let rowsPerPage = 5
 
@@ -85,6 +90,7 @@ final class NavigatorViewModel: ObservableObject {
 
   /// Selected Learner category chip ("All" = no filter).
   @Published private(set) var selectedCategory: String = "All"
+  @Published private(set) var listTab: ListTab = .all
 
   /// Hidden "Retrace" mini-game state machine (Home sparkle button).
   let game = RetraceGameEngine()
@@ -114,10 +120,12 @@ final class NavigatorViewModel: ObservableObject {
   // MARK: - Dependencies
 
   private let api: ProcedureAPIService
+  private let progressStore: LocalProgressStore
   private var loadTask: Task<Void, Never>?
 
-  init(api: ProcedureAPIService) {
+  init(api: ProcedureAPIService, progressStore: LocalProgressStore) {
     self.api = api
+    self.progressStore = progressStore
   }
 
   // MARK: - Lifecycle
@@ -142,8 +150,20 @@ final class NavigatorViewModel: ObservableObject {
 
   func openLearner() {
     selectedCategory = "All"
+    // Re-read saved state before deciding the default tab — this store
+    // instance is long-lived (owned by the coordinator for the whole app
+    // session) and can be stale relative to saves made through the phone
+    // Learner tab's own `LocalProgressStore` instance.
+    progressStore.reload()
+    listTab = progressStore.savedProcedureIDs.isEmpty ? .all : .saved
     screen = .learnerHub
     loadProcedures()
+  }
+
+  /// Switch the Learner hub between Saved and All. Category filter (if any)
+  /// stays applied on top.
+  func selectListTab(_ tab: ListTab) {
+    listTab = tab
   }
 
   func openTroubleshoot() { screen = .troubleshootIntro }
@@ -292,12 +312,20 @@ final class NavigatorViewModel: ObservableObject {
 
   // MARK: - Learner mode
 
-  /// Client-side category filter, mirroring `DiscoverViewModel.filteredProcedures`.
-  /// "All" is a no-op; nil/empty category falls into "Other" so legacy rows
-  /// surface in the catch-all chip instead of vanishing.
+  /// Procedures the learner has bookmarked (`LocalProgressStore`), in the
+  /// server's original order.
+  var savedProcedures: [ProcedureListItem] {
+    procedures.filter { progressStore.isSaved($0.id) }
+  }
+
+  /// Client-side tab + category filter, mirroring `DiscoverViewModel.filteredProcedures`
+  /// (category-wise). Tab picks the base set (saved vs. all); "All" category is a
+  /// no-op; nil/empty category falls into "Other" so legacy rows surface in the
+  /// catch-all chip instead of vanishing.
   var filteredProcedures: [ProcedureListItem] {
-    guard selectedCategory != "All" else { return procedures }
-    return procedures.filter {
+    let base = listTab == .saved ? savedProcedures : procedures
+    guard selectedCategory != "All" else { return base }
+    return base.filter {
       let c = ($0.category?.isEmpty == false ? $0.category : nil) ?? "Other"
       return c == selectedCategory
     }
