@@ -415,7 +415,8 @@ struct ProcedureReviewView: View {
           description: step.description != original.description ? step.description : nil,
           tips: step.tips != original.tips ? step.tips : nil,
           warnings: step.warnings != original.warnings ? step.warnings : nil,
-          errorCriteria: step.errorCriteria != original.errorCriteria ? step.errorCriteria : nil
+          errorCriteria: step.errorCriteria != original.errorCriteria ? step.errorCriteria : nil,
+          displaySummary: step.displaySummary != original.displaySummary ? (step.displaySummary ?? "") : nil
         )
         _ = try await api.updateStep(
           procedureId: initialProcedure.id,

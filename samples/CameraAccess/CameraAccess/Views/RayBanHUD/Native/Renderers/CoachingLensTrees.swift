@@ -218,11 +218,14 @@ enum CoachingLensTrees {
           }
         }
       } else {
-        // Collapsed: the full step card (tap → .stepExpanded).
+        // Collapsed: the glanceable step card (tap → .stepExpanded for the
+        // full description). Shows the condensed display_summary; truncate
+        // is only a safety net for legacy rows falling back to a long
+        // description.
         LensComponents.cardPanel(spacing: 8, padding: 14) {
           Text("STEP \(s.stepIndex + 1) OF \(s.totalSteps)", style: .meta, color: .secondary)
           Text(s.stepTitle, style: .heading, color: .primary)
-          Text(LensComponents.truncate(s.stepDescription, max: 180), style: .body, color: .primary)
+          Text(LensComponents.truncate(s.stepSummary, max: 180), style: .body, color: .primary)
         }
         .onTap(cb.onExpandStep)
       }

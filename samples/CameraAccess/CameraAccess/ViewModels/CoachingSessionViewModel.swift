@@ -111,6 +111,13 @@ class CoachingSessionViewModel: GeminiLiveSessionBase {
   /// injected turn can't collide with a real user or model turn.
   private static let heartbeatQuietWindow: TimeInterval = 1.5
 
+  /// Deferred next-step [ADVANCE] injection staged by a verified `check_step`.
+  /// The server has already advanced (and local UI mirrored), but the SPOKEN
+  /// next-step coaching waits until Live finishes voicing its confirmation —
+  /// `onTurnCompleteExtra` drains this before re-arming the poll, so the
+  /// learner hears "yes, that's right" and THEN the next step, in order.
+  private var pendingAdvanceInjection: String?
+
   // MARK: - Computed
 
   var currentStep: ProcedureStepResponse? {
@@ -397,13 +404,19 @@ class CoachingSessionViewModel: GeminiLiveSessionBase {
   override var supportsPushToTalk: Bool { true }
 
   override func onConnectedExtra() {
+    // A reconnect (resumption path) re-orients the model via the server
+    // context-summary, which is already anchored on the advanced current
+    // step — replaying a pre-disconnect [ADVANCE] would double-tell it.
+    pendingAdvanceInjection = nil
+
     // The oracle poll arms on every .connected transition (including
     // resumption reconnects). scheduleNextHeartbeat cancels any prior tick
     // before starting, so this is safe to call more than once.
     //
     // Passive mode (Active Monitoring off) is the master switch: never arm the
     // poll loop, so no frames are sent to the server oracle and no visual
-    // interjection / advance happens — fully reactive, verbal-only.
+    // interjection / advance happens unprompted. The learner-initiated
+    // check_step tool still verifies on demand — that path doesn't poll.
     guard activeMonitoring else {
       heartbeatEnabled = false
       print("[Coaching] passive mode — oracle poll disabled")
@@ -414,6 +427,23 @@ class CoachingSessionViewModel: GeminiLiveSessionBase {
   }
 
   override func onTurnCompleteExtra() async {
+    // A verified check_step defers its next-step [ADVANCE] until the model
+    // finishes speaking its confirmation — that turn just completed, so
+    // drain it now. Skip the poll re-arm on this tick: the injection starts
+    // a fresh model turn whose own turnComplete re-arms the heartbeat, so
+    // the first post-advance poll naturally lands ≥4s after the model
+    // finishes coaching the new step.
+    if let injection = pendingAdvanceInjection {
+      pendingAdvanceInjection = nil
+      if let service = geminiService, isGeminiReady {
+        do {
+          try await service.sendClientTextTurn(injection)
+        } catch {
+          print("[Coaching] deferred [ADVANCE] inject failed: \(error)")
+        }
+      }
+      return
+    }
     // Poll cadence is anchored on turnComplete: this re-arms ~4s after the
     // model finishes replying, so the poll (and any advance/correction turn
     // it injects) naturally avoids colliding with the model mid-speech.
@@ -426,6 +456,9 @@ class CoachingSessionViewModel: GeminiLiveSessionBase {
     heartbeatEnabled = false
     heartbeatTask?.cancel()
     heartbeatTask = nil
+    // A staged next-step injection dies with the socket — on any future
+    // reconnect the context summary re-orients the model instead.
+    pendingAdvanceInjection = nil
   }
 
   override func handleToolCallExtras(name: String, args: [String: Any], result: [String: Any]) async {
@@ -439,8 +472,133 @@ class CoachingSessionViewModel: GeminiLiveSessionBase {
     lastFrameJPEG = jpeg
   }
 
+  // MARK: - check_step interception (on-device tool)
+
+  /// `check_step` is answered ON-DEVICE: the visual oracle needs a camera
+  /// frame, which the /tool-call body can't carry, so the phone attaches its
+  /// cached `lastFrameJPEG` to `/verify?mode=on_demand` and synthesizes the
+  /// toolResponse itself. Every other tool forwards to the server as usual.
+  ///
+  /// Concurrency notes (verified against the base + server):
+  /// - Runs inside the `pendingToolCallIds` bracket, so the audio send gate
+  ///   AND the oracle poll (`canSendHeartbeatNow`) stay closed for the whole
+  ///   round-trip — no poll can race this check.
+  /// - The server's race guard drops any poll verdict that was in flight
+  ///   when this check advances the step.
+  /// - `advance_step` server-side resets the dwell streak, so the next step's
+  ///   poll confirmations start from zero.
+  override func interceptToolCall(name: String, args: [String: Any]) async -> [String: Any]? {
+    guard name == "check_step" else { return nil }
+    let claim = (args["claim"] as? String) == "question" ? "question" : "done"
+
+    guard let sessionId, let frame = lastFrameJPEG, cameraHealth == .ok else {
+      // Dead or not-yet-started camera. Deliberately NOT a blind verbal
+      // advance (the server can't know the camera is down) — asking the
+      // learner is the honest fallback. Their follow-up "yes, I'm done"
+      // triggers a fresh check_step; the server's insist-once counter is
+      // untouched because /verify was never reached.
+      return [
+        "status": "check_failed",
+        "message": "No usable camera frame right now. Ask the learner to confirm or describe what they did.",
+      ]
+    }
+
+    do {
+      let resp = try await ProcedureAPIService().verifyStep(
+        sessionId: sessionId, frameJPEG: frame, mode: "on_demand", claim: claim
+      )
+      return toolResultForVerify(resp)
+    } catch {
+      print("[Coaching] check_step verify failed: \(error)")
+      // Client-side transport failure. We can't advance locally (server
+      // state is the truth), so tell Live to fall back to conversation.
+      return [
+        "status": "check_failed",
+        "message": "The check didn't go through. Ask the learner to confirm what they see; on their next 'done' try the check again.",
+      ]
+    }
+  }
+
+  /// Map an on-demand verify verdict to (a) immediate local UI state, (b) a
+  /// staged deferred [ADVANCE] injection, and (c) the toolResponse dict Live
+  /// speaks from. UI mirrors NOW (server state already moved); only the
+  /// SPOKEN next-step coaching defers to `onTurnCompleteExtra`. The
+  /// toolResponse deliberately carries zero next-step content — the model
+  /// cannot narrate ahead from information it doesn't have.
+  private func toolResultForVerify(_ resp: VerifyResponse) -> [String: Any] {
+    switch resp.status {
+    case "advanced":
+      var result: [String: Any] = ["status": "advanced"]
+      if let n = resp.newStep { result["new_step"] = n }
+      if let t = resp.stepTitle { result["step_title"] = t }
+      if let d = resp.stepDescription { result["step_description"] = d }
+      if let c = resp.completionCriteria { result["completion_criteria"] = c }
+      applyLearnerToolResult(name: "advance_step", args: [:], result: result)
+      pendingAdvanceInjection =
+        "[ADVANCE] The learner just finished this step. Next step: "
+        + "\(resp.stepTitle ?? "") — \(resp.stepDescription ?? ""). "
+        + "Congratulate them briefly, then coach this next step."
+      let verifiedNote = (resp.method == "verbal")
+        ? " (Advanced on the learner's word — the camera couldn't confirm; don't mention the mechanics.)"
+        : ""
+      return [
+        "status": "verified",
+        "message": "Verified — the step is complete. Briefly confirm to the learner (e.g. \"yes, that's done — nice\"). "
+          + "Do NOT describe what comes next; the next step arrives in a separate message."
+          + verifiedNote,
+      ]
+
+    case "completed":
+      applyLearnerToolResult(
+        name: "advance_step",
+        args: [:],
+        result: ["status": "completed", "message": resp.message ?? ""]
+      )
+      // Final step: nothing to defer — the close rides the toolResponse.
+      return [
+        "status": "completed",
+        "message": resp.message ?? "All steps are complete. Give them a short, warm congratulations to close out.",
+      ]
+
+    case "not_confirmed":
+      return [
+        "status": "not_confirmed",
+        "message": "Not verified yet — \(resp.reason ?? "the end state isn't visible on camera"). "
+          + "Tell the learner what's still missing, warmly. Do not advance.",
+      ]
+
+    case "unverifiable":
+      return [
+        "status": "unverifiable",
+        "message": "This step can't be checked visually. Ask the learner to confirm or describe what they did; "
+          + "if they say they're done, call check_step with claim=\"done\".",
+      ]
+
+    case "already_completed":
+      return [
+        "status": "already_completed",
+        "message": "The procedure is already complete — nothing left to check.",
+      ]
+
+    default: // includes "check_failed"
+      return [
+        "status": resp.status,
+        "message": resp.reason ?? "The check couldn't run. Ask the learner to describe what they see.",
+      ]
+    }
+  }
+
   override func toolCallSummary(name: String, args: [String: Any], result: [String: Any]) -> String {
     switch name {
+    case "check_step":
+      switch result["status"] as? String {
+      case "verified": return "Checked your work — step verified"
+      case "completed": return "Checked your work — procedure complete"
+      case "not_confirmed": return "Checked your work — not done yet"
+      case "unverifiable": return "Can't check this step visually"
+      case "already_completed": return "Procedure already complete"
+      default: return "Couldn't check right now"
+      }
     case "advance_step":
       if let status = result["status"] as? String, status == "completed" {
         return "Procedure complete"
@@ -595,6 +753,25 @@ class CoachingSessionViewModel: GeminiLiveSessionBase {
   /// `error` injects a `[CORRECTION]` turn without touching step state.
   private func runOraclePoll() async {
     guard activeMonitoring, canSendHeartbeatNow() else { return }
+
+    // Safety net for a stranded check_step [ADVANCE]: if the learner barged
+    // in over the confirmation ("yes, that's—"), that generation never emits
+    // turnComplete, so onTurnCompleteExtra never drained the staged
+    // injection. The quiet-window gate above just proved nobody is talking —
+    // drain it now instead of polling (the injection starts a model turn;
+    // its own turnComplete re-arms the heartbeat).
+    if let injection = pendingAdvanceInjection {
+      pendingAdvanceInjection = nil
+      if let service = geminiService {
+        do {
+          try await service.sendClientTextTurn(injection)
+        } catch {
+          print("[Coaching] stranded [ADVANCE] inject failed: \(error)")
+        }
+      }
+      return
+    }
+
     // Dead camera branch → `lastFrameJPEG` is frozen at the last delivered
     // frame. Shipping it would have the oracle judging a stale image every
     // tick — a false [ADVANCE] waiting to happen. Skip until recovery.
@@ -680,6 +857,12 @@ class CoachingSessionViewModel: GeminiLiveSessionBase {
   }
 
   private func applyLearnerToolResult(name: String, args: [String: Any], result: [String: Any]) {
+    // NOTE: no "check_step" case, on purpose. The intercept path
+    // (toolResultForVerify) already mirrors an advance by calling this
+    // method with name "advance_step"; the base's handleToolCallExtras then
+    // calls it once more with name "check_step", which must fall into
+    // `default` — adding a check_step case here would double-apply the
+    // step transition (double celebration, double progress write).
     switch name {
     case "advance_step":
       if let status = result["status"] as? String, status == "completed" {

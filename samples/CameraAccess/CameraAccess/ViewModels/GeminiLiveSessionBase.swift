@@ -507,6 +507,15 @@ class GeminiLiveSessionBase: ObservableObject {
   /// mutations are safe.
   func handleToolCallExtras(name: String, args: [String: Any], result: [String: Any]) async {}
 
+  /// Pre-forward interception point. Return a result dict to handle the tool
+  /// ON-DEVICE and skip the server /tool-call forward entirely; return nil to
+  /// forward as usual. Coaching intercepts `check_step` here — the visual
+  /// oracle needs the camera frame, which the /tool-call body can't carry, so
+  /// the phone attaches its cached `lastFrameJPEG` to `/verify` instead.
+  /// Runs INSIDE the pendingToolCallIds bracket, so the audio send gate and
+  /// the oracle poll stay closed for the whole round-trip. Default: nil.
+  func interceptToolCall(name: String, args: [String: Any]) async -> [String: Any]? { nil }
+
   /// Whether a tool call should flush queued AI playback (`clearPlaybackBuffer`)
   /// so a half-spoken reply doesn't continue over the next turn. Default `true`
   /// — Coaching keeps this behavior unchanged in every state, including the
@@ -1130,6 +1139,10 @@ class GeminiLiveSessionBase: ObservableObject {
       // here would re-introduce the per-runtime arm/teardown race we removed.
       audioManager?.onAudioBuffer = nil
       audioManager?.clearPlaybackBuffer(reason: "runtime-detach")
+      // The lobby loop is per-runtime UI, not part of the persistent HFP
+      // pipeline — a runtime that started it and died mid-search must not
+      // leave it looping on the shared engine. Safe no-op when not playing.
+      audioManager?.stopLobbyMusic()
     } else {
       audioManager?.stopCapture()
     }
@@ -2207,12 +2220,17 @@ class GeminiLiveSessionBase: ObservableObject {
     let startedAt = Date()
     print("[GeminiLive] ▶ Tool call START name=\(name) id=\(id) args=\(args)")
 
-    let result = await forwardToolCallToServer(
-      sessionId: sid,
-      toolCallId: id,
-      functionName: name,
-      args: args
-    )
+    let result: [String: Any]
+    if let intercepted = await interceptToolCall(name: name, args: args) {
+      result = intercepted
+    } else {
+      result = await forwardToolCallToServer(
+        sessionId: sid,
+        toolCallId: id,
+        functionName: name,
+        args: args
+      )
+    }
     let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
     print("[GeminiLive] ◀ Tool call DONE  name=\(name) id=\(id) result=\(result) (\(elapsedMs)ms)")
 

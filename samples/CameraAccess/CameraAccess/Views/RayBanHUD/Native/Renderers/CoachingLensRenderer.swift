@@ -148,6 +148,7 @@ final class CoachingLensRenderer: LensRenderer {
       totalSteps: viewModel.lensTotalSteps,
       stepTitle: step?.title ?? "",
       stepDescription: description,
+      stepSummary: step?.lensText ?? "",
       expansion: expansion,
       hasReference: media != .none,
       referenceIsVideo: referenceIsVideo,

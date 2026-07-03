@@ -33,10 +33,12 @@ enum RayBanHUDLayoutTokens {
   /// before this elapses, recording continues; otherwise it stops. Per
   /// `DESIGN.md` confirmation-overlay convention.
   static let stopCountdownDuration: TimeInterval = 3.0
-  /// Compact step-card description truncation cutoff before "Read more" kicks in.
-  /// Sized so the prefix + "… Read more" fits inside `lineLimit(2)` at the
-  /// 18 pt body weight without clipping the affordance.
-  static let stepDescriptionCharacterLimit: Int = 60
+  /// Compact step-card text truncation cutoff before "Read more" kicks in.
+  /// The card shows the step's condensed `display_summary` (≤160 chars by
+  /// contract), so 180 means summaries always render whole and only legacy
+  /// full-description fallbacks truncate — matching the native lens card's
+  /// 180-char cap. Sized for `lineLimit(4)` at the 18 pt body weight.
+  static let stepDescriptionCharacterLimit: Int = 180
   /// Maximum width of the Exit workflow pill.
   static let exitPillMaxWidth: CGFloat = 340
   /// Page-transition slide duration. Page-nav animations derive their offset

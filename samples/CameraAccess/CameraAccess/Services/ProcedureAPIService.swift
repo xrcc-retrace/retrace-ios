@@ -194,7 +194,19 @@ class ProcedureAPIService: ObservableObject {
   /// `advanced` / `completed`). On `advanced`/`completed` the server has
   /// already advanced the session; the phone mirrors local UI + relays the
   /// event into Gemini Live. Multipart body carries one file part `frame`.
-  func verifyStep(sessionId: String, frameJPEG: Data) async throws -> VerifyResponse {
+  ///
+  /// Pass `mode: "on_demand"` + `claim: "done"|"question"` for the
+  /// learner-initiated `check_step` tool path — adds statuses
+  /// `not_confirmed` / `unverifiable` / `check_failed` / `already_completed`
+  /// and a longer timeout (the oracle is capped at 10s server-side; the
+  /// client timeout must outlive it or a timed-out client desyncs from a
+  /// server that already advanced).
+  func verifyStep(
+    sessionId: String,
+    frameJPEG: Data,
+    mode: String? = nil,
+    claim: String? = nil
+  ) async throws -> VerifyResponse {
     guard let url = URL(string: "\(serverBaseURL)/api/learner/session/\(sessionId)/verify") else {
       throw APIError.invalidURL
     }
@@ -202,13 +214,19 @@ class ProcedureAPIService: ObservableObject {
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
     request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-    request.timeoutInterval = 10
+    request.timeoutInterval = (mode == "on_demand") ? 20 : 10
 
     var body = Data()
     body.append("--\(boundary)\r\n".data(using: .utf8)!)
     body.append("Content-Disposition: form-data; name=\"frame\"; filename=\"frame.jpg\"\r\n".data(using: .utf8)!)
     body.append("Content-Type: image/jpeg\r\n\r\n".data(using: .utf8)!)
     body.append(frameJPEG)
+    for (field, value) in [("mode", mode), ("claim", claim)] {
+      guard let value else { continue }
+      body.append("\r\n--\(boundary)\r\n".data(using: .utf8)!)
+      body.append("Content-Disposition: form-data; name=\"\(field)\"\r\n\r\n".data(using: .utf8)!)
+      body.append(value.data(using: .utf8)!)
+    }
     body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
     request.httpBody = body
 

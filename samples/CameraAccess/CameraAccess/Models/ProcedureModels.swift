@@ -109,6 +109,11 @@ struct ProcedureStepResponse: Codable, Identifiable, Equatable {
   let timestampEnd: Double
   let tips: [String]
   let warnings: [String]
+  // Condensed 1-2 sentence version of `description` for the lens card
+  // (≤160 chars, generated at extraction). Optional for backward
+  // compatibility with servers that predate the column; empty/nil falls
+  // back to `description` via `lensText`.
+  let displaySummary: String?
   let errorCriteria: [String]
   let clipUrl: String?
   // How reliably this step's end-state can be verified from the camera by
@@ -121,6 +126,7 @@ struct ProcedureStepResponse: Codable, Identifiable, Equatable {
   enum CodingKeys: String, CodingKey {
     case title, description, tips, warnings
     case stepNumber = "step_number"
+    case displaySummary = "display_summary"
     case timestampStart = "timestamp_start"
     case timestampEnd = "timestamp_end"
     case errorCriteria = "error_criteria"
@@ -136,6 +142,7 @@ struct ProcedureStepResponse: Codable, Identifiable, Equatable {
     timestampEnd: Double,
     tips: [String] = [],
     warnings: [String] = [],
+    displaySummary: String? = nil,
     errorCriteria: [String] = [],
     clipUrl: String? = nil,
     visualVerifiability: String = "reliable"
@@ -147,6 +154,7 @@ struct ProcedureStepResponse: Codable, Identifiable, Equatable {
     self.timestampEnd = timestampEnd
     self.tips = tips
     self.warnings = warnings
+    self.displaySummary = displaySummary
     self.errorCriteria = errorCriteria
     self.clipUrl = clipUrl
     self.visualVerifiability = visualVerifiability
@@ -164,9 +172,18 @@ struct ProcedureStepResponse: Codable, Identifiable, Equatable {
     timestampEnd = try c.decode(Double.self, forKey: .timestampEnd)
     tips = try c.decode([String].self, forKey: .tips)
     warnings = try c.decode([String].self, forKey: .warnings)
+    displaySummary = try c.decodeIfPresent(String.self, forKey: .displaySummary)
     errorCriteria = try c.decodeIfPresent([String].self, forKey: .errorCriteria) ?? []
     clipUrl = try c.decodeIfPresent(String.self, forKey: .clipUrl)
     visualVerifiability = try c.decodeIfPresent(String.self, forKey: .visualVerifiability) ?? "reliable"
+  }
+
+  /// What the lens (and its on-phone emulator) renders on the collapsed
+  /// step card: the condensed summary when present, else the full
+  /// description. Single fallback rule shared by every lens surface.
+  var lensText: String {
+    if let summary = displaySummary, !summary.isEmpty { return summary }
+    return description
   }
 
   var hasAnyInsights: Bool {
@@ -280,6 +297,7 @@ struct StepUpdateRequest: Codable {
   var timestampEnd: Double?
   var errorCriteria: [String]?
   var visualVerifiability: String? = nil
+  var displaySummary: String? = nil
 
   enum CodingKeys: String, CodingKey {
     case title, description, tips, warnings
@@ -287,6 +305,7 @@ struct StepUpdateRequest: Codable {
     case timestampEnd = "timestamp_end"
     case errorCriteria = "error_criteria"
     case visualVerifiability = "visual_verifiability"
+    case displaySummary = "display_summary"
   }
 }
 
@@ -300,17 +319,21 @@ struct StepUpdateRequest: Codable {
 /// `completed` the shape mirrors the `advance_step` tool-call result, so the
 /// payload feeds straight into `applyLearnerToolResult`.
 struct VerifyResponse: Codable {
-  /// skip | pending | error | advanced | completed
+  /// Poll: skip | pending | error | advanced | completed
+  /// On-demand (check_step): adds not_confirmed | unverifiable | check_failed | already_completed
   let status: String
-  let errorText: String?         // correction sentence (status == "error")
+  let errorText: String?         // correction sentence (status == "error" / matched known error)
   let newStep: Int?              // 1-indexed step number (status == "advanced")
   let stepTitle: String?
   let stepDescription: String?
   let completionCriteria: String?
   let message: String?           // closing message (status == "completed")
+  let reason: String?            // on-demand: the visible gap / why the check couldn't run
+  let method: String?            // on-demand advance: "visual" | "verbal"
+  let note: String?              // on-demand advance: insist-once / trust-on-failure marker
 
   enum CodingKeys: String, CodingKey {
-    case status, message
+    case status, message, reason, method, note
     case errorText = "error_text"
     case newStep = "new_step"
     case stepTitle = "step_title"

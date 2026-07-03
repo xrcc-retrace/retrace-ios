@@ -475,9 +475,11 @@ When designing a new page, **think about the neighbor map** even if you're not i
 
 All directional input — finger swipe today, MediaPipe tomorrow — will route through a single `coordinator.move()` and `coordinator.select()` API. New components should never wire their own gestures; they participate via the coordinator.
 
-### Step-card full-text expansion
+### Step-card text tiers: glance summary vs full description
 
-The step card today truncates at ~75 chars with `... Read more`. A planned tap-to-expand mode will give the full description a dedicated layout. New content patterns should account for both compact + full views by default rather than retrofitting later.
+The collapsed step card renders the step's **`display_summary`** — a condensed, self-contained instruction (1–2 short sentences, ≤160 chars by contract, generated at extraction and editable in StepEditView) — via `step.lensText`, which falls back to the full `description` on legacy rows without a summary. Because summaries fit under the 180-char card cap, the collapsed card normally shows **no truncation**; the `truncate(_:max: 180)` / `… Read more` path only fires on fallback descriptions. Tap-to-expand (`.stepExpanded`) always paginates the **full description** at 180-char pages — the deliberate "show me more" affordance.
+
+New lens content should follow the same two-tier pattern: a glanceable summary-tier text on the default surface, full text one deliberate interaction away. Don't render raw `description` on a compact surface; use `lensText`.
 
 ---
 

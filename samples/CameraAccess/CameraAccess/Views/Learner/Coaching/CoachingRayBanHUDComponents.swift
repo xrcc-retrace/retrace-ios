@@ -174,10 +174,12 @@ struct RayBanHUDStepCard: View {
         .lineSpacing(2)
         .fixedSize(horizontal: false, vertical: true)
     } else {
-      compactDescription(step.description)
+      // Collapsed card shows the condensed lens summary (falls back to the
+      // full description on legacy rows, where "Read more" still kicks in).
+      compactDescription(step.lensText)
         .foregroundStyle(Color.white.opacity(0.96))
         .lineSpacing(2)
-        .lineLimit(2)
+        .lineLimit(4)
         .truncationMode(.tail)
     }
   }
@@ -186,6 +188,7 @@ struct RayBanHUDStepCard: View {
     let limit = RayBanHUDLayoutTokens.stepDescriptionCharacterLimit
     guard description.count > limit else {
       return Text(description)
+        .font(.inter(.medium, size: 18))
     }
     let cutoff = max(0, limit - 12)
     let prefixRaw = String(description.prefix(cutoff))

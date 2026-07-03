@@ -53,6 +53,7 @@ struct CoachingLensSnapshot: Equatable {
   let totalSteps: Int
   let stepTitle: String
   let stepDescription: String                 // full text; renderer paginates
+  let stepSummary: String                     // condensed lens-card text (display_summary, falls back to description)
   let expansion: LensCoachingExpansion
   // Reference media (resolved from the step's real clip_url + source_type via
   // `StepReferenceMedia`). The renderer no longer reconstructs a .mp4 URL —

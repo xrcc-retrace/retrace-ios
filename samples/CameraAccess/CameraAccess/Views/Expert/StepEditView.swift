@@ -9,6 +9,7 @@ struct StepEditView: View {
   @Environment(\.dismiss) private var dismiss
   @State private var title: String
   @State private var description: String
+  @State private var displaySummary: String
   @State private var tips: [String]
   @State private var warnings: [String]
   @State private var errorCriteria: [String]
@@ -29,6 +30,7 @@ struct StepEditView: View {
     self.onSaved = onSaved
     self._title = State(initialValue: step.title)
     self._description = State(initialValue: step.description)
+    self._displaySummary = State(initialValue: step.displaySummary ?? "")
     self._tips = State(initialValue: step.tips)
     self._warnings = State(initialValue: step.warnings)
     self._errorCriteria = State(initialValue: step.errorCriteria)
@@ -37,6 +39,7 @@ struct StepEditView: View {
   private var hasChanges: Bool {
     title != step.title ||
     description != step.description ||
+    displaySummary != (step.displaySummary ?? "") ||
     tips != step.tips ||
     warnings != step.warnings ||
     errorCriteria != step.errorCriteria
@@ -78,6 +81,39 @@ struct StepEditView: View {
               .foregroundColor(.textPrimary)
               .scrollContentBackground(.hidden)
               .frame(minHeight: 100)
+              .padding(Spacing.lg)
+              .background(Color.surfaceRaised)
+              .cornerRadius(Radius.md)
+              .overlay(
+                RoundedRectangle(cornerRadius: Radius.md)
+                  .stroke(Color.borderSubtle, lineWidth: 1)
+              )
+          }
+
+          // Lens summary — the condensed text the glasses lens card shows in
+          // place of the full description (Gemini Live still speaks the full
+          // description). Empty = lens falls back to the description.
+          VStack(alignment: .leading, spacing: Spacing.md) {
+            HStack {
+              Text("LENS SUMMARY")
+                .font(.retraceOverline)
+                .tracking(0.5)
+                .foregroundColor(.textSecondary)
+              Spacer()
+              Text("\(displaySummary.count)/160")
+                .font(.retraceCaption1)
+                .foregroundColor(displaySummary.count > 160 ? .semanticError : .textTertiary)
+            }
+
+            Text("Short version shown on the glasses display. Leave empty to show the description.")
+              .font(.retraceCaption1)
+              .foregroundColor(.textTertiary)
+
+            TextEditor(text: $displaySummary)
+              .font(.retraceCallout)
+              .foregroundColor(.textPrimary)
+              .scrollContentBackground(.hidden)
+              .frame(minHeight: 60)
               .padding(Spacing.lg)
               .background(Color.surfaceRaised)
               .cornerRadius(Radius.md)
@@ -204,6 +240,7 @@ struct StepEditView: View {
     isSaving = true
     errorMessage = nil
 
+    let cleanSummary = displaySummary.trimmingCharacters(in: .whitespacesAndNewlines)
     let cleanTips = tips.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
     let cleanWarnings = warnings.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
     let cleanErrorCriteria = errorCriteria.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
@@ -219,6 +256,7 @@ struct StepEditView: View {
         timestampEnd: step.timestampEnd,
         tips: cleanTips,
         warnings: cleanWarnings,
+        displaySummary: cleanSummary.isEmpty ? nil : cleanSummary,
         errorCriteria: cleanErrorCriteria,
         clipUrl: step.clipUrl,
         visualVerifiability: step.visualVerifiability
@@ -241,7 +279,8 @@ struct StepEditView: View {
       description: description != step.description ? description : nil,
       tips: cleanTips != step.tips ? cleanTips : nil,
       warnings: cleanWarnings != step.warnings ? cleanWarnings : nil,
-      errorCriteria: cleanErrorCriteria != step.errorCriteria ? cleanErrorCriteria : nil
+      errorCriteria: cleanErrorCriteria != step.errorCriteria ? cleanErrorCriteria : nil,
+      displaySummary: cleanSummary != (step.displaySummary ?? "") ? cleanSummary : nil
     )
 
     do {
