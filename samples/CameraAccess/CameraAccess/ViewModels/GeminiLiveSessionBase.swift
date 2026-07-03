@@ -1139,10 +1139,6 @@ class GeminiLiveSessionBase: ObservableObject {
       // here would re-introduce the per-runtime arm/teardown race we removed.
       audioManager?.onAudioBuffer = nil
       audioManager?.clearPlaybackBuffer(reason: "runtime-detach")
-      // The lobby loop is per-runtime UI, not part of the persistent HFP
-      // pipeline — a runtime that started it and died mid-search must not
-      // leave it looping on the shared engine. Safe no-op when not playing.
-      audioManager?.stopLobbyMusic()
     } else {
       audioManager?.stopCapture()
     }

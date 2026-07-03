@@ -408,12 +408,6 @@ class DiagnosticSessionViewModel: GeminiLiveSessionBase {
     pendingResolution = nil
     cancelWebSearchProgressPolling()
     cancelConfirmWatchdog()
-    // Must run while `audioManager` is still alive (it's nil'd inside
-    // stopGeminiLiveSession): the didSet fires syncLobbyMusic(), the only
-    // thing that stops the lobby loop. On the shared external audio manager
-    // the engine outlives this session, so exiting mid web-search would
-    // otherwise leave the music playing forever.
-    searchNarration = nil
     stopCameraStream()
     stopGeminiLiveSession()
   }
@@ -454,10 +448,6 @@ class DiagnosticSessionViewModel: GeminiLiveSessionBase {
       // one to the shared DeviceSession. Keeps the WiFi video link + camera
       // alive across the handoff (no LED blink, no SoftAP re-join) and
       // avoids the half-drained-WARP-pipe stop→re-add hazard.
-      // Narration should already be nil by handoff time (resolution only
-      // lands after the holds drain), but this teardown skips endSession()
-      // — clear it defensively so the lobby loop can't survive the handoff.
-      searchNarration = nil
       let loaned = await loanCameraForHandoff()
       stopGeminiLiveSession()
       if !loaned {
