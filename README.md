@@ -9,9 +9,25 @@
 The phone client for **Retrace**, an AI coaching system built for the **XRCC Berlin 2026** hackathon.
 A SwiftUI app that captures from Ray-Ban Meta glasses or the iPhone camera, then talks **directly** to Gemini Live for real-time, visually-verified voice coaching.
 
+🥈 **2nd place — XRCC Berlin 2026.** Development closed out in July 2026; this repo is preserved as a complete, working snapshot.
+
 [**▶ Watch the demo**](https://www.youtube.com/watch?v=azK-CLpyRQg) &nbsp;·&nbsp; [**🎬 Full walkthrough video**](https://www.youtube.com/watch?v=CqUj5HtP0QE) &nbsp;·&nbsp; [**🏛 Org overview**](https://github.com/xrcc-retrace) &nbsp;·&nbsp; [**🛰 Backend repo**](https://github.com/xrcc-retrace/main-local-server-test)
 
 </div>
+
+---
+
+## What it does
+
+Retrace turns one expert demonstration into hands-free AI coaching for everyone else. This app is what the expert and the learner actually hold (or wear):
+
+- **A voice coach in your glasses.** The learner works hands-free while Gemini Live talks them through each step in real time — audio and ~1 fps video flow straight from the phone to Google over a direct WebSocket, so the conversation never stutters on a server hop.
+- **A coach that sees the work.** Step completion isn't taken on faith: the app posts camera frames to a server-side visual oracle that checks the learner's actual progress, and the coach advances (or corrects) based on the verdict.
+- **Say "done" — and get checked.** A completion claim or an "is this right?" triggers `check_step`; the app intercepts the tool call, attaches its latest camera frame, and the coach answers with visual evidence.
+- **A HUD on the actual lens.** Coaching state, step cards, and reference imagery render on the Ray-Ban Display glasses via Meta's DAT SDK — mirrored 1:1 by an on-phone emulator with its own design system.
+- **Your hands are the controller.** A hand-tracking substrate (Apple Vision pose extraction → gesture recognizers) drives the HUD's hover-then-select interaction — pinch to confirm, no touchscreen needed.
+- **It never loses the thread.** Gemini Live sessions survive socket death and context compression via session resumption; on reconnect the app re-orients the model on the real current step.
+- **Glasses optional.** Every flow runs end-to-end on iPhone alone; a mock-device kit covers hardware-free development and UI tests.
 
 ---
 
@@ -40,7 +56,7 @@ Retrace is a three-tier system:
                 └───────────────────────────────────────────┘
 ```
 
-The phone is the orchestrator. **Voice and ~0.5 fps video flow straight from the phone to Gemini Live** — they never hop through our backend. The backend is the control plane: it builds the system prompt, mints a short-lived ephemeral token, and dispatches tool calls.
+The phone is the orchestrator. **Voice and ~1 fps video flow straight from the phone to Gemini Live** — they never hop through our backend. The backend is the control plane: it builds the system prompt, mints a short-lived ephemeral token, and dispatches tool calls.
 
 > Full system architecture, the three product flows, and the cross-cutting design decisions live in the **[org profile README](https://github.com/xrcc-retrace)**. This README focuses on the iOS side.
 
@@ -48,9 +64,10 @@ The phone is the orchestrator. **Voice and ~0.5 fps video flow straight from the
 
 ## Highlights
 
-- **Two capture transports, one coaching pipeline.** `CaptureTransport.glasses` (DAT SDK 0.7) or `CaptureTransport.iPhone` (`AVCaptureSession`). The coaching VM, audio session manager, and Gemini client are transport-agnostic — they just see *"a JPEG source"* and *"a mic buffer source."*
+- **Two capture transports, one coaching pipeline.** `CaptureTransport.glasses` (DAT SDK 0.8) or `CaptureTransport.iPhone` (`AVCaptureSession`). The coaching VM, audio session manager, and Gemini client are transport-agnostic — they just see *"a JPEG source"* and *"a mic buffer source."*
 - **One shared `DeviceSession`, refcounted.** `Services/DeviceSessionManager.swift` is the sole caller of `wearables.createSession` — every consumer (`"expert"`, `"gemini-live"`, `"lens"`) leases through `acquire(consumerLabel:)` so the camera Stream and the lens Display capability can share one session on the same physical glasses (a second `createSession` throws `sessionAlreadyExists`). It races `stateStream()` vs `errorStream()` on start, serializes acquire/release, and surfaces `datAppOnTheGlassesUpdateRequired` immediately.
 - **Out-of-band visual verification.** Completion isn't a Gemini tool call — `CoachingSessionViewModel.runOraclePoll()` posts the latest camera JPEG to `/api/learner/session/{id}/verify` on a ~4 s timer; on an `advanced`/`completed`/`error` verdict it updates local state and injects an `[ADVANCE]`/`[CORRECTION]` text turn into Live. Gated by a single Active/Passive toggle.
+- **On-device `check_step` interception.** When the learner says "done" or asks "is this right?", Gemini calls `check_step` — but a camera frame can't ride the tool-call body, so the VM intercepts it, POSTs its cached latest frame to `/verify mode=on_demand`, and synthesizes the `toolResponse` from the oracle's verdict. Works in Passive mode too; on a verified advance the spoken next-step injection is deferred until Live finishes voicing its confirmation.
 - **Native on-glasses lens.** A parallel `MWDATDisplay` surface (`Services/Lens/` + `Views/RayBanHUD/Native/`) renders a `FlexBox`/`VideoPlayer` tree on the real glasses via `LensDisplayCoordinator` (the `"lens"` DeviceSession consumer), mirroring the on-phone HUD emulator.
 - **Direct Gemini Live socket** with full wire-protocol handling — binary-frame JSON sniffing, `setupComplete` gating, server-VAD barge-in, function-call interception, session resumption.
 - **Indefinite session length** via context compression (100k → 40k) and `sessionResumptionUpdate.new_handle`. On `goAway` we mint a handle-baked token, reconnect, and inject a server-built `context-summary` so the model wakes up on the *real* current step.
@@ -103,7 +120,7 @@ DEBUG builds include `MockDeviceKit`. Use the in-app debug menu (shake-gesture o
 
 | Transport | Capture | Audio |
 |---|---|---|
-| `.glasses` | DAT SDK 0.7 `Stream` capability attached to the shared `DeviceSession` — leased via `DeviceSessionManager.acquire(consumerLabel: "gemini-live")` then `session.addStream(config:)`. Never calls `createSession` directly. `AutoDeviceSelector` picks the best paired device. | Bluetooth HFP routed through `AVAudioSession` |
+| `.glasses` | DAT SDK 0.8 `Stream` capability attached to the shared `DeviceSession` — leased via `DeviceSessionManager.acquire(consumerLabel: "gemini-live")` then `session.addStream(config:)`. Never calls `createSession` directly. `AutoDeviceSelector` picks the best paired device. Coaching streams request `.high` resolution and ride DAT 0.8's automatic WiFi link lease; expert recording deliberately stays on BT Classic (`.medium`) so a WiFi join can't pause frames mid-recording. | Bluetooth HFP routed through `AVAudioSession` |
 | `.iPhone` | `Utils/IPhoneCameraCapture.swift` wraps `AVCaptureSession` at 720×1280 portrait — geometry matches the glasses stream so the writer settings work unchanged. Coaching path throttles sample buffers to ≈1 fps JPEG (`videoMinInterval = 1.0 s`, quality 0.85) to match the glasses frame rate and token budget. | Forced built-in mic + loudspeaker |
 
 `Utils/AudioSessionManager.swift` has four modes — the VM picks one based on transport + activity:
@@ -122,7 +139,7 @@ DEBUG builds include `MockDeviceKit`. Use the in-app debug menu (shake-gesture o
 - **Endpoint** — `BidiGenerateContentConstrained` (v1alpha ephemeral-token variant). This endpoint delivers JSON control messages as **binary** WebSocket frames (UTF-8-encoded `{...}` bytes, not text frames). The service sniffs the first byte of every binary frame before deciding between JSON parsing and raw PCM audio playback.
 - **Setup handshake** — sends `{"setup": {}}` as the very first frame after `didOpenWithProtocol` (config is already baked into the token). `.connected` flips only after `setupComplete` arrives, so the audio gate can't open before Gemini is ready.
 - **Send gate** — three inputs: mic muted, pending tool call, or Gemini not ready. Edge-logged: only OPEN / CLOSED transitions print.
-- **Tool calls** — `json.toolCall.functionCalls[]` → `onToolCall(id, name, args)`. The VM forwards to `POST /api/learner/session/{id}/tool-call`, unwraps `{result: {...}}`, updates local state (step index, PiP toggle, completion), and replies to Gemini with `toolResponse`. `advance_step` here is **verbal-only** (the learner said "done").
+- **Tool calls** — `json.toolCall.functionCalls[]` → `onToolCall(id, name, args)`. `check_step` is intercepted **on-device** (the VM POSTs its cached frame to `/verify mode=on_demand` and synthesizes the `toolResponse`); `get_reference_clip` / `go_to_step` forward to `POST /api/learner/session/{id}/tool-call`, unwrap `{result: {...}}`, update local state (step index, PiP toggle, completion), and reply with `toolResponse`. `advance_step` is no longer a Live tool — the HUD swipe posts it straight to `/tool-call`.
 - **Visual advance + interjection are out-of-band, not tool calls.** `CoachingSessionViewModel.runOraclePoll()` (on a ~4 s timer, gated by `activeMonitoring`) posts the latest camera JPEG — cached from `onEncodedFrame(_:)`, no second camera tap — to `POST /api/learner/session/{id}/verify`. On an `advanced`/`completed` verdict it reuses `applyLearnerToolResult` for local state and injects an `[ADVANCE]` turn; on `error` it injects `[CORRECTION]`, both via `service.sendClientTextTurn`. Live never decides completion from the video itself.
 - **Pending tool-call set** — a `Set<String>`, not an `Optional<String>`. If Gemini ever emits multiple function calls in one `toolCall` frame, the audio + video send gate stays closed until the *last* one completes.
 - **Session resumption** — persists `sessionResumptionUpdate.new_handle`. On `goAway` (~60 s warning) or socket error, the VM mints a handle-baked token via `POST /api/learner/session/{id}/token?handle=...`, reconnects, waits for `setupComplete`, then injects `GET /api/learner/session/{id}/context-summary` as a user turn so the model re-orients on the real current step.
@@ -244,7 +261,7 @@ Record a procedure end-to-end from glasses or iPhone, review the raw capture, th
 | Layer | Pick |
 |---|---|
 | Language / framework | Swift 5.9, SwiftUI, Combine, Swift Concurrency (`actor`, `@MainActor`, `AsyncSequence`) |
-| Smart-glasses SDK | Meta DAT SDK 0.7.0 — `MWDATCore` + `MWDATCamera` + `MWDATDisplay` + `MWDATMockDevice` |
+| Smart-glasses SDK | Meta DAT SDK 0.8.0 — `MWDATCore` + `MWDATCamera` + `MWDATDisplay` + `MWDATMockDevice` |
 | Capture | `AVFoundation`, `AVCaptureSession`, `AVAssetWriter` |
 | Networking | `URLSession`, `URLSessionWebSocketTask` (Gemini Live), `Network.framework` `NWBrowser` (Bonjour) |
 | Hand tracking | Apple Vision + MediaPipe Tasks Vision (`SwiftTasksVision` SPM package) |
@@ -340,7 +357,7 @@ The cross-cutting Retrace decisions (direct-to-Gemini, ephemeral tokens, current
 5. **Barge-in is server-detected.** `serverContent.interrupted` is Gemini's server-VAD telling us it cancelled generation. Flush playback or the speaker keeps going.
 6. **Camera lifecycle is serialized.** `CoachingSessionViewModel.cameraLifecycleTask` chains every start/stop so a rapid dismiss + reopen can't race two `Stream` capabilities (DAT SDK returns a WARP error on that race).
 7. **One shared `DeviceSession`, owned by `DeviceSessionManager`.** Every DAT session touchpoint goes through the refcounting singleton — never `wearables.createSession(...)` directly. Camera (`"gemini-live"` / `"expert"`) and lens (`"lens"`) consumers compose their capabilities onto one session per device. See the DeviceSession lifecycle section above.
-8. **Visual completion is out-of-band, not a Gemini tool call.** The coaching VM polls `/verify` with a camera frame; the server-side Flash oracle decides, and the phone injects `[ADVANCE]`/`[CORRECTION]` into Live. One Active/Passive toggle arms the poll loop.
+8. **Visual completion is out-of-band, not a Gemini tool call.** The coaching VM polls `/verify` with a camera frame; the server-side Flash oracle decides, and the phone injects `[ADVANCE]`/`[CORRECTION]` into Live. One Active/Passive toggle arms the poll loop. The only completion-related Live tool is `check_step`, and even that routes the learner's claim to the same oracle.
 9. **No glasses registration gate.** Glasses are checked on-demand when the user picks a glasses-backed action. iPhone-only flows never prompt.
 10. **HUD confirm registrations and handler-stack pushes are token-stamped.** SwiftUI fires the new view's `.onAppear` before the old view's `.onDisappear` during page transitions; without UUID tokens, an outgoing page silently wipes an incoming overlay's freshly-installed closure (asymmetric failure: touch tap still works, pinch-select silently no-ops).
 
@@ -395,15 +412,15 @@ Requires `pip install pbxproj` once.
 
 ## Attribution
 
-Forked from Meta's [`meta-wearables-dat-ios`](https://github.com/facebook/meta-wearables-dat-ios) `CameraAccess` sample. The actively-developed Xcode project lives at `samples/CameraAccess/`. The Meta DAT SDK is consumed via Swift Package Manager (pinned at 0.7.0 in `Package.resolved`); canonical AI-coding guidance is delivered through the `mwdat-ios:*` Claude Code plugin (also pinned at 0.7.0). The previously vendored `meta-dat-fork/` snapshot was a stale 0.6.0 copy and has been removed — refresh the plugin or read Meta's upstream repo directly for new guidance.
+Forked from Meta's [`meta-wearables-dat-ios`](https://github.com/facebook/meta-wearables-dat-ios) `CameraAccess` sample. The actively-developed Xcode project lives at `samples/CameraAccess/`. The Meta DAT SDK is consumed via Swift Package Manager (pinned at 0.8.0 in `Package.resolved`); canonical AI-coding guidance is delivered through the `mwdat-ios:*` Claude Code plugin. The previously vendored `meta-dat-fork/` snapshot was a stale 0.6.0 copy and has been removed — refresh the plugin or read Meta's upstream repo directly for new guidance.
 
-A second README at [`samples/CameraAccess/README.md`](samples/CameraAccess/README.md) covers the same iOS app at the Xcode-project scope (handy when navigating the project from inside Xcode).
+A stub README at [`samples/CameraAccess/README.md`](samples/CameraAccess/README.md) points back here, keeping only the build-critical notes (Xcode file registration, attribution) for anyone navigating from inside Xcode.
 
 ---
 
 <div align="center">
 
-Built by the XRCC Retrace team for the Berlin 2026 hackathon.
+Built by the XRCC Retrace team — 🥈 2nd place at the Berlin 2026 hackathon.
 
 [**Org profile**](https://github.com/xrcc-retrace) &nbsp;·&nbsp; [**Backend**](https://github.com/xrcc-retrace/main-local-server-test)
 
