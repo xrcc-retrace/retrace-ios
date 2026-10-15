@@ -40,7 +40,12 @@ class UploadService: NSObject, ObservableObject, URLSessionTaskDelegate {
     return URLSession(configuration: config, delegate: self, delegateQueue: .main)
   }()
 
-  func uploadRecording(fileURL: URL) async {
+  /// `interviewLogURL`: the expert-interviewer sidecar
+  /// (`InterviewLogStore.sidecarURL(for:)`), sent as the `interview` part so
+  /// the server folds the expert's answers into extraction and ducks the
+  /// AI's voice out of the clips. Omitted (today's request shape) when nil
+  /// or unreadable.
+  func uploadRecording(fileURL: URL, interviewLogURL: URL? = nil) async {
     guard !isUploading else { return }
 
     isUploading = true
@@ -75,11 +80,20 @@ class UploadService: NSObject, ObservableObject, URLSessionTaskDelegate {
       return
     }
     body.append(videoData)
+
+    var interviewNote = ""
+    if let interviewLogURL, let logData = try? Data(contentsOf: interviewLogURL), !logData.isEmpty {
+      body.append("\r\n--\(boundary)\r\n".data(using: .utf8)!)
+      body.append("Content-Disposition: form-data; name=\"interview\"; filename=\"interview.json\"\r\n".data(using: .utf8)!)
+      body.append("Content-Type: application/json\r\n\r\n".data(using: .utf8)!)
+      body.append(logData)
+      interviewNote = " + interview log (\(logData.count / 1024)KB)"
+    }
     body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
 
     request.httpBody = body
 
-    print("[Upload] Starting upload: \(filename) (\(videoData.count / 1024)KB) to \(serverBaseURL)")
+    print("[Upload] Starting upload: \(filename) (\(videoData.count / 1024)KB)\(interviewNote) to \(serverBaseURL)")
 
     do {
       let (data, response) = try await session.data(for: request)

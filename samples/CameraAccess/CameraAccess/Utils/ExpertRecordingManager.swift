@@ -75,6 +75,20 @@ class ExpertRecordingManager: ObservableObject {
   private let audioSessionManager: AudioSessionManager
 
   private let recordingQueue = DispatchQueue(label: "com.retrace.recording")
+
+  /// Host-clock origin of the mp4 timeline — the PTS of the first sample the
+  /// writer accepted (`startSession(atSourceTime:)`). Everything the expert
+  /// interviewer stamps in "video seconds" (AI speech windows for ducking,
+  /// question timestamps for the extraction prompt) is `hostNow − origin`.
+  /// Written on `recordingQueue`, read from the main actor — hence the lock.
+  private let timelineOrigin = RecordingTimelineOrigin()
+
+  /// Seconds into the recording right now, or nil before the first sample
+  /// landed / after the writer was discarded.
+  var videoTimeNow: Double? {
+    timelineOrigin.videoTime(forHostTime: CMClockGetTime(CMClockGetHostTimeClock()))
+  }
+
   private var appendedFrameCount: Int64 = 0
   private var droppedFrameCount: Int64 = 0
   /// Shared flag flipped by whichever of {video, audio} arrives first —
@@ -315,6 +329,7 @@ class ExpertRecordingManager: ObservableObject {
     preparedWriterDims = nil
     configuredAudioFormat = .aac
     hasStartedSession = false
+    timelineOrigin.clear()
     appendedFrameCount = 0
     droppedFrameCount = 0
     appendsInWindow = 0
@@ -493,6 +508,8 @@ class ExpertRecordingManager: ObservableObject {
     videoInput = nil
     audioInput = nil
     preparedWriterDims = nil
+    // Debrief questions after Stop have no video time — the origin is gone.
+    timelineOrigin.clear()
 
     // A recording is only usable if the writer finished cleanly AND at least one video frame landed.
     // If either is untrue the .mp4 will be missing its moov atom (or be empty) and fail upload.
@@ -538,6 +555,7 @@ class ExpertRecordingManager: ObservableObject {
         let firstPTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         writer.startSession(atSourceTime: firstPTS)
         self.hasStartedSession = true
+        self.timelineOrigin.set(firstPTS)
       }
 
       guard videoInput.isReadyForMoreMediaData else {
@@ -603,6 +621,7 @@ class ExpertRecordingManager: ObservableObject {
         let firstPTS = CMSampleBufferGetPresentationTimeStamp(sb)
         writer.startSession(atSourceTime: firstPTS)
         self.hasStartedSession = true
+        self.timelineOrigin.set(firstPTS)
       }
 
       guard audioInput.isReadyForMoreMediaData else { return }
@@ -751,5 +770,33 @@ class ExpertRecordingManager: ObservableObject {
 
     guard setStatus == noErr else { return nil }
     return sb
+  }
+}
+
+
+/// Lock-protected box for the writer's host-clock timeline origin. Written
+/// from `ExpertRecordingManager.recordingQueue`, read from the main actor.
+final class RecordingTimelineOrigin: @unchecked Sendable {
+  private let lock = NSLock()
+  private var originSeconds: Double?
+
+  func set(_ pts: CMTime) {
+    lock.lock()
+    originSeconds = CMTimeGetSeconds(pts)
+    lock.unlock()
+  }
+
+  func clear() {
+    lock.lock()
+    originSeconds = nil
+    lock.unlock()
+  }
+
+  func videoTime(forHostTime hostTime: CMTime) -> Double? {
+    lock.lock()
+    defer { lock.unlock() }
+    guard let origin = originSeconds else { return nil }
+    let t = CMTimeGetSeconds(hostTime) - origin
+    return t >= 0 ? t : nil
   }
 }

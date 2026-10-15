@@ -56,6 +56,8 @@ struct IPhoneRecordingView: View {
     switch transport {
     case .iPhone:
       IPhoneRecordingEngine(
+        wearables: wearables,
+        sessionManager: sessionManager,
         uploadService: uploadService,
         onAcknowledgeProcedure: onAcknowledgeProcedure,
         onRecordingComplete: onRecordingComplete
@@ -90,19 +92,43 @@ private struct IPhoneRecordingEngine: View {
 
   @AppStorage("debugMode") private var debugMode: Bool = false
   @AppStorage("hudAdditiveBlend") private var hudAdditiveBlend: Bool = false
+  /// Expert interviewer preference. Read when the VM is constructed (the
+  /// audio mode depends on it); the picker is locked afterwards for this
+  /// session and the stored value applies to the next recording.
+  @AppStorage(InterviewerMode.storageKey) private var interviewerModeRaw: String = InterviewerMode.default.rawValue
   @State private var currentInterfaceOrientation: UIInterfaceOrientation = .portrait
   @State private var expertPageIndex: Int = 0
 
   init(
+    wearables: WearablesInterface,
+    sessionManager: DeviceSessionManager,
     uploadService: UploadService,
     onAcknowledgeProcedure: @escaping () -> Void,
     onRecordingComplete: @escaping (URL, TimeInterval) -> Void
   ) {
     self._viewModel = StateObject(
-      wrappedValue: IPhoneExpertRecordingViewModel(uploadService: uploadService)
+      wrappedValue: IPhoneExpertRecordingViewModel(
+        uploadService: uploadService,
+        wearables: wearables,
+        sessionManager: sessionManager
+      )
     )
     self.onAcknowledgeProcedure = onAcknowledgeProcedure
     self.onRecordingComplete = onRecordingComplete
+  }
+
+  private var interviewerModeBinding: Binding<InterviewerMode> {
+    Binding(
+      get: { InterviewerMode(rawValue: interviewerModeRaw) ?? .default },
+      set: { interviewerModeRaw = $0.rawValue }
+    )
+  }
+
+  /// Stop (phone pill, lens confirm): finalize the mp4 and, with the
+  /// interviewer on, run the debrief. The hand-off is published on the VM
+  /// and routed by `.onChange(of: viewModel.handoff)` below.
+  private func stopTapped() {
+    Task { await viewModel.finishRecording() }
   }
 
   var body: some View {
@@ -116,18 +142,14 @@ private struct IPhoneRecordingEngine: View {
         hudAdditiveBlend: hudAdditiveBlend,
         pageIndex: $expertPageIndex,
         onStop: {
-          // Stop = capture mode is over. Finalize the mp4, then hand the
-          // URL up so the parent can dismiss this view (camera + audio
-          // teardown fires on `onDisappear`) and present the review as
-          // a sibling full-screen cover. No camera running underneath
-          // the review — that was the old sheet-on-top-of-recording-view
-          // pattern, which kept the AVCaptureSession alive for the full
-          // upload + procedure-review flow.
-          Task {
-            if let result = await viewModel.stopRecording() {
-              onRecordingComplete(result.0, result.1)
-            }
-          }
+          // Stop = capture mode is over. Finalize the mp4 (and run the
+          // interviewer's debrief if it's on), then hand the URL up so the
+          // parent can dismiss this view (camera + audio teardown fires on
+          // `onDisappear`) and present the review as a sibling full-screen
+          // cover. No camera running underneath the review — that was the
+          // old sheet-on-top-of-recording-view pattern, which kept the
+          // AVCaptureSession alive for the full upload + procedure-review flow.
+          stopTapped()
         }
       )
     } chrome: {
@@ -144,8 +166,14 @@ private struct IPhoneRecordingEngine: View {
           viewModel.startRecording(landscape: false)
         }
       )
+      interviewerChrome
     }
     .animation(.easeInOut(duration: 0.18), value: viewModel.recordingManager.isHUDActive)
+    .onChange(of: viewModel.handoff) { _, result in
+      if let result {
+        onRecordingComplete(result.url, result.duration)
+      }
+    }
     .task {
       await viewModel.prepare()
     }
@@ -167,13 +195,7 @@ private struct IPhoneRecordingEngine: View {
         recordingManager: viewModel.recordingManager,
         hudViewModel: viewModel.hudViewModel,
         transport: .iPhone,
-        onStopConfirmed: {
-          Task {
-            if let result = await viewModel.stopRecording() {
-              onRecordingComplete(result.0, result.1)
-            }
-          }
-        },
+        onStopConfirmed: { stopTapped() },
         onExitRequested: { dismiss() }
       )
       lensSession.activate(.expert, vm: context)
@@ -193,6 +215,48 @@ private struct IPhoneRecordingEngine: View {
       Button("OK") { viewModel.dismissError() }
     } message: {
       Text(viewModel.errorMessage)
+    }
+  }
+}
+
+// MARK: - iPhone engine: interviewer chrome
+
+private extension IPhoneRecordingEngine {
+  /// Interviewer-specific chrome layered over the shared chrome:
+  ///   • pre-recording — the On / Debrief only / Off picker above the Start CTA
+  ///     (locked once the session's audio mode has been chosen);
+  ///   • recording — status pill (top) + question card (bottom) when a
+  ///     question is live;
+  ///   • after Stop — the debrief overlay until the hand-off is ready.
+  @ViewBuilder
+  var interviewerChrome: some View {
+    let isRecording = viewModel.recordingManager.isHUDActive
+    if !isRecording, !viewModel.isDebriefing {
+      VStack {
+        Spacer()
+        ExpertInterviewerModePicker(mode: interviewerModeBinding, isLocked: true)
+          .padding(.bottom, 92)  // sits just above the Start CTA
+      }
+      .padding(.horizontal, 24)
+    }
+    if let interviewer = viewModel.interviewer, isRecording {
+      VStack(spacing: 12) {
+        ExpertInterviewStatusPill(interviewer: interviewer)
+          .padding(.top, 20)
+        Spacer()
+        if let question = interviewer.currentQuestion {
+          ExpertInterviewQuestionCard(question: question, isListening: interviewer.isListeningForAnswer)
+            .padding(.horizontal, 20)
+            .padding(.bottom, 24)
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
+      }
+      .animation(.spring(response: 0.35, dampingFraction: 0.85), value: interviewer.currentQuestion)
+    }
+    if let interviewer = viewModel.interviewer, viewModel.isDebriefing {
+      ExpertInterviewDebriefOverlay(interviewer: interviewer) {
+        viewModel.skipDebrief()
+      }
     }
   }
 }
