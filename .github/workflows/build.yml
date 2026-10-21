@@ -1,0 +1,29 @@
+name: build
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  simulator:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+      - run: xcodebuild -version
+      # Xcode 26 ships the Metal compiler as a separate component (see testflight.yml).
+      - run: xcodebuild -downloadComponent MetalToolchain || true
+      - name: Resolve Swift packages
+        working-directory: samples/CameraAccess
+        run: xcodebuild -resolvePackageDependencies -project CameraAccess.xcodeproj -scheme CameraAccess
+      - name: Build for iOS Simulator
+        working-directory: samples/CameraAccess
+        run: |
+          set -o pipefail
+          xcodebuild -project CameraAccess.xcodeproj -scheme CameraAccess \
+            -destination 'generic/platform=iOS Simulator' -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO build | tail -200
