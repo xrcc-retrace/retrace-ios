@@ -6,10 +6,10 @@
 
 ### Record an expert once. Coach every learner forever.
 
-The phone client for **Retrace**, an AI coaching system for hands-on tasks, built for the XRCC Berlin 2026 hackathon (🥈 2nd place).
+The phone client for **Retrace**, an AI coaching system for hands-on tasks. 🥈 2nd place at the XRCC Berlin 2026 hackathon; work continued through 2026.
 SwiftUI app that captures from Ray-Ban Meta glasses or the iPhone camera, holds a **direct WebSocket to Gemini Live** for voice, and renders a HUD on the glasses' lens. The backend lives in [`hshwang34/retrace-server`](https://github.com/hshwang34/retrace-server).
 
-[**▶ Demo**](https://www.youtube.com/watch?v=azK-CLpyRQg) · [**🎬 Full walkthrough**](https://www.youtube.com/watch?v=CqUj5HtP0QE) · [**🛰 Backend**](https://github.com/hshwang34/retrace-server)
+[**🌐 retracelab.com**](https://retracelab.com) · [**▶ Demo**](https://www.youtube.com/watch?v=azK-CLpyRQg) · [**🎬 Full walkthrough**](https://www.youtube.com/watch?v=CqUj5HtP0UE) · [**🛰 Backend**](https://github.com/hshwang34/retrace-server) (private)
 
 </div>
 
