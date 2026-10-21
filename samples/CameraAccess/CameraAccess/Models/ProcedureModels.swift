@@ -3,6 +3,13 @@ import Foundation
 struct UploadResponse: Codable {
   let id: String
   let status: String
+  /// True when the server accepted an expert-interview log with the video.
+  let hasInterview: Bool?
+
+  enum CodingKeys: String, CodingKey {
+    case id, status
+    case hasInterview = "has_interview"
+  }
 }
 
 /// One online source cited in a procedure built from the troubleshoot

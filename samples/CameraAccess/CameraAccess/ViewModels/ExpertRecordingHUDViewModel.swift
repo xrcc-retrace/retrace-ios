@@ -64,6 +64,14 @@ final class ExpertRecordingHUDViewModel: ObservableObject {
 
   @Published private(set) var micSource: ExpertHUDMicSource = .iPhoneBuiltIn
 
+  // MARK: - Stop countdown
+
+  /// True while the lens stop-confirm overlay's 3 s countdown is showing.
+  /// Set by `ExpertNarrationTipPage`; read by the expert interviewer's pause
+  /// gate so a question can never land while the expert is deciding whether
+  /// to stop.
+  @Published var stopCountdownActive: Bool = false
+
   // MARK: - Hand tracking
   //
   // Recognizer + frame log + debug-provider plumbing all live on

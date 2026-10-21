@@ -543,6 +543,37 @@ class GeminiLiveSessionBase: ObservableObject {
   /// lens are unaffected (those come up independently of the camera Stream).
   var streamsCameraToGemini: Bool { true }
 
+  /// Whether the OWNER feeds camera frames via `submitExternalFrame(_:)`
+  /// instead of this base opening its own `AVCaptureSession` / DAT `Stream`.
+  /// The expert interviewer runs beside an active recording whose capture
+  /// session already owns the camera — a second `AVCaptureSession` on the
+  /// same device fails, so the recording VM tees 1 fps JPEGs in here. When
+  /// true the camera/lens branch is skipped entirely. Default false.
+  var usesExternalFrameSource: Bool { false }
+
+  /// Install this session's mic→Gemini closure on the audio manager's
+  /// SECONDARY tap slot instead of `onAudioBuffer`. Required whenever the
+  /// borrowed manager's primary slot belongs to someone else (the expert
+  /// recorder's mp4 writer) — otherwise whichever installs last steals the
+  /// mic. Only meaningful with `externalAudioManager`. Default false.
+  var usesSecondaryMicSlot: Bool { false }
+
+  /// When true, every converted 16 kHz PCM16 mic buffer is also handed to
+  /// `onMicPCM16(_:)` REGARDLESS of the send gate (the interviewer keeps a
+  /// ring of narration for the server-side planner while Live itself hears
+  /// nothing). Default false — no extra conversion cost for other modes.
+  var observesMicPCM: Bool { false }
+
+  /// Receives converted mic PCM when `observesMicPCM` is true. Called on the
+  /// audio TAP THREAD — implementations must be lock-protected and cheap.
+  nonisolated func onMicPCM16(_ pcm: Data) {}
+
+  /// Server path the token manager refreshes against. Default is the learner
+  /// namespace; modes with their own router override.
+  func tokenRefreshPath(sessionId: String) -> String {
+    "/api/learner/session/\(sessionId)/token"
+  }
+
   /// Context summary injected after a successful resumption reconnect.
   /// Coaching fetches the learner-session summary; other modes return nil
   /// (the reconnect still happens, just without the re-orient).
@@ -976,7 +1007,8 @@ class GeminiLiveSessionBase: ObservableObject {
     // 4. Token manager.
     let tm = GeminiTokenManager(
       sessionId: payload.sessionId,
-      serverBaseURL: serverBaseURL
+      serverBaseURL: serverBaseURL,
+      tokenPath: tokenRefreshPath(sessionId: payload.sessionId)
     )
     await tm.setInitialToken(payload.ephemeralToken)
     self.tokenManager = tm
@@ -1050,7 +1082,8 @@ class GeminiLiveSessionBase: ObservableObject {
     observeGeminiConnectionState(gemini)
 
     // Audio mic-tap → Gemini (same three-gate check as before).
-    audio.onAudioBuffer = { [weak self] buffer, _ in
+    let observesPCM = observesMicPCM
+    let micClosure: (AVAudioPCMBuffer, AVAudioTime) -> Void = { [weak self] buffer, _ in
       guard let self = self else { return }
       let sendingOk = self.isSendingAudio
       let noTool = self.pendingToolCallIds.isEmpty
@@ -1072,12 +1105,22 @@ class GeminiLiveSessionBase: ObservableObject {
         }
       }
 
-      guard gateOpen else { return }
+      // Convert once; the PCM observer (interviewer's planner ring) wants
+      // every buffer, the Live send only gated ones.
+      guard observesPCM || gateOpen else { return }
       guard let pcmData = self.audioManager?.convertBufferForSend(buffer) else { return }
+      if observesPCM { self.onMicPCM16(pcmData) }
+      guard gateOpen else { return }
 
       Task {
         try? await self.geminiService?.sendAudio(pcmData)
       }
+    }
+    if usesSecondaryMicSlot {
+      // Primary slot belongs to the owner (expert recorder's writer).
+      audio.installSecondaryAudioConsumer(micClosure)
+    } else {
+      audio.onAudioBuffer = micClosure
     }
 
     // In push-to-talk (demo) mode the session must start NOT sending — the mic
@@ -1110,6 +1153,19 @@ class GeminiLiveSessionBase: ObservableObject {
   /// uses, so there's no contention to relieve by stopping it. The send gates
   /// (`!isClipPlaying`) already keep those frames from reaching Gemini, so the
   /// model stays blind/silent without a stop→restart cycle.
+  /// Owner-fed JPEG frame (see `usesExternalFrameSource`). Same contract as
+  /// the internal sources: `onEncodedFrame` fires regardless of the gate,
+  /// the send happens only when Gemini is ready, no tool call is in flight
+  /// and no reference clip is playing.
+  @MainActor
+  func submitExternalFrame(_ jpeg: Data) {
+    onEncodedFrame(jpeg)
+    guard isGeminiReady, pendingToolCallIds.isEmpty, !isClipPlaying else { return }
+    Task { [weak self] in
+      try? await self?.geminiService?.sendVideoFrame(jpeg)
+    }
+  }
+
   @MainActor
   func setReferenceClipPlaying(_ playing: Bool) {
     guard isClipPlaying != playing else { return }
@@ -1137,7 +1193,11 @@ class GeminiLiveSessionBase: ObservableObject {
       // BORROWED persistent session: detach only THIS runtime's endpoints and
       // leave the HFP pipeline running for the next runtime. Tearing it down
       // here would re-introduce the per-runtime arm/teardown race we removed.
-      audioManager?.onAudioBuffer = nil
+      if usesSecondaryMicSlot {
+        audioManager?.removeSecondaryAudioConsumer()
+      } else {
+        audioManager?.onAudioBuffer = nil
+      }
       audioManager?.clearPlaybackBuffer(reason: "runtime-detach")
     } else {
       audioManager?.stopCapture()
@@ -1180,6 +1240,13 @@ class GeminiLiveSessionBase: ObservableObject {
   /// from inside the setup task; everything else is logged so coaching
   /// continues voice-only (visual auto-advance + lens HUD simply unavailable).
   private func launchCameraLensBranch() {
+    // Owner-fed frames (expert interviewer beside a live recording): the
+    // recording's capture session owns the camera; a second AVCaptureSession
+    // / DAT Stream here would fail or compete. Nothing to launch.
+    if usesExternalFrameSource {
+      print("[GeminiLive] external frame source — camera/lens branch skipped")
+      return
+    }
     // Re-arm the per-attach lens-availability notice; the branches below flip it
     // true only if the lens was wanted but the glasses can't display it.
     glassesLensUnavailable = false

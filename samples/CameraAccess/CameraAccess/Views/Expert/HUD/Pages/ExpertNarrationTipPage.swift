@@ -265,12 +265,14 @@ struct ExpertNarrationTipPage: RayBanHUDView {
   private func startStopFlow() {
     guard countdownStartedAt == nil else { return }
     countdownStartedAt = Date()
+    hud.stopCountdownActive = true
     let nanos = UInt64(RayBanHUDLayoutTokens.stopCountdownDuration * 1_000_000_000)
     commitTask?.cancel()
     commitTask = Task { @MainActor in
       try? await Task.sleep(nanoseconds: nanos)
       guard !Task.isCancelled else { return }
       countdownStartedAt = nil
+      hud.stopCountdownActive = false
       commitTask = nil
       hoverCoordinator.cancel()
       onStop()
@@ -283,6 +285,7 @@ struct ExpertNarrationTipPage: RayBanHUDView {
     commitTask?.cancel()
     commitTask = nil
     countdownStartedAt = nil
+    hud.stopCountdownActive = false
     hoverCoordinator.cancel()
   }
 

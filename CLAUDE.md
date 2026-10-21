@@ -143,6 +143,14 @@ AppLaunch ──► Wearables.configure() + BonjourDiscovery.start
 
 Record a procedure end-to-end from the glasses or the iPhone, review the raw capture, then upload. The upload returns `202`; the app polls procedure status (`processing` → `completed` / `completed_partial` / `failed`) until Gemini finishes generating the SOP. `ProcedureEditView` + `StepEditView` let you rewrite titles, descriptions, tips, warnings, and step order before sharing.
 
+**Expert interviewer (iPhone transport).** A Gemini Live session that runs *beside* the recording and asks the questions a learner would have needed ("what size socket?", "how do you know it's tight?"). Picked per recording on the pre-record screen (`InterviewerMode`: *Ask me* / *Debrief only* / *Off*, stored under `expertInterviewerMode`). Pieces:
+
+- `ViewModels/ExpertInterviewViewModel.swift` — `GeminiLiveSessionBase` subclass. Three loops: a ~5 s **planner tick** (latest JPEG + last ~6 s of narration from a `PCMRingBuffer` → `POST /api/expert/interview/{id}/observe`; the SERVER decides if there's a gap), a 250 ms **pause gate** (holds a returned ask until the expert has been silent `policy.silenceBeforeAskSeconds`, nothing is playing, and the HUD stop-countdown isn't up — then injects `[ASK] …`; expired asks are reported `deferred`, never dropped), and an **answer-window** state machine (question voiced → mic opens → expert answers → Live acks or asks ONE follow-up → mic closes → `POST /answer`). `recomputeSendGate()` is overridden so the mic reaches Live **only inside an answer window** — an open mic makes Live reply to every pause in the narration. Debrief after Stop runs on the same socket with the mic open; "done"/Done ends it; `finalize()` merges the server log with the phone's AI-speech windows (video time, from `ExpertRecordingManager.videoTimeNow`) and publishes `finalLog`.
+- `ViewModels/IPhoneExpertRecordingViewModel.swift` owns the shared audio: with the interviewer on, the manager runs in **`.interview`** mode and capture starts in `prepare()` (so Live can connect for the pre-roll briefing), the recorder is built `borrowedSession: true` (its Stop must not kill the mic the debrief needs), and this VM stops capture in `teardown()`. Camera frames are tee'd at 1 fps through an `IPhoneCoachingCameraSource` into `interviewer.ingestFrame`. If `.interview` fails to start it falls back to the plain `.recordingPhoneOnly` recorder — the recording always wins. Stop → `finishRecording()` → debrief → `handoff` published → `IPhoneRecordingView` routes to the review cover.
+- `Services/InterviewLogStore.swift` writes the log beside the mp4 as `<name>.interview.json`; `ExpertRecordingReviewView` passes it to `UploadService.uploadRecording(fileURL:interviewLogURL:)` as the `interview` multipart part and deletes it on Discard.
+- `Views/Expert/ExpertInterviewOverlay.swift` — phone-side chrome (mode picker, status pill, question card, debrief overlay). The lens-side question card is a follow-up (see `docs/expert-interviewer-design.md` at the repo root §4.9).
+- Glasses transport: not wired yet (the design doc covers the HFP specifics; `StreamSessionViewModel` is untouched).
+
 ### Learner Mode
 
 - **Discover** — all procedures from the server.
@@ -190,7 +198,7 @@ The HUD reads `HandGestureService.$state` to drive focus rings, the recede-and-a
 
 ### AudioSessionManager modes
 
-`Utils/AudioSessionManager.swift` has four modes — the VM picks one based on transport + activity:
+`Utils/AudioSessionManager.swift` has five modes — the VM picks one based on transport + activity:
 
 | Mode | Purpose |
 |---|---|
@@ -198,6 +206,9 @@ The HUD reads `HandGestureService.$state` to drive focus rings, the recede-and-a
 | `.coachingPhoneOnly` | Full-duplex with AEC, forced built-in mic + loudspeaker. Used when `.iPhone` transport — ignores HFP even if glasses are paired. |
 | `.recording` | Simplex capture, no playback, no AEC. Expert recording via glasses (HFP) or iPhone mic fallback. |
 | `.recordingPhoneOnly` | Simplex capture, forced built-in mic. iPhone-native expert recording — ignores HFP. |
+| `.interview` | `.coachingPhoneOnly`'s graph (AEC, built-in mic, loudspeaker) for iPhone expert recording **with the interviewer on**. One manager feeds the mp4 writer (primary tap slot), the interviewer's Live session (secondary slot, `installSecondaryAudioConsumer`) and the planner's PCM ring. AEC strips most of the AI's own questions out of the recording; the server ducks the rest. |
+
+Mode predicates (`supportsPlayback` / `isPhoneOnly` / `forcesLoudspeaker`) replace the old `mode == .coaching || mode == .coachingPhoneOnly` checks — add new modes there, not at call sites. `convertBufferForSend` has its own `AVAudioConverter` (`sendAudioConverter`): the recorder's `convertBufferToPcmRecording` runs on `recordingQueue` while the Live send runs on the tap thread, and `AVAudioConverter` is not thread-safe.
 
 ## Gemini Live client
 
@@ -205,7 +216,8 @@ The HUD reads `HandGestureService.$state` to drive focus rings, the recede-and-a
 
 - **Wire endpoint** — `BidiGenerateContentConstrained` (v1alpha ephemeral-token variant). This endpoint delivers JSON control messages as **binary** WebSocket frames (UTF-8 encoded `{...}` bytes, not text frames). The service sniffs the first byte of each binary frame before deciding between JSON parsing and raw PCM audio playback.
 - **Setup handshake** — after `didOpenWithProtocol`, sends `{"setup": {}}` as the very first frame (required; config is already baked into the ephemeral token). `.connected` flips only after `setupComplete` arrives, so the audio send gate can't open before Gemini is ready.
-- **Send gate** — per-buffer gate with three inputs: mic muted, a pending tool call, or Gemini not ready. Logged only on OPEN / CLOSED transitions, not per buffer.
+- **Send gate** — per-buffer gate with three inputs: mic muted, a pending tool call, or Gemini not ready. Logged only on OPEN / CLOSED transitions, not per buffer. `recomputeSendGate()` is overridable — the expert interviewer folds its answer-window flag in there.
+- **Owner-fed sessions** — three `GeminiLiveSessionBase` hooks let a subclass run beside another pipeline instead of owning the camera/mic: `usesExternalFrameSource` (skip the camera/lens branch; owner calls `submitExternalFrame(_:)`), `usesSecondaryMicSlot` (install the mic closure on the audio manager's secondary tap slot so the owner's primary consumer isn't stolen), `observesMicPCM` + `nonisolated onMicPCM16(_:)` (receive every converted 16 kHz PCM buffer regardless of the gate — called on the tap thread). `tokenRefreshPath(sessionId:)` gives the mode's `/token` endpoint to `GeminiTokenManager` (default stays the learner path).
 - **Session resumption** — persists `sessionResumptionUpdate.new_handle`. On `goAway` (~60 s warning) or socket error, the view model mints a handle-baked token via `POST /api/learner/session/{id}/token?handle=...`, reconnects, waits for `setupComplete`, then injects `GET /api/learner/session/{id}/context-summary` as a user turn to re-orient the model on the real current step.
 - **Barge-in** — `serverContent.interrupted` triggers a playback buffer flush via `AudioSessionManager.clearPlaybackBuffer(reason: "barge-in")` so the learner doesn't hear the stale reply continuing.
 - **Tool calls** — `json.toolCall.functionCalls[]` → `onToolCall(id, name, args)`. The base's `interceptToolCall(name:args:)` hook runs first: `check_step` (the learner's "done" claim / "is this right?" question) is handled **on-device** — the coaching VM POSTs its cached `lastFrameJPEG` to `/verify mode=on_demand&claim=done|question` and synthesizes the `toolResponse` (a frame can't ride the tool-call body). On a verified advance, local UI mirrors immediately but the spoken next-step `[ADVANCE]` injection is **deferred** (`pendingAdvanceInjection`) until Live finishes voicing its confirmation (drained in `onTurnCompleteExtra`, which skips the poll re-arm on that tick). All other tools (`get_reference_clip`, `go_to_step`) forward to `POST /api/learner/session/{id}/tool-call`, unwrap `{result: {...}}`, update local state, and ACK via `toolResponse`. `advance_step` is no longer a Live tool — the HUD swipe still posts it directly to `/tool-call`.
@@ -272,12 +284,15 @@ samples/CameraAccess/
 │   ├── Models/
 │   │   ├── CaptureTransport.swift     # .glasses | .iPhone
 │   │   ├── DiagnosticModels.swift     # Codable mirrors of /api/troubleshoot (session, state, handoff, manual upload/status, candidate procedure, diagnostic log entry)
+│   │   ├── InterviewModels.swift      # InterviewerMode (on/quiet/off pref) + Codable mirrors of /api/expert/interview (start, observe, ask, answer, debrief) + the phone-owned InterviewLog (strict server-side — never add a field on one side only)
 │   │   └── ProcedureModels.swift      # Codable mirrors of server models (procedures, steps incl. visualVerifiability, ProcedurePart visual glossary, session, voices, SessionRecord) + VerifyResponse (oracle verdict)
 │   ├── Services/
 │   │   ├── BonjourDiscovery.swift     # NWBrowser for _retrace._tcp; caches serverBaseURL
 │   │   ├── ServerEndpoint.swift       # 4-mode backend resolver (.auto/.local/.cloud/.custom) + compiled-in cloud URL; mirrors result to UserDefaults["serverBaseURL"]
 │   │   ├── GeminiLiveService.swift    # Direct WebSocket, binary-frame JSON sniffing, resumption, barge-in, tool plumbing
-│   │   ├── GeminiTokenManager.swift   # actor — force-refresh with optional resumption handle, concurrent-caller dedup
+│   │   ├── GeminiTokenManager.swift   # actor — force-refresh with optional resumption handle, concurrent-caller dedup; `tokenPath` picks the mode's /token endpoint
+│   │   ├── InterviewAPIService.swift  # REST client for /api/expert/interview/* (start, briefing-inject, observe multipart, answer, debrief, finalize, end)
+│   │   ├── InterviewLogStore.swift    # <recording>.interview.json sidecar read/write/delete
 │   │   ├── LocalProgressStore.swift   # Saved procedures + session history (UserDefaults)
 │   │   ├── ProcedureAPIService.swift  # REST client for /api/procedures and /api/learner (incl. verifyStep — multipart camera frame → VerifyResponse)
 │   │   ├── CompletionFeedback.swift / WorkflowPlaybackAudioSession.swift
@@ -287,15 +302,17 @@ samples/CameraAccess/
 │   │   │   └── LensRendererProtocol.swift
 │   │   └── VoicePreviewPlayer.swift
 │   ├── Utils/
-│   │   ├── AudioSessionManager.swift  # Four modes (coaching / coachingPhoneOnly / recording / recordingPhoneOnly)
-│   │   ├── ExpertRecordingManager.swift  # AVAssetWriter pipeline (720×1280, shared host-clock session start for video + audio)
+│   │   ├── AudioSessionManager.swift  # Five modes (coaching / coachingPhoneOnly / recording / recordingPhoneOnly / interview) + mode predicates
+│   │   ├── ExpertRecordingManager.swift  # AVAssetWriter pipeline (720×1280, shared host-clock session start for video + audio); `videoTimeNow` exposes seconds-into-recording via RecordingTimelineOrigin
+│   │   ├── PCMRingBuffer.swift        # Lock-protected Int16 ring + WAV wrapper (the interviewer's narration chunk for the planner)
 │   │   ├── IPhoneCameraCapture.swift  # AVCaptureSession wrapper for iPhone transport
 │   │   ├── UploadService.swift        # multipart POST to /api/expert/upload
 │   │   └── Retrace{Colors,Spacing,Typography}.swift
 │   ├── ViewModels/
 │   │   ├── WearablesViewModel.swift           # DAT registration state
 │   │   ├── StreamSessionViewModel.swift       # glasses stream preview
-│   │   ├── IPhoneExpertRecordingViewModel.swift
+│   │   ├── IPhoneExpertRecordingViewModel.swift  # iPhone recording + owner of the shared `.interview` audio session and the 1 fps frame tee when the interviewer is on
+│   │   ├── ExpertInterviewViewModel.swift     # Expert interviewer Live session: planner ticker, pause gate, answer-window state machine, debrief, finalize → InterviewLog
 │   │   ├── IPhoneCoachingCameraSource.swift
 │   │   ├── GeminiLiveSessionBase.swift        # Shared base — token lifecycle, reconnect-on-goAway, setup-complete gate, JPEG frame throttle (videoMinInterval 1.0s / videoJpegQuality 0.85), `onEncodedFrame(_:)` hook (fires per throttled JPEG so subclasses can cache the latest frame for the oracle), pendingToolCallIds, cameraLifecycleTask. Used by Coaching + Diagnostic VMs.
 │   │   ├── LensDisplayCoordinator.swift       # Owns the DAT Display capability (the "lens" DeviceSessionManager consumer); lazy-attach, pendingAction queue, requiresDATAppUpdate. See Lens subsystem below.
@@ -319,7 +336,7 @@ samples/CameraAccess/
 │       ├── Onboarding/                # OnboardingContainerView + Screens/ + Components/ — first-launch flow
 │       ├── RayBanHUD/                 # Lens design system — see DESIGN.md before touching lens UI. RayBanHUDEmulator/View/HUDInputEngine = the on-phone SwiftUI emulator; Native/ (LensComponents, LensIconMap, LensImageURL, LensSnapshot, Renderers/) = the real MWDATDisplay FlexBox tree builders
 │       ├── Troubleshoot/              # TroubleshootSessionView, TroubleshootIntroView, DiagnosticPhaseBar, DiagnosticResolutionPanel, ManualUploadSheet, TroubleshootConfirmOverlay, TroubleshootPageHandler, Pages/, Components/
-│       ├── Expert/                    # ExpertTabView, RecordTabView, IPhoneRecordingView, WorkflowListView, ProcedureDetailView, ProcedureEditView, StepEditView, ExpertManualUploadSheet + PDFPreviewView (PDF → SOP via /api/expert/manuals), ProcedureReviewView, HUD/ (lens recording chrome)
+│       ├── Expert/                    # ExpertTabView, RecordTabView, IPhoneRecordingView, ExpertInterviewOverlay (interviewer mode picker / status pill / question card / debrief), WorkflowListView, ProcedureDetailView, ProcedureEditView, StepEditView, ExpertManualUploadSheet + PDFPreviewView (PDF → SOP via /api/expert/manuals), ProcedureReviewView, HUD/ (lens recording chrome)
 │       ├── MockDeviceKit/
 │       └── Learner/
 │           ├── LearnerTabView.swift

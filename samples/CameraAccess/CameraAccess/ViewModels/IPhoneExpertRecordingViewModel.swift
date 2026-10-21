@@ -2,7 +2,16 @@ import AVFoundation
 import Combine
 import CoreMedia
 import Foundation
+import MWDATCore
 import SwiftUI
+
+/// The captured recording, ready to hand to the review flow. Published by
+/// `IPhoneExpertRecordingViewModel.handoff` once the mp4 is finalized AND
+/// (when the interviewer is on) the debrief has finished.
+struct RecordingHandoff: Equatable {
+  let url: URL
+  let duration: TimeInterval
+}
 
 /// iPhone-native counterpart to `StreamSessionViewModel`. Owns an
 /// `AVCaptureSession` (via `IPhoneCameraCapture`), the same `ExpertRecordingManager`
@@ -15,19 +24,38 @@ import SwiftUI
 ///      `ExpertRecordingManager.startRecording()` (writer + audio capture).
 ///      Sample buffers already flowing from the capture session feed into
 ///      `recordingManager.appendVideoFrame(_:)` while `isRecording` is true.
-///   3. User taps stop → `stopRecording()` finalizes the `.mp4` and
-///      returns `(URL, duration)` so the view can hand off to the
-///      sibling review cover and dismiss this view (capture mode ends).
+///   3. User taps stop → `finishRecording()` finalizes the `.mp4`, runs the
+///      interviewer's debrief if one is active, and publishes `handoff` so
+///      the view can dismiss and route into the sibling review cover.
 ///   4. On view disappear → `teardown()` stops the capture session + unsets
 ///      the sample-buffer callback.
+///
+/// **Expert interviewer** (`InterviewerMode` ≠ `.off`): this VM also owns the
+/// shared audio session for the interviewer. The audio manager runs in
+/// `.interview` (full-duplex, AEC, loudspeaker) and capture starts in
+/// `prepare()` — before recording — so the Live socket can connect for the
+/// pre-roll briefing. The recorder is constructed `borrowedSession: true` so
+/// its Stop doesn't kill capture (the debrief needs the mic afterwards); this
+/// VM stops capture in `teardown()`. Camera frames are tee'd at 1 fps into
+/// the interviewer via `IPhoneCoachingCameraSource`. If the `.interview`
+/// session fails to start, we fall back to today's `.recordingPhoneOnly`
+/// recorder — the recording always wins.
 @MainActor
 final class IPhoneExpertRecordingViewModel: ObservableObject {
   @Published var showError: Bool = false
   @Published var errorMessage: String = ""
   @Published var isPreviewLive: Bool = false
+  /// True from Stop until the debrief finished (interviewer on) — the view
+  /// shows the debrief overlay and waits for `handoff`.
+  @Published private(set) var isDebriefing: Bool = false
+  /// Set exactly once per recording when the review flow may begin.
+  @Published private(set) var handoff: RecordingHandoff?
 
-  let audioSessionManager = AudioSessionManager(mode: .recordingPhoneOnly)
-  lazy var recordingManager = ExpertRecordingManager(audioSessionManager: audioSessionManager)
+  let interviewerMode: InterviewerMode
+  private(set) var audioSessionManager: AudioSessionManager
+  private(set) var recordingManager: ExpertRecordingManager
+  /// nil when `interviewerMode == .off`.
+  let interviewer: ExpertInterviewViewModel?
   let uploadService: UploadService
   let camera = IPhoneCameraCapture()
 
@@ -41,25 +69,68 @@ final class IPhoneExpertRecordingViewModel: ObservableObject {
   /// `GeminiLiveSessionBase.handLandmarkerService`.
   private var handLandmarkerService: HandLandmarkerService?
 
+  /// 1 fps JPEG tee feeding the interviewer (planner + Live). Reuses the
+  /// coaching source: same throttle, same re-entry guard, own queue — it
+  /// never touches the writer's `recordingQueue`.
+  private var frameTee: IPhoneCoachingCameraSource?
+
   private var recordingManagerCancellable: AnyCancellable?
+  private var interviewerCancellable: AnyCancellable?
+  /// Owns capture when the interviewer is on (see class doc).
+  private var ownsAudioCapture = false
+  private var pendingHandoff: RecordingHandoff?
 
-  init(uploadService: UploadService) {
+  init(
+    uploadService: UploadService,
+    wearables: WearablesInterface,
+    sessionManager: DeviceSessionManager,
+    interviewerMode: InterviewerMode = .stored()
+  ) {
     self.uploadService = uploadService
-    // SwiftUI doesn't chain observation into nested ObservableObjects, so
-    // without this bridge the Start/Stop toggle and timer overlay never
-    // redraw when `recordingManager.isRecording` / `recordingDuration` flip.
-    // Force the lazy var to materialize, then re-emit its objectWillChange
-    // through the outer VM so any subview observing `self` rebuilds.
-    let manager = recordingManager
-    recordingManagerCancellable = manager.objectWillChange
-      .receive(on: RunLoop.main)
-      .sink { [weak self] _ in self?.objectWillChange.send() }
+    self.interviewerMode = interviewerMode
 
-    hudViewModel.bind(audioSessionManager: audioSessionManager)
+    let audio = AudioSessionManager(mode: interviewerMode == .off ? .recordingPhoneOnly : .interview)
+    self.audioSessionManager = audio
+    self.recordingManager = ExpertRecordingManager(
+      audioSessionManager: audio,
+      borrowedSession: interviewerMode != .off
+    )
+    self.interviewer = interviewerMode == .off ? nil : ExpertInterviewViewModel(
+      mode: interviewerMode,
+      wearables: wearables,
+      serverBaseURL: ServerEndpoint.shared.resolvedBaseURL,
+      sessionManager: sessionManager
+    )
+
+    bindRecordingManager()
+    hudViewModel.bind(audioSessionManager: audio)
+
+    if let interviewer {
+      interviewer.videoTimeProvider = { [weak self] in self?.recordingManager.videoTimeNow }
+      interviewer.isStopCountdownActive = { [weak self] in self?.hudViewModel.stopCountdownActive ?? false }
+      // Debrief done → write the sidecar log → release the hand-off.
+      interviewerCancellable = interviewer.$finalLog
+        .compactMap { $0 }
+        .receive(on: RunLoop.main)
+        .sink { [weak self] log in
+          self?.completeHandoff(with: log)
+        }
+    }
   }
 
   var previewLayer: AVCaptureVideoPreviewLayer {
     camera.previewLayer
+  }
+
+  // SwiftUI doesn't chain observation into nested ObservableObjects, so
+  // without this bridge the Start/Stop toggle and timer overlay never
+  // redraw when `recordingManager.isRecording` / `recordingDuration` flip.
+  // Re-emit its objectWillChange through the outer VM so any subview
+  // observing `self` rebuilds.
+  private func bindRecordingManager() {
+    recordingManagerCancellable = recordingManager.objectWillChange
+      .receive(on: RunLoop.main)
+      .sink { [weak self] _ in self?.objectWillChange.send() }
   }
 
   // MARK: - Session lifecycle
@@ -92,8 +163,19 @@ final class IPhoneExpertRecordingViewModel: ObservableObject {
     // race that was producing silent recordings.
     await audioSessionManager.prewarm()
 
+    if interviewer != nil {
+      await startInterviewerAudioAndSession()
+    }
+
+    // Capture the tee by value: this closure runs on the capture queue and
+    // must not read main-actor state. The tee is created (or nil) before
+    // this point and only ever dropped after `onSampleBuffer` is cleared.
+    let tee = frameTee
     camera.onSampleBuffer = { [weak self] sampleBuffer in
       guard let self else { return }
+      // Tee BEFORE the main-actor hop: the source throttles to 1 fps and
+      // encodes on its own queue, so this is a lock + compare per frame.
+      tee?.submit(sampleBuffer)
       // Hop to MainActor so we can read `recordingManager.isRecording` and call
       // the @MainActor API; `appendVideoFrame` itself dispatches to its serial
       // `recordingQueue`, so the hop only pays for the gate check.
@@ -111,6 +193,50 @@ final class IPhoneExpertRecordingViewModel: ObservableObject {
     } catch {
       surfaceError("Could not start iPhone camera: \(error.localizedDescription)")
     }
+  }
+
+  /// Start the shared `.interview` capture early and connect the interviewer.
+  /// Any failure here degrades to a plain recording — never to no recording.
+  private func startInterviewerAudioAndSession() async {
+    guard let interviewer else { return }
+    do {
+      try await audioSessionManager.startCaptureAsync()
+      ownsAudioCapture = true
+    } catch {
+      print("[Expert] .interview audio failed to start (\(error)) — falling back to plain recording")
+      fallBackToPlainRecording()
+      return
+    }
+
+    if let tee = makeFrameTee(for: interviewer) {
+      frameTee = tee
+    }
+    await interviewer.start(borrowing: audioSessionManager)
+    if !interviewer.isInterviewerAvailable {
+      print("[Expert] interviewer unavailable — recording continues with notes-only planner off")
+    }
+  }
+
+  private func makeFrameTee(for interviewer: ExpertInterviewViewModel) -> IPhoneCoachingCameraSource? {
+    IPhoneCoachingCameraSource(minInterval: 1.0, jpegQuality: 0.85) { [weak interviewer] jpeg in
+      await MainActor.run { interviewer?.ingestFrame(jpeg) }
+    }
+  }
+
+  /// The `.interview` session couldn't start. Swap in the pre-interviewer
+  /// pipeline: a fresh `.recordingPhoneOnly` manager and a recorder that owns
+  /// its own capture start/stop. The HUD and the recorder bridge rebind.
+  private func fallBackToPlainRecording() {
+    audioSessionManager.stopCapture()
+    let audio = AudioSessionManager(mode: .recordingPhoneOnly)
+    audioSessionManager = audio
+    recordingManager = ExpertRecordingManager(audioSessionManager: audio, borrowedSession: false)
+    bindRecordingManager()
+    hudViewModel.bind(audioSessionManager: audio)
+    ownsAudioCapture = false
+    frameTee = nil
+    Task { await audio.prewarm() }
+    objectWillChange.send()
   }
 
   /// Spin up the MediaPipe hand landmarker and wire the camera's secondary
@@ -188,15 +314,14 @@ final class IPhoneExpertRecordingViewModel: ObservableObject {
       // user knows to tap Start again instead of getting a silent mp4.
       if let err = await self.recordingManager.startRecording(width: size.width, height: size.height) {
         self.surfaceError(err.errorDescription ?? "Couldn't start recording.")
+        return
       }
+      self.interviewer?.recordingDidStart()
     }
   }
 
-  /// Finalize the mp4. Returns the captured `(URL, duration)` on success
-  /// so the caller can dismiss the recording view and route into the
-  /// review flow without keeping the camera/audio pipeline running. The
-  /// view is responsible for calling `onRecordingComplete` (or however
-  /// it routes); this VM no longer holds review-presentation state.
+  /// Finalize the mp4. Returns the captured `(URL, duration)` on success.
+  /// Prefer `finishRecording()` from the UI — it also runs the debrief.
   func stopRecording() async -> (URL, TimeInterval)? {
     let duration = recordingManager.recordingDuration
     _ = await recordingManager.stopRecording()
@@ -205,6 +330,41 @@ final class IPhoneExpertRecordingViewModel: ObservableObject {
     }
     surfaceError("Recording failed — no usable video was captured.")
     return nil
+  }
+
+  /// Stop tapped. Finalizes the mp4, then either hands off immediately or
+  /// (interviewer on) runs the debrief on the still-open socket and hands
+  /// off when `ExpertInterviewViewModel.finalLog` lands.
+  func finishRecording() async {
+    guard handoff == nil, pendingHandoff == nil else { return }
+    guard let (url, duration) = await stopRecording() else { return }
+    let result = RecordingHandoff(url: url, duration: duration)
+
+    guard let interviewer, interviewer.phase == .recording || interviewer.phase == .preroll else {
+      handoff = result
+      return
+    }
+    pendingHandoff = result
+    isDebriefing = true
+    await interviewer.recordingDidStop()
+    // Completion arrives via the `$finalLog` sink → `completeHandoff`.
+  }
+
+  /// "Done" on the debrief overlay.
+  func skipDebrief() {
+    Task { await interviewer?.endDebrief() }
+  }
+
+  private func completeHandoff(with log: InterviewLog) {
+    guard let result = pendingHandoff else { return }
+    pendingHandoff = nil
+    do {
+      try InterviewLogStore.save(log, besides: result.url)
+    } catch {
+      print("[Expert] failed to save interview sidecar: \(error)")
+    }
+    isDebriefing = false
+    handoff = result
   }
 
   /// Stop capture session and drop the sample-buffer callback. Call from
@@ -216,10 +376,18 @@ final class IPhoneExpertRecordingViewModel: ObservableObject {
   func teardown() async {
     camera.onSampleBuffer = nil
     camera.onHandSampleBuffer = nil
+    frameTee = nil
     await camera.stop()
     handLandmarkerService?.stop()
     handLandmarkerService = nil
     hudViewModel.resetHandTracking()
+    if let interviewer {
+      await interviewer.shutdown()
+    }
+    if ownsAudioCapture {
+      audioSessionManager.stopCapture()
+      ownsAudioCapture = false
+    }
     audioSessionManager.deactivate()
     isPreviewLive = false
   }

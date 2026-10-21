@@ -5,6 +5,9 @@ import Foundation
 actor GeminiTokenManager {
   private let sessionId: String
   private let serverBaseURL: String
+  /// Server path for refreshes. Defaults to the learner namespace; other
+  /// modes pass their own (`GeminiLiveSessionBase.tokenRefreshPath`).
+  private let tokenPath: String
   private var currentToken: EphemeralTokenResponse?
   private var refreshTask: Task<EphemeralTokenResponse, Error>?
 
@@ -16,9 +19,10 @@ actor GeminiTokenManager {
     return d
   }()
 
-  init(sessionId: String, serverBaseURL: String) {
+  init(sessionId: String, serverBaseURL: String, tokenPath: String? = nil) {
     self.sessionId = sessionId
     self.serverBaseURL = serverBaseURL
+    self.tokenPath = tokenPath ?? "/api/learner/session/\(sessionId)/token"
   }
 
   /// Seed with the token from the initial session/start response.
@@ -81,9 +85,7 @@ actor GeminiTokenManager {
   }
 
   private func fetchTokenFromServer(handle: String? = nil) async throws -> EphemeralTokenResponse {
-    var components = URLComponents(
-      string: "\(serverBaseURL)/api/learner/session/\(sessionId)/token"
-    )
+    var components = URLComponents(string: "\(serverBaseURL)\(tokenPath)")
     if let handle, !handle.isEmpty {
       components?.queryItems = [URLQueryItem(name: "handle", value: handle)]
     }

@@ -9,6 +9,14 @@ struct ExpertRecordingReviewView: View {
 
   @State private var fileSize: String = ""
 
+  /// Expert-interviewer sidecar written beside the recording, if any.
+  private var interviewLogURL: URL? {
+    InterviewLogStore.exists(besides: recordingURL) ? InterviewLogStore.sidecarURL(for: recordingURL) : nil
+  }
+  private var interviewFactCount: Int? {
+    InterviewLogStore.load(besides: recordingURL).map { $0.facts.count + ($0.facts.isEmpty ? $0.qa.filter { $0.answer != nil }.count : 0) }
+  }
+
   var body: some View {
     NavigationStack {
       RetraceScreen {
@@ -21,6 +29,15 @@ struct ExpertRecordingReviewView: View {
                 .font(.retraceCaption1)
                 .foregroundColor(.textSecondary)
                 .monospacedDigit()
+
+              if let count = interviewFactCount {
+                HStack(spacing: 6) {
+                  Image(systemName: "text.bubble")
+                  Text(count > 0 ? "\(count) interview note\(count == 1 ? "" : "s") attached" : "Interview notes attached")
+                }
+                .font(.retraceCaption1)
+                .foregroundColor(.textSecondary)
+              }
 
               // Upload state
               if uploadService.isUploading {
@@ -147,7 +164,7 @@ struct ExpertRecordingReviewView: View {
           isDisabled: false
         ) {
           Task {
-            await uploadService.uploadRecording(fileURL: recordingURL)
+            await uploadService.uploadRecording(fileURL: recordingURL, interviewLogURL: interviewLogURL)
           }
         }
 
@@ -157,6 +174,7 @@ struct ExpertRecordingReviewView: View {
           isDisabled: false
         ) {
           try? FileManager.default.removeItem(at: recordingURL)
+          InterviewLogStore.delete(besides: recordingURL)
           onDismiss()
         }
       }

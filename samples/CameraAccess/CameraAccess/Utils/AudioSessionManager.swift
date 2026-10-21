@@ -12,11 +12,38 @@ import Foundation
 ///   override. Expert recording via glasses (HFP) or iPhone mic fallback.
 /// - `.recordingPhoneOnly`: simplex capture, forced built-in mic. Used for
 ///   iPhone-native expert recording — ignores HFP even if glasses are paired.
+/// - `.interview`: full-duplex with AEC, forced built-in mic + loudspeaker —
+///   `.coachingPhoneOnly`'s graph, used for iPhone expert recording WITH the
+///   interviewer on. One manager feeds the mp4 writer (primary tap slot), the
+///   interviewer's Gemini Live session (secondary slot) and the planner's PCM
+///   ring; the AI's questions play through the loudspeaker and AEC keeps most
+///   of them out of the recording.
 enum AudioSessionMode {
   case coaching
   case coachingPhoneOnly
   case recording
   case recordingPhoneOnly
+  case interview
+
+  /// Modes with a player node attached (`.playAndRecord`) — the only ones
+  /// `playPcm16Audio` / `clearPlaybackBuffer` act on.
+  var supportsPlayback: Bool {
+    switch self {
+    case .coaching, .coachingPhoneOnly, .interview: return true
+    case .recording, .recordingPhoneOnly: return false
+    }
+  }
+
+  /// Modes pinned to the built-in mic (ignore paired HFP glasses).
+  var isPhoneOnly: Bool {
+    switch self {
+    case .coachingPhoneOnly, .recordingPhoneOnly, .interview: return true
+    case .coaching, .recording: return false
+    }
+  }
+
+  /// Phone-only full-duplex modes that force the loudspeaker output.
+  var forcesLoudspeaker: Bool { self == .coachingPhoneOnly || self == .interview }
 }
 
 @MainActor
@@ -132,6 +159,12 @@ class AudioSessionManager: ObservableObject {
   /// short-circuit route-change rebinds when the live format hasn't changed
   /// (see `rebindMicTapIfCapturing(reason:)`).
   private var converterInputFormat: AVAudioFormat?
+  /// Dedicated converter for `convertBufferForSend` (mic → Gemini). The
+  /// recorder's `convertBufferToPcmRecording` runs on its own serial queue
+  /// while the Live send runs on the tap thread; `AVAudioConverter` is not
+  /// thread-safe, so the two paths must never share an instance. Rebuilt
+  /// alongside `audioConverter` on every route/format change.
+  private var sendAudioConverter: AVAudioConverter?
 
   /// True once `prewarm()` has put the audio session in its target category
   /// AND the input audio unit has been instantiated against a settled
@@ -223,7 +256,7 @@ class AudioSessionManager: ObservableObject {
     // Attach player node only for coaching modes. Recording has no playback
     // and attaching the node forces `.playAndRecord`, which pulls in output-port
     // negotiation and triggers the route-change cascade we're trying to avoid.
-    if mode == .coaching || mode == .coachingPhoneOnly {
+    if mode.supportsPlayback {
       engine.attach(playerNode)
       engine.connect(playerNode, to: engine.mainMixerNode, format: playbackFormat)
       // Lobby-music node shares the same mixer/output, ducked low. Connected
@@ -323,6 +356,16 @@ class AudioSessionManager: ObservableObject {
           mode: demoRoute ? .default : .voiceChat,
           options: demoRoute ? [] : [.defaultToSpeaker]  // no HFP / A2DP
         )
+      case .interview:
+        // Same graph as `.coachingPhoneOnly` (no demo route): AEC + built-in
+        // mic + loudspeaker. The recorder shares this session, so the mp4
+        // gets the voice-processed mic — a feature here: AEC strips most of
+        // the interviewer's own questions out of the recording.
+        try session.setCategory(
+          .playAndRecord,
+          mode: .voiceChat,
+          options: [.defaultToSpeaker]
+        )
       case .recording:
         // Simplex capture. No `.voiceChat` (no AEC processing), no `.defaultToSpeaker`
         // (nothing to play, and this option forces an override-to-speaker that
@@ -353,14 +396,14 @@ class AudioSessionManager: ObservableObject {
       // until the user manually taps play. Activation-time option, not
       // deactivation-time — iOS associates it with the session lifecycle.
       try session.setActive(true, options: .notifyOthersOnDeactivation)
-      if mode == .coachingPhoneOnly, !demoRoute {
+      if mode.forcesLoudspeaker, !demoRoute {
         // Belt-and-suspenders: even with `.defaultToSpeaker`, an actively routed
         // HFP output could sneak through if the user paired glasses mid-session.
         // This override forces the loudspeaker for the life of this activation.
         // Skipped in the DEBUG demo route so output can reach the Mac.
         try session.overrideOutputAudioPort(.speaker)
       }
-      if mode == .coachingPhoneOnly || mode == .recordingPhoneOnly {
+      if mode.isPhoneOnly {
         forceBuiltInMicPreferred(session)
       }
       if isGlassesMode {
@@ -693,7 +736,7 @@ class AudioSessionManager: ObservableObject {
     //    immediately stop (see comment in `startCapture` for the
     //    diagnostic background).
     do {
-      if capturedMode == .coaching || capturedMode == .coachingPhoneOnly {
+      if capturedMode.supportsPlayback {
         let isBTHFPInput = AVAudioSession.sharedInstance().currentRoute.inputs
           .contains { $0.portType == .bluetoothHFP }
         let demoRoute = (capturedMode == .coachingPhoneOnly) && Self.routeAudioToMacForDemo
@@ -739,7 +782,7 @@ class AudioSessionManager: ObservableObject {
       await Task.detached(priority: .userInitiated) { [inputNode = self.inputNode] in
         Self.configureSessionOffMain(mode: capturedMode, preferredGlassesNames: capturedNames)
         do {
-          if capturedMode == .coaching || capturedMode == .coachingPhoneOnly {
+          if capturedMode.supportsPlayback {
             // Same VPIO+HFP bypass as `startCapture`. Display glasses
             // BT HFP input crashes the VPIO unit silently — engine.start
             // returns success but `isRunning` flips false immediately.
@@ -789,7 +832,7 @@ class AudioSessionManager: ObservableObject {
       throw error
     }
 
-    if capturedMode == .coaching || capturedMode == .coachingPhoneOnly {
+    if capturedMode.supportsPlayback {
       playerNode.play()
     }
     isCapturing = true
@@ -856,7 +899,7 @@ class AudioSessionManager: ObservableObject {
         // VPIO on the Display glasses route re-triggers the engine self-stop the
         // retry is trying to recover from.
         let isBTHFPInput = AVAudioSession.sharedInstance().currentRoute.inputs.contains { $0.portType == .bluetoothHFP }
-        let shouldUseVPIO = (capturedMode == .coaching || capturedMode == .coachingPhoneOnly) && !demoRoute && !isBTHFPInput
+        let shouldUseVPIO = (capturedMode.supportsPlayback) && !demoRoute && !isBTHFPInput
         try Self.safeSetVoiceProcessing(inputNode, enabled: shouldUseVPIO)
       } catch {
         print("[AudioSession] retry: setVoiceProcessingEnabled failed: \(error)")
@@ -917,6 +960,12 @@ class AudioSessionManager: ObservableObject {
           mode: demoRoute ? .default : .voiceChat,
           options: demoRoute ? [] : [.defaultToSpeaker]
         )
+      case .interview:
+        try session.setCategory(
+          .playAndRecord,
+          mode: .voiceChat,
+          options: [.defaultToSpeaker]
+        )
       case .recording:
         // A2DP is invalid with `.record` (output-only profile); see the
         // sibling `configureAudioSession()` for the full reasoning. HFP
@@ -937,10 +986,10 @@ class AudioSessionManager: ObservableObject {
       // sample bakes `.notifyOthersOnDeactivation` into activation so Music
       // resumes cleanly when we tear down.
       try session.setActive(true, options: .notifyOthersOnDeactivation)
-      if mode == .coachingPhoneOnly, !demoRoute {
+      if mode.forcesLoudspeaker, !demoRoute {
         try session.overrideOutputAudioPort(.speaker)
       }
-      if mode == .coachingPhoneOnly || mode == .recordingPhoneOnly {
+      if mode.isPhoneOnly {
         if let builtIn = session.availableInputs?.first(where: { $0.portType == .builtInMic }) {
           do {
             try session.setPreferredInput(builtIn)
@@ -1000,7 +1049,7 @@ class AudioSessionManager: ObservableObject {
 
     do {
       try engine.start()
-      if mode == .coaching || mode == .coachingPhoneOnly {
+      if mode.supportsPlayback {
         playerNode.play()
       }
       isCapturing = true
@@ -1106,7 +1155,7 @@ class AudioSessionManager: ObservableObject {
   /// and (inline-mirrored) `startEngineWithRetry()` so no path re-enables VPIO
   /// on the glasses route and re-triggers the self-stop.
   private func applyVoiceProcessingForCurrentRoute() {
-    if mode == .coaching || mode == .coachingPhoneOnly {
+    if mode.supportsPlayback {
       let session = AVAudioSession.sharedInstance()
       let isBTHFPInput = session.currentRoute.inputs.contains { $0.portType == .bluetoothHFP }
       let demoRoute = (mode == .coachingPhoneOnly) && Self.routeAudioToMacForDemo
@@ -1241,6 +1290,7 @@ class AudioSessionManager: ObservableObject {
     // Rebuild the tap + converter against the now-settled input format.
     installMicTap()
     audioConverter = nil
+    sendAudioConverter = nil
     converterInputFormat = nil
     initializeConverterIfNeeded()
 
@@ -1253,7 +1303,7 @@ class AudioSessionManager: ObservableObject {
     engine.prepare()
     do {
       try engine.start()
-      if mode == .coaching || mode == .coachingPhoneOnly {
+      if mode.supportsPlayback {
         playerNode.play()
       }
       let fmt = inputNode.inputFormat(forBus: 0)
@@ -1295,7 +1345,7 @@ class AudioSessionManager: ObservableObject {
     inputNode.removeTap(onBus: 0)
     // Flush pending playback buffers FIRST so the player-node stop can't be
     // racing with a scheduled buffer callback (only applies to coaching modes).
-    if mode == .coaching || mode == .coachingPhoneOnly {
+    if mode.supportsPlayback {
       playerNode.stop()
       scheduledBufferCount = 0
       // Lobby music can never outlive the session.
@@ -1317,6 +1367,7 @@ class AudioSessionManager: ObservableObject {
     userInputPeak = 0
     stopStatsTimer()
     audioConverter = nil
+    sendAudioConverter = nil
     converterInputFormat = nil
     // Pre-warm state belongs to a single capture cycle. Reset so the next
     // recording's `prewarm()` actually re-engages the input AU instead of
@@ -1343,7 +1394,7 @@ class AudioSessionManager: ObservableObject {
       print("[AudioSession] Failed to switch to .playback: \(error)")
     }
 
-    if mode == .coaching || mode == .coachingPhoneOnly {
+    if mode.supportsPlayback {
       do {
         // `.notifyOthersOnDeactivation` wakes any other audio app we bumped
         // during `.voiceChat` so system routing snaps back cleanly.
@@ -1491,7 +1542,7 @@ class AudioSessionManager: ObservableObject {
   /// Play raw PCM16 Int16 audio data received from Gemini Live.
   /// Thread-safe — can be called from any thread. No-op in recording modes.
   func playPcm16Audio(_ data: Data) {
-    guard mode == .coaching || mode == .coachingPhoneOnly else {
+    guard mode.supportsPlayback else {
       print("[AudioSession] ⚠ playPcm16Audio called in recording mode — ignoring")
       return
     }
@@ -1595,7 +1646,7 @@ class AudioSessionManager: ObservableObject {
 
   /// Flush all queued playback buffers and restart the player.
   func clearPlaybackBuffer(reason: String = "unspecified") {
-    guard mode == .coaching || mode == .coachingPhoneOnly else {
+    guard mode.supportsPlayback else {
       print("[AudioSession] ⚠ clearPlaybackBuffer called in recording mode — ignoring")
       return
     }
@@ -1621,7 +1672,7 @@ class AudioSessionManager: ObservableObject {
   /// running engine, and a no-op (logged once) if no bundled track is present
   /// so the rest of the feature works before the asset lands.
   func startLobbyMusic() {
-    guard mode == .coaching || mode == .coachingPhoneOnly else { return }
+    guard mode.supportsPlayback else { return }
     guard engine.isRunning else {
       print("[AudioSession] startLobbyMusic skipped — engine not running")
       return
@@ -1680,10 +1731,10 @@ class AudioSessionManager: ObservableObject {
   /// Convert a mic capture buffer to PCM16 16kHz mono Data for sending to Gemini.
   /// Returns nil if conversion fails.
   func convertBufferForSend(_ buffer: AVAudioPCMBuffer) -> Data? {
-    guard let converter = audioConverter else {
+    guard let converter = sendAudioConverter else {
       // Fallback: try to initialize now
       initializeConverterIfNeeded()
-      guard let converter = audioConverter else { return nil }
+      guard let converter = sendAudioConverter else { return nil }
       return convertWithConverter(converter, buffer: buffer)
     }
     return convertWithConverter(converter, buffer: buffer)
@@ -1767,10 +1818,15 @@ class AudioSessionManager: ObservableObject {
   }
 
   private func initializeConverterIfNeeded() {
-    guard audioConverter == nil else { return }
+    guard audioConverter == nil || sendAudioConverter == nil else { return }
     let hwFormat = inputNode.inputFormat(forBus: 0)
     guard hwFormat.sampleRate > 0 else { return }
-    audioConverter = AVAudioConverter(from: hwFormat, to: sendFormat)
+    if audioConverter == nil {
+      audioConverter = AVAudioConverter(from: hwFormat, to: sendFormat)
+    }
+    if sendAudioConverter == nil {
+      sendAudioConverter = AVAudioConverter(from: hwFormat, to: sendFormat)
+    }
     converterInputFormat = hwFormat
   }
 
@@ -1878,6 +1934,7 @@ class AudioSessionManager: ObservableObject {
 
     // The hardware format changed (HFP ↔ built-in); rebuild the converter.
     audioConverter = nil
+    sendAudioConverter = nil
     converterInputFormat = nil
     initializeConverterIfNeeded()
 
