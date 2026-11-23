@@ -9,7 +9,7 @@
 The phone client for **Retrace**, an AI coaching system for hands-on tasks. 🥈 2nd place at the XRCC Berlin 2026 hackathon; work continued through 2026.
 SwiftUI app that captures from Ray-Ban Meta glasses or the iPhone camera, holds a **direct WebSocket to Gemini Live** for voice, and renders a HUD on the glasses' lens. The backend lives in [`hshwang34/retrace-server`](https://github.com/hshwang34/retrace-server).
 
-[**🌐 retracelab.com**](https://retracelab.com) · [**▶ Demo**](https://www.youtube.com/watch?v=azK-CLpyRQg) · [**🎬 Full walkthrough**](https://www.youtube.com/watch?v=CqUj5HtP0UE) · [**🛰 Backend**](https://github.com/hshwang34/retrace-server) (private)
+[**🌐 retracelab.com**](https://retracelab.com) · [**▶ Demo**](https://www.youtube.com/watch?v=azK-CLpyRQg) · [**🎬 Full walkthrough**](https://www.youtube.com/watch?v=CqUj5HtP0UE) · [**🛰 Backend**](https://github.com/hshwang34/retrace-server)
 
 </div>
 
@@ -168,6 +168,10 @@ samples/CameraAccess/CameraAccess/
 ## Attribution
 
 Forked from Meta's [`meta-wearables-dat-ios`](https://github.com/facebook/meta-wearables-dat-ios) `CameraAccess` sample; the DAT SDK 0.8.0 is consumed via Swift Package Manager. Hand tracking uses MediaPipe Tasks Vision.
+
+## License
+
+Source-available, not open source: Retrace code is all rights reserved, and the parts derived from Meta's sample stay under the [Meta Wearables Developer Terms](https://wearables.developer.meta.com/terms). See [LICENSE](LICENSE) and [NOTICE](NOTICE). Retrace is not affiliated with or endorsed by Meta.
 
 <div align="center">
 

@@ -1,0 +1,33 @@
+Retrace iOS — License
+
+This repository contains two kinds of code under different terms.
+
+1. Meta Wearables Device Access Toolkit sample code
+
+   This app began as Meta's `CameraAccess` sample from
+   https://github.com/facebook/meta-wearables-dat-ios. Files that carry the
+   "Copyright (c) Meta Platforms, Inc. and affiliates." header, and the Meta
+   portions of other files, are governed by Meta's terms, reproduced verbatim
+   from that repository:
+
+   ----------------------------------------------------------------------------
+   DEVELOPER TERMS
+
+   By using the Wearables Device Access Toolkit, you agree to our Meta Wearables Developer Terms (https://wearables.developer.meta.com/terms),
+   including our Acceptable Use Policy (https://wearables.developer.meta.com/acceptable-use-policy).
+   ----------------------------------------------------------------------------
+
+   Third-party notices shipped with the toolkit are in NOTICE.
+
+2. Retrace code
+
+   Copyright (c) 2026 Hyunseok Hwang and Retrace contributors.
+   All rights reserved.
+
+   The Retrace-authored code, design and assets in this repository are
+   published for viewing and reference. No license is granted to copy, modify
+   or redistribute them except where a file states otherwise. Because parts of
+   this app derive from Meta's sample, this repository is not released under an
+   open-source license.
+
+Retrace is not affiliated with or endorsed by Meta.
