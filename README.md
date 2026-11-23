@@ -7,9 +7,9 @@
 ### Record an expert once. Coach every learner forever.
 
 The phone client for **Retrace**, an AI coaching system for hands-on tasks. 🥈 2nd place at the XRCC Berlin 2026 hackathon; work continued through 2026.
-SwiftUI app that captures from Ray-Ban Meta glasses or the iPhone camera, holds a **direct WebSocket to Gemini Live** for voice, and renders a HUD on the glasses' lens. The backend lives in [`hshwang34/retrace-server`](https://github.com/hshwang34/retrace-server).
+SwiftUI app that captures from Ray-Ban Meta glasses or the iPhone camera, holds a **direct WebSocket to Gemini Live** for voice, and renders a HUD on the glasses' lens. The backend lives in [`xrcc-retrace/retrace-server`](https://github.com/xrcc-retrace/retrace-server).
 
-[**🌐 retracelab.com**](https://retracelab.com) · [**▶ Demo**](https://www.youtube.com/watch?v=azK-CLpyRQg) · [**🎬 Full walkthrough**](https://www.youtube.com/watch?v=CqUj5HtP0UE) · [**🛰 Backend**](https://github.com/hshwang34/retrace-server)
+[**🌐 retracelab.com**](https://retracelab.com) · [**▶ Demo**](https://www.youtube.com/watch?v=azK-CLpyRQg) · [**🎬 Full walkthrough**](https://www.youtube.com/watch?v=CqUj5HtP0UE) · [**🛰 Backend**](https://github.com/xrcc-retrace/retrace-server)
 
 </div>
 
@@ -53,7 +53,7 @@ Before recording the expert picks **Ask me / Debrief only / Off**. With it on, a
 | Stop should not kill the mic | The recorder borrows the audio session (`borrowedSession: true`), so Stop can roll into a short debrief on the same socket before teardown. |
 | Server restarts between Stop and Upload | The phone owns the `InterviewLog`, saves it as a `<recording>.interview.json` sidecar, and uploads it as the `interview` part. |
 
-Status: builds, server side verified end-to-end; not yet exercised on a device. Design and failure matrix: [`docs/expert-interviewer-design.md` in the backend repo](https://github.com/hshwang34/retrace-server/blob/main/docs/expert-interviewer-design.md).
+Status: builds, server side verified end-to-end; not yet exercised on a device. Design and failure matrix: [`docs/expert-interviewer-design.md` in the backend repo](https://github.com/xrcc-retrace/retrace-server/blob/main/docs/expert-interviewer-design.md).
 
 ---
 
@@ -175,6 +175,6 @@ Source-available, not open source: Retrace code is all rights reserved, and the 
 
 <div align="center">
 
-Built at XRCC Berlin 2026 by Hyunseok Hwang and Arthur Lee · Backend: [hshwang34/retrace-server](https://github.com/hshwang34/retrace-server)
+Built at XRCC Berlin 2026 by Hyunseok Hwang and Arthur Lee · Backend: [xrcc-retrace/retrace-server](https://github.com/xrcc-retrace/retrace-server)
 
 </div>
